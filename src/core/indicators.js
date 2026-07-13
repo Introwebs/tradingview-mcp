@@ -173,22 +173,55 @@ export async function setInputs({ entity_id, inputs: inputsRaw }) {
       var chart = ${CHART_API};
       var study = chart.getStudyById(${safeString(entity_id)});
       if (!study) return { error: 'Study not found: ' + ${safeString(entity_id)} };
-      var currentInputs = study.getInputValues();
       var overrides = ${inputsJson};
-      var updatedKeys = {};
+
+      // Apply each override through TradingView's official property system
+      // (study.properties().inputs[id].setValue). This is the same model the
+      // Settings dialog binds to: setValue fires the proper change listeners and
+      // recalcs the study cleanly.
+      //
+      // The previous implementation round-tripped the ENTIRE input model via
+      // study.getInputValues()/setInputValues(). For compiled or protected Pine
+      // scripts, getInputValues() also returns the compiled-source blob ("text")
+      // and pineId/pineVersion system fields; re-submitting the whole array through
+      // setInputValues() collapses their input model and yields a "Can't parse pine"
+      // runtime error. setValue on the individual property node avoids that entirely.
+      var props = (typeof study.properties === 'function') ? study.properties() : null;
+      var inputsNode = props ? props.inputs : null;
+
+      if (inputsNode) {
+        var updatedKeys = {};
+        var missing = [];
+        for (var key in overrides) {
+          if (!overrides.hasOwnProperty(key)) continue;
+          var node = inputsNode[key];
+          if (node && typeof node.setValue === 'function') {
+            node.setValue(overrides[key]);
+            updatedKeys[key] = overrides[key];
+          } else {
+            missing.push(key);
+          }
+        }
+        return { updated_inputs: updatedKeys, missing: missing, via: 'properties' };
+      }
+
+      // Fallback for studies with no property tree (rare). Uses the legacy
+      // round-trip; unsafe for compiled scripts, but such studies never reach here.
+      var currentInputs = study.getInputValues();
+      var uk = {};
       for (var i = 0; i < currentInputs.length; i++) {
         if (overrides.hasOwnProperty(currentInputs[i].id)) {
           currentInputs[i].value = overrides[currentInputs[i].id];
-          updatedKeys[currentInputs[i].id] = overrides[currentInputs[i].id];
+          uk[currentInputs[i].id] = overrides[currentInputs[i].id];
         }
       }
       study.setInputValues(currentInputs);
-      return { updated_inputs: updatedKeys };
+      return { updated_inputs: uk, missing: [], via: 'legacy' };
     })()
   `);
 
   if (result && result.error) throw new Error(result.error);
-  return { success: true, entity_id, updated_inputs: result.updated_inputs };
+  return { success: true, entity_id, updated_inputs: result.updated_inputs, missing: result.missing || [], via: result.via };
 }
 
 export async function toggleVisibility({ entity_id, visible }) {
