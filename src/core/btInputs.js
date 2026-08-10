@@ -10,21 +10,58 @@
  * (regola operativa: "in_18 = 240" non dice nulla a chi legge la piattaforma; "Risk/Reward = 2.5" sì).
  * Il blocco 3 finisce in extra_metrics; il blocco 1 non si tocca mai.
  *
- * ATTENZIONE: la separazione 2/3 si basa sui NOMI (vedi PROPERTY_NAMES) perché TradingView
- * non espone un marcatore strutturale affidabile. Se TV localizzasse quei nomi, il filtro va
- * aggiornato: il sintomo è un 422 "Incomplete inputs" dal finalize, che è la rete di sicurezza
- * lato server.
+ * La separazione 2/3 usa DUE condizioni insieme: assenza di `group` E nome nella lista
+ * verificata. Vedi il commento di classifyInputs per il perché.
  */
 
 const SYSTEM_IDS = new Set(['text', 'pineId', 'pineVersion', 'pineFeatures']);
 
+// Lista VERIFICATA dal vivo (2026-08-10) su tre strategie reali via getInputsInfo().
+// NON aggiungere nomi "plausibili" senza averli visti: la prima versione di questa lista era
+// per metà inventata ('Order size', 'Slippage', 'Recalculate After Order Filled'... non
+// esistono) e avrebbe fatto passare 18 Proprietà per input di logica, scrivendole dentro
+// `inputs` di ogni backtest. In silenzio: il finalize lato server rifiuta quando le chiavi
+// sono MENO del previsto, mai quando sono di più.
 export const PROPERTY_NAMES = new Set([
-  'Initial Capital', 'Base Currency', 'Order size', 'Pyramiding',
-  'Commission Type', 'Commission Value', 'Verify Price For Limit Orders', 'Slippage',
-  'Margin Long', 'Margin Short', 'Recalculate After Order Filled',
-  'Recalculate On Every Tick', 'Use Bar Magnifier', 'Fill Orders On Bar Close',
+  'Initial Capital',
+  'Base Currency',
+  'Default entry/order Qty Type',
+  'Default entry/order Qty Value',
+  'pyramiding',
+  'Commission Type',
+  'Commission Value',
+  'Margin Long',
+  'Margin Short',
+  'Process orders on bar Close',
+  'Calculate Strategy on every Tick(s)',
+  "Calculate Strategy on Order's Fill(s)",
+  'Calculate Strategy on every History Tick',
+  'Backtesting Limit Order(s) fill assumption',
+  'Backtesting slippage for market orders',
+  'Close entries rule',
+  'Risk free rate',
+  'Use Bar Magnifier',
+  'Fill orders using standard OHLC',
+  "Run mode: 'backtest', 'alert' or something else",
+  "Alert message template for run mode 'alert'",
+  "Alert type for run mode 'alert'",
+  'exclude_from_report',
+  'trim_orders',
+  'calc_range',
 ]);
 
+/**
+ * Proprietà = NESSUN group E nome nella lista verificata.
+ *
+ * Le due condizioni insieme perché ognuna da sola sbaglia. Il `group` (il `group=` dichiarato
+ * in Pine, che TradingView riporta in getInputsInfo) è nullo su tutto il blocco Proprietà, ma
+ * anche su un input di logica dichiarato senza `group=`: da solo lo scambierebbe per una
+ * Proprietà, facendolo sparire da `inputs`. I nomi da soli si rompono se TradingView li cambia.
+ *
+ * Insieme, un eventuale disallineamento sbaglia nella direzione giusta: fa scivolare una
+ * Proprietà dentro `inputs`, dove si vede leggendo la piattaforma, invece di far sparire un
+ * input di logica, che nessuno noterebbe.
+ */
 export function classifyInputs(info) {
   const system = [];
   const logic = [];
@@ -32,7 +69,7 @@ export function classifyInputs(info) {
   for (const item of info || []) {
     if (!item || !item.id) continue;
     if (SYSTEM_IDS.has(item.id) || !/^in_\d+$/.test(item.id)) { system.push(item); continue; }
-    if (PROPERTY_NAMES.has(String(item.name || '').trim())) { properties.push(item); continue; }
+    if (!item.group && PROPERTY_NAMES.has(String(item.name || '').trim())) { properties.push(item); continue; }
     logic.push(item);
   }
   return { system, logic, properties };

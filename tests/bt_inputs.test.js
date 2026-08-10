@@ -53,3 +53,45 @@ test('PROPERTY_NAMES contiene i nomi noti del blocco Proprietà', () => {
     assert.ok(PROPERTY_NAMES.has(n), `manca ${n}`);
   }
 });
+
+test('PROPERTY_NAMES ha esattamente i 25 nomi verificati dal vivo', () => {
+  assert.equal(PROPERTY_NAMES.size, 25);
+});
+
+test('un input di logica CON group non diventa una Proprietà anche se il nome coincide', () => {
+  // Caso reale possibile: uno script che chiama un proprio input "Close entries rule"
+  // dentro un gruppo. Il group lo salva dall'essere scambiato per una Proprietà.
+  const info = [
+    { id: 'in_0', name: 'Close entries rule', type: 'text', group: 'Filtri' },
+    { id: 'in_1', name: 'Close entries rule', type: 'text', group: null },
+  ];
+  const c = classifyInputs(info);
+  assert.deepEqual(c.logic.map((i) => i.id), ['in_0']);
+  assert.deepEqual(c.properties.map((i) => i.id), ['in_1']);
+});
+
+test('un input SENZA group e con nome sconosciuto resta logica', () => {
+  // Input dichiarato in Pine senza group=: il group da solo lo scambierebbe per Proprietà.
+  const c = classifyInputs([{ id: 'in_0', name: 'Soglia ATR', type: 'float', group: null }]);
+  assert.deepEqual(c.logic.map((i) => i.id), ['in_0']);
+  assert.deepEqual(c.properties, []);
+});
+
+test('la coda reale delle Proprietà finisce tutta fuori da inputs', () => {
+  // Nomi presi dal probe su TradingView vivo: sono quelli che la vecchia lista sbagliava.
+  const info = [
+    { id: 'in_0', name: 'Rischio per trade (%)', type: 'float', group: 'Risk' },
+    { id: 'in_39', name: 'pyramiding', type: 'integer', group: null },
+    { id: 'in_42', name: 'Default entry/order Qty Value', type: 'float', group: null },
+    { id: 'in_52', name: 'Backtesting slippage for market orders', type: 'integer', group: null },
+    { id: 'in_62', name: 'calc_range', type: 'text', group: null },
+  ];
+  const values = { in_0: 1.5, in_39: 3, in_42: 100, in_52: 2, in_62: 'all' };
+  const { inputs, properties } = buildInputsPayload(info, values);
+
+  assert.deepEqual(Object.keys(inputs), ['Rischio per trade (%)']);
+  for (const n of ['pyramiding', 'Default entry/order Qty Value', 'Backtesting slippage for market orders', 'calc_range']) {
+    assert.ok(n in properties, `${n} doveva essere una Proprietà`);
+    assert.ok(!(n in inputs), `${n} non doveva finire in inputs`);
+  }
+});

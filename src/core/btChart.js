@@ -20,7 +20,10 @@ export async function readInputsInfo(entityId, { evaluate = realEvaluate } = {})
       for (var i = 0; i < info.length; i++) {
         var x = info[i];
         if (!x || !x.id) continue;
-        map.push({ id: x.id, name: String(x.name || '').slice(0, 60), type: x.type });
+        // group = il group= dichiarato in Pine. Serve a distinguere gli input di logica dal
+        // blocco Proprieta, che TradingView appende senza group (vedi btInputs.classifyInputs).
+        // E una stringa corta: nessun rischio di trascinare fuori blob dalla pagina.
+        map.push({ id: x.id, name: String(x.name || '').slice(0, 60), type: x.type, group: x.group || null });
       }
       return JSON.stringify(map);
     })()
