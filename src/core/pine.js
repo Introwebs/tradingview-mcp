@@ -289,7 +289,6 @@ export async function compile() {
     (function() {
       var btns = document.querySelectorAll('button');
       var fallback = null;
-      var saveBtn = null;
       for (var i = 0; i < btns.length; i++) {
         var text = btns[i].textContent.trim();
         if (/save and add to chart/i.test(text)) {
@@ -299,12 +298,14 @@ export async function compile() {
         if (!fallback && /^(Add to chart|Update on chart)/i.test(text)) {
           fallback = btns[i];
         }
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) {
-          saveBtn = btns[i];
-        }
       }
       if (fallback) { fallback.click(); return fallback.textContent.trim(); }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
+      // No match: deliberately do NOT fall back to the Save button. The labels above
+      // are English-only, so on a localized UI (it/de/fr/...) nothing matches and the
+      // old fallback clicked Save — silently turning a compile into a cloud save of
+      // whatever identity the editor buffer currently holds. That is how unrelated
+      // scripts got overwritten. Returning null hands control to the caller's
+      // Ctrl+Enter shortcut: locale-independent, and it compiles without saving.
       return null;
     })()
   `);
@@ -445,7 +446,6 @@ export async function smartCompile() {
       var btns = document.querySelectorAll('button');
       var addBtn = null;
       var updateBtn = null;
-      var saveBtn = null;
       for (var i = 0; i < btns.length; i++) {
         var text = btns[i].textContent.trim();
         if (/save and add to chart/i.test(text)) {
@@ -454,11 +454,12 @@ export async function smartCompile() {
         }
         if (!addBtn && /^add to chart$/i.test(text)) addBtn = btns[i];
         if (!updateBtn && /^update on chart$/i.test(text)) updateBtn = btns[i];
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) saveBtn = btns[i];
       }
       if (addBtn) { addBtn.click(); return 'Add to chart'; }
       if (updateBtn) { updateBtn.click(); return 'Update on chart'; }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
+      // No Save-button fallback here either — see compile() above. On a localized UI
+      // the English-only labels match nothing, and clicking Save would write the
+      // buffer to the cloud instead of compiling. Fall through to Ctrl+Enter.
       return null;
     })()
   `);
