@@ -40,6 +40,30 @@ test('toFinalizePayload normalizza total_trades a intero', () => {
   assert.equal(Number.isInteger(p.total_trades), true);
 });
 
+test('toFinalizePayload limita profit_factor Infinity a 100 quando ci sono trade e segnala il flag', () => {
+  const p = toFinalizePayload({ ...TV, profit_factor: Infinity, total_trades: 42 }, {});
+  assert.equal(p.profit_factor, 100);
+  assert.equal(p.extra_metrics.profit_factor_capped, true);
+});
+
+test('toFinalizePayload limita profit_factor undefined a 100 quando ci sono trade (stessa semantica di Infinity)', () => {
+  const p = toFinalizePayload({ ...TV, profit_factor: undefined, total_trades: 42 }, {});
+  assert.equal(p.profit_factor, 100);
+  assert.equal(p.extra_metrics.profit_factor_capped, true);
+});
+
+test('toFinalizePayload NON limita profit_factor Infinity se non ci sono trade: 0 resta corretto', () => {
+  const p = toFinalizePayload({ ...TV, profit_factor: Infinity, total_trades: 0 }, {});
+  assert.equal(p.profit_factor, 0);
+  assert.equal(p.extra_metrics.profit_factor_capped, undefined);
+});
+
+test('toFinalizePayload NON tocca un profit_factor normale', () => {
+  const p = toFinalizePayload({ ...TV, profit_factor: 1.8, total_trades: 42 }, {});
+  assert.equal(p.profit_factor, 1.8);
+  assert.equal(p.extra_metrics.profit_factor_capped, undefined);
+});
+
 test('fingerprint è stabile e distingue metriche diverse', () => {
   assert.equal(fingerprint(TV), fingerprint({ ...TV }));
   assert.notEqual(fingerprint(TV), fingerprint({ ...TV, net_profit: 1234.6 }));

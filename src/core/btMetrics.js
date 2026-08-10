@@ -23,6 +23,29 @@ export function toFinalizePayload(tv = {}, ctx = {}) {
   for (const [k, v] of Object.entries(tv)) if (!CORE_KEYS.has(k)) extra[k] = v;
   if (ctx.properties && Object.keys(ctx.properties).length) extra.properties = ctx.properties;
 
+  const totalTrades = Math.round(num(tv.total_trades) ?? 0);
+
+  // TradingView riporta profitFactor come Infinity (o lo omette del tutto, undefined) quando
+  // la strategia non ha NESSUN trade in perdita: profit_factor = grossProfit / grossLoss e
+  // grossLoss è 0. num() scarta i valori non finiti, quindi senza questa correzione il
+  // payload finirebbe con profit_factor: 0 — il valore semanticamente OPPOSTO a quello vero
+  // (0 = pessimo, mentre "nessuna perdita" è il caso migliore possibile).
+  //
+  // Non è cosmetico: la piattaforma normalizza le metriche col min-max ALL'INTERNO della
+  // sessione per calcolare il punteggio che sceglie il miglior backtest. Un run senza perdite
+  // verrebbe classificato come il peggiore della matrice.
+  //
+  // Perché si scrive 100 e non un numero enorme tipo 9999: il min-max della sessione
+  // schiaccerebbe a zero il profit factor di TUTTI gli altri backtest, falsando la classifica
+  // dell'intera sessione. 100 resta chiaramente "ottimo" senza distruggere la scala. Il flag
+  // `profit_factor_capped` va letto come "nessun trade in perdita" — NON come se 100 fosse un
+  // valore realmente misurato. Se non ci sono trade, 0 resta corretto: non c'è nulla da limitare.
+  let profitFactor = num(tv.profit_factor) ?? 0;
+  if (!Number.isFinite(tv.profit_factor) && totalTrades > 0) {
+    profitFactor = 100;
+    extra.profit_factor_capped = true;
+  }
+
   return {
     symbol: ctx.symbol,
     timeframe: ctx.timeframe,
@@ -35,8 +58,8 @@ export function toFinalizePayload(tv = {}, ctx = {}) {
     max_drawdown: num(tv.max_drawdown) ?? 0,
     max_drawdown_pct: pct(tv.max_drawdown_percent) ?? 0,
     win_rate: pct(tv.percent_profitable) ?? 0,
-    profit_factor: num(tv.profit_factor) ?? 0,
-    total_trades: Math.round(num(tv.total_trades) ?? 0),
+    profit_factor: profitFactor,
+    total_trades: totalTrades,
     sharpe: num(tv.sharpe_ratio),
     sortino: num(tv.sortino_ratio),
     extra_metrics: extra,

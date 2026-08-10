@@ -43,6 +43,7 @@ export async function grindSession(opts, deps = {}) {
   const {
     session_id, entity_id, command_id = null, max_runs = 0,
     period_start = null, period_end = null, recalc_timeout_ms = 20000,
+    max_consecutive_failures = 3,
   } = opts;
 
   const {
@@ -67,6 +68,11 @@ export async function grindSession(opts, deps = {}) {
   let failed = 0;
   let stopped_reason = null;
   let prevFp = fingerprint((await getStrategyResults())?.metrics || {});
+  // Fallimenti CONSECUTIVI in finalize: un 422 isolato è un test storto e non deve fermare
+  // la matrice, ma se la causa è sistemica (es. initialCapital sempre null perché "Initial
+  // Capital" non viene riconosciuto tra gli input) ogni run fallisce allo stesso modo e senza
+  // questo contatore il grind macinerebbe l'intera coda a vuoto. Si azzera a ogni successo.
+  let consecutiveFinalizeFailures = 0;
 
   for (;;) {
     if (max_runs && executed + failed >= max_runs) break;
@@ -122,6 +128,7 @@ export async function grindSession(opts, deps = {}) {
       await api.stageEquity(run.id, shot.file_path);
       await api.finalize(run.id, payload);
       executed++;
+      consecutiveFinalizeFailures = 0;
       rows.push({
         run_id: run.id, label: run.label ?? null, status: 'done',
         symbol: run.symbol, timeframe: run.timeframe, period_label: run.period_label ?? null,
@@ -130,10 +137,23 @@ export async function grindSession(opts, deps = {}) {
       });
       await api.progress(command_id, `✔ run ${run.id}: ${payload.total_trades} trade, PF ${payload.profit_factor}`);
     } catch (err) {
-      // Un 422 non blocca la matrice (garanzia della piattaforma): la run resta failed e si prosegue.
+      // Un 422 isolato non blocca la matrice (garanzia della piattaforma): la run resta
+      // failed e si prosegue. Ma se il fallimento si ripete N volte DI FILA è un guasto
+      // sistemico (stesso campo obbligatorio sempre rifiutato): ci si ferma e si restituisce
+      // il controllo, invece di macinare l'intera matrice senza produrre nulla.
       await api.markFailed(run.id, err.message);
       failed++;
+      consecutiveFinalizeFailures++;
       rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: err.message.slice(0, 300) });
+
+      if (consecutiveFinalizeFailures >= max_consecutive_failures) {
+        stopped_reason = {
+          kind: 'systemic_failure', detail: err.message,
+          run_id: run.id, label: run.label ?? null,
+        };
+        await api.progress(command_id, `⛔ ${consecutiveFinalizeFailures} fallimenti consecutivi in finalize (run ${run.id}: ${err.message}) — mi fermo`);
+        break;
+      }
     }
 
     prevFp = fingerprint(results.metrics);

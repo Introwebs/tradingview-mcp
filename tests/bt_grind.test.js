@@ -134,3 +134,53 @@ test('un 422 sul finalize marca la run failed e prosegue con la successiva', asy
   assert.equal(out.executed, 1);
   assert.equal(out.stopped_reason, null);
 });
+
+test('tre fallimenti consecutivi in finalize sono un guasto sistemico: il grind si ferma e non tocca le run successive', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [
+      { id: 1, symbol: 'X', timeframe: '15', input_set: {} },
+      { id: 2, symbol: 'X', timeframe: '15', input_set: {} },
+      { id: 3, symbol: 'X', timeframe: '15', input_set: {} },
+      { id: 4, symbol: 'X', timeframe: '15', input_set: {} },
+      { id: 5, symbol: 'X', timeframe: '15', input_set: {} },
+    ],
+    metricsSeq: [M(), M({ net_profit: 2 }), M({ net_profit: 3 }), M({ net_profit: 4 }), M({ net_profit: 5 }), M({ net_profit: 6 })],
+  });
+  deps.api.finalize = async () => { throw new Error('HTTP 422: Initial Capital mancante'); };
+  let nextRunCalls = 0;
+  const origNextRun = deps.api.nextRun;
+  deps.api.nextRun = async (...args) => { nextRunCalls++; return origNextRun(...args); };
+
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+
+  assert.equal(out.stopped_reason.kind, 'systemic_failure');
+  assert.equal(out.stopped_reason.run_id, 3);
+  assert.equal(out.failed, 3);
+  assert.equal(out.executed, 0);
+  assert.equal(finalized.length, 0);
+  assert.equal(nextRunCalls, 3); // non chiamata per la run 4 o 5: il breaker ha fermato tutto prima
+});
+
+test('il contatore dei fallimenti consecutivi si azzera a ogni successo (fallimenti sparsi non sono un guasto sistemico)', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [
+      { id: 1, symbol: 'X', timeframe: '15', input_set: {} },
+      { id: 2, symbol: 'X', timeframe: '15', input_set: {} },
+      { id: 3, symbol: 'X', timeframe: '15', input_set: {} },
+      { id: 4, symbol: 'X', timeframe: '15', input_set: {} },
+    ],
+    metricsSeq: [M(), M({ net_profit: 2 }), M({ net_profit: 3 }), M({ net_profit: 4 }), M({ net_profit: 5 })],
+  });
+  const outcomes = [false, true, false, true]; // fallisce, ok, fallisce, ok
+  let i = 0;
+  deps.api.finalize = async (runId, payload) => {
+    const ok = outcomes[i++];
+    if (!ok) throw new Error('HTTP 422: errore isolato');
+    finalized.push({ runId, payload });
+    return { data: { id: runId * 10 } };
+  };
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  assert.equal(out.stopped_reason, null);
+  assert.equal(out.executed, 2);
+  assert.equal(out.failed, 2);
+});
