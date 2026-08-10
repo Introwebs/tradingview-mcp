@@ -11,7 +11,7 @@ import { existsSync, readFileSync } from 'node:fs';
 export function readFileConfig(p = join(homedir(), '.pinealgos', 'config.json')) {
   try {
     if (!existsSync(p)) return {};
-    const raw = readFileSync(p, 'utf8').replace(/^﻿/, '');
+    const raw = readFileSync(p, 'utf8').replace(/^\uFEFF/, '');
     const data = JSON.parse(raw);
     return data && typeof data === 'object' ? data : {};
   } catch {
@@ -28,20 +28,39 @@ export function resolveConfig({ env = process.env, fileConfig = readFileConfig()
   return { base, token };
 }
 
-export function makeApi({ base, token, fetchImpl = globalThis.fetch } = {}) {
+export function makeApi({ base, token, fetchImpl = globalThis.fetch, timeoutMs = 30000 } = {}) {
   const headers = (extra = {}) => ({ Authorization: `Bearer ${token}`, Accept: 'application/json', ...extra });
 
   async function req(method, path, { body, raw } = {}) {
-    const res = await fetchImpl(`${base}${path}`, {
-      method,
-      headers: raw ? headers() : headers(body ? { 'Content-Type': 'application/json' } : {}),
-      body: raw ? raw : body ? JSON.stringify(body) : undefined,
-    });
+    let res;
+    try {
+      res = await fetchImpl(`${base}${path}`, {
+        method,
+        headers: raw ? headers() : headers(body ? { 'Content-Type': 'application/json' } : {}),
+        body: raw ? raw : body ? JSON.stringify(body) : undefined,
+        // Il grind gira dentro un processo MCP di lunga durata su decine di run: senza timeout,
+        // un server bloccato o una rete impallata appende la chiamata per sempre e ferma tutto.
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      // fetch stessa può rigettare (DNS, ECONNREFUSED, abort per timeout) senza passare dal ramo
+      // !res.ok: senza questo try/catch il messaggio arriva come "TypeError: fetch failed" nudo,
+      // impossibile da diagnosticare quando il grind fa decine di chiamate simili.
+      throw new Error(`${method} ${path} → ${err.message}`);
+    }
     if (!res.ok) {
       const text = typeof res.text === 'function' ? await res.text() : '';
       throw new Error(`${method} ${path} → HTTP ${res.status}: ${text}`);
     }
-    return typeof res.json === 'function' ? res.json() : null;
+    if (typeof res.json !== 'function') return null;
+    try {
+      return await res.json();
+    } catch {
+      // Risposta ok ma corpo vuoto/non-JSON (204, pagina HTML da un proxy, body troncato): non è
+      // un errore della chiamata, quindi degradiamo a null invece di far esplodere "Unexpected
+      // end of JSON input" — i chiamanti (es. nextRun con `out?.data ?? null`) lo gestiscono già.
+      return null;
+    }
   }
 
   return {
