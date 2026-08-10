@@ -72,22 +72,39 @@ register('pine', {
         return core.check({ source });
       },
     }],
+    ['identity', {
+      description: 'Show which saved script the editor points at, and whether it has unsaved changes',
+      handler: () => core.getIdentity(),
+    }],
     ['save', {
-      description: 'Save the current Pine Script (Ctrl+S)',
-      handler: () => core.save(),
+      description: 'Save the current Pine Script and verify it landed (--name to title a new script)',
+      options: {
+        name: { type: 'string', short: 'n', description: 'Name for a brand-new unsaved script' },
+      },
+      handler: (opts) => core.save({ name: opts.name }),
     }],
     ['new', {
-      description: 'Create a new blank Pine Script (indicator, strategy, library)',
+      description: 'Create a real new Pine Script (indicator, strategy, library); --name saves it right away',
+      options: {
+        name: { type: 'string', short: 'n', description: 'Save the new script under this name' },
+      },
       handler: (opts, positionals) => {
         const type = positionals[0] || 'indicator';
-        return core.newScript({ type });
+        return core.newScript({ type, name: opts.name });
       },
     }],
     ['open', {
-      description: 'Open a saved Pine Script by name',
+      description: 'Open a saved Pine Script by its exact name',
       handler: (opts, positionals) => {
         if (!positionals[0]) throw new Error('Script name required. Usage: tv pine open "My Script"');
         return core.openScript({ name: positionals.join(' ') });
+      },
+    }],
+    ['read', {
+      description: 'Read a saved script\'s source without touching the editor buffer',
+      handler: (opts, positionals) => {
+        if (!positionals[0]) throw new Error('Script name required. Usage: tv pine read "My Script"');
+        return core.readScriptSource({ name: positionals.join(' ') });
       },
     }],
     ['list', {
