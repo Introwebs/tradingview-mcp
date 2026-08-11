@@ -52,6 +52,39 @@ export async function readInputValues(entityId, { evaluate = realEvaluate } = {}
   return out || {};
 }
 
+/**
+ * L'entity_id della strategia il cui report e' effettivamente calcolato, cioe' quella
+ * selezionata nel pannello Strategy Tester.
+ *
+ * Serve perche' getStrategyResults() NON accetta un entity_id: cerca "la prima strategia con
+ * un report" e restituisce quella. Con piu' strategie sul chart (il caso normale) il grind
+ * rischia di applicare gli input a una e leggere le metriche di un'altra, senza accorgersene:
+ * i numeri sarebbero plausibili e nessun controllo scatterebbe. Verificato dal vivo il
+ * 2026-08-10 su un chart con due strategie: solo quella selezionata nel pannello aveva
+ * reportData().performance, l'altra tornava null.
+ *
+ * @returns {Promise<string|null>} l'id, o null se nessuna strategia ha un report calcolato
+ */
+export async function readComputedReportEntityId({ evaluate = realEvaluate } = {}) {
+  return evaluate(`
+    (function() {
+      try {
+        var cw = ${CHART_API}._chartWidget;
+        var srcs = cw.model().model().dataSources();
+        for (var i = 0; i < srcs.length; i++) {
+          var s = srcs[i];
+          if (typeof s.reportData !== 'function') continue;
+          var rd = s.reportData();
+          if (rd && typeof rd.value === 'function') rd = rd.value();
+          if (!rd || !rd.performance) continue;
+          return (typeof s.id === 'function') ? s.id() : (s.id || null);
+        }
+        return null;
+      } catch (e) { return null; }
+    })()
+  `);
+}
+
 /** true se ogni chiave richiesta risulta applicata sul chart (confronto tollerante sui numeri). */
 export function readbackMatches(requested = {}, actual = {}) {
   for (const [k, want] of Object.entries(requested)) {

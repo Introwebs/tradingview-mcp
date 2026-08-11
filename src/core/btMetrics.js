@@ -1,9 +1,20 @@
 /**
  * Mapping metriche TradingView → payload di finalize Pine Algos, e rilevamento anomalie.
  *
- * TradingView espone le percentuali come 12.345 (= 12,345%); l'API Pine Algos le vuole
- * come ratio 0-1 (obiettivi e is_best sono valutati su quella scala). La conversione sta
- * QUI e in nessun altro posto.
+ * NESSUNA conversione di scala sulle percentuali. VERIFICATO DAL VIVO (2026-08-10, Imbalance
+ * Strategy su TVC:NDQ 5m): i campi `*Percent` dell'API interna di TradingView sono già ratio
+ * 0-1, non percentuali — esattamente la scala che l'API Pine Algos si aspetta.
+ *
+ *   netProfit 14184.535 su 100.000 di capitale  →  netProfitPercent 0.14184  (= 14,18%)
+ *   121 vincenti su 294                          →  percentProfitable 0.41156 (= 41,16%)
+ *   drawdown 8065.93                             →  maxStrategyDrawDownPercent 0.0668 (= 6,68%)
+ *
+ * La prima versione di questo file divideva per 100 dando per scontato che TV restituisse
+ * "12.345" per il 12,345%. Risultato: OGNI metrica percentuale finiva sulla piattaforma 100
+ * volte più piccola del vero — un drawdown del 6,68% registrato come 0,067%, e obiettivi tipo
+ * "DD <= 6%" superati da qualsiasi cosa. I test unitari non l'hanno intercettato perché
+ * codificavano la stessa assunzione sbagliata: solo l'esecuzione su dati reali poteva scoprirlo.
+ * Se un giorno i numeri sembrassero fuori scala, ricontrolla QUI per primo.
  */
 
 const CORE_KEYS = new Set([
@@ -12,7 +23,6 @@ const CORE_KEYS = new Set([
 ]);
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
-const pct = (v) => (num(v) === null ? null : num(v) / 100);
 
 /**
  * @param {Object} tv  metrics di getStrategyResults()
@@ -54,10 +64,11 @@ export function toFinalizePayload(tv = {}, ctx = {}) {
     initial_capital: ctx.initial_capital,
     inputs: ctx.inputs || {},
     net_profit: num(tv.net_profit) ?? 0,
-    net_profit_pct: pct(tv.net_profit_percent) ?? 0,
+    // Già ratio 0-1 lato TradingView: passano così come sono (vedi il commento in testa).
+    net_profit_pct: num(tv.net_profit_percent) ?? 0,
     max_drawdown: num(tv.max_drawdown) ?? 0,
-    max_drawdown_pct: pct(tv.max_drawdown_percent) ?? 0,
-    win_rate: pct(tv.percent_profitable) ?? 0,
+    max_drawdown_pct: num(tv.max_drawdown_percent) ?? 0,
+    win_rate: num(tv.percent_profitable) ?? 0,
     profit_factor: profitFactor,
     total_trades: totalTrades,
     sharpe: num(tv.sharpe_ratio),

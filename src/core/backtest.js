@@ -15,7 +15,12 @@
 import { setInputs as realSetInputs } from './indicators.js';
 import { getStrategyResults as realGetStrategyResults } from './data.js';
 import { captureScreenshot as realCaptureScreenshot } from './capture.js';
-import { readInputsInfo as realReadInputsInfo, readInputValues as realReadInputValues, readbackMatches } from './btChart.js';
+import {
+  readInputsInfo as realReadInputsInfo,
+  readInputValues as realReadInputValues,
+  readComputedReportEntityId as realReadComputedReportEntityId,
+  readbackMatches,
+} from './btChart.js';
 import { buildInputsPayload } from './btInputs.js';
 import { toFinalizePayload, fingerprint, detectAnomaly } from './btMetrics.js';
 
@@ -53,6 +58,7 @@ export async function grindSession(opts, deps = {}) {
     captureScreenshot = realCaptureScreenshot,
     readInputsInfo = realReadInputsInfo,
     readInputValues = realReadInputValues,
+    readComputedReportEntityId = realReadComputedReportEntityId,
     sleep = realSleep,
   } = deps;
 
@@ -62,6 +68,20 @@ export async function grindSession(opts, deps = {}) {
   // La mappa id→nome→tipo si legge UNA volta: non cambia tra le run della stessa strategia.
   const info = await readInputsInfo(entity_id);
   if (!info.length) throw new Error(`nessun input leggibile per entity_id=${entity_id}: la strategia è sul chart?`);
+
+  // Il report lo legge getStrategyResults(), che NON accetta un entity_id: prende la prima
+  // strategia con un report calcolato, cioè quella selezionata nel pannello Strategy Tester.
+  // Se non è la nostra, il grind applicherebbe gli input a una strategia e registrerebbe le
+  // metriche di un'altra — con numeri perfettamente plausibili e nessun errore. Si verifica
+  // una volta sola: la selezione del pannello non cambia da sé durante il grind.
+  const reportOwner = await readComputedReportEntityId();
+  if (reportOwner && reportOwner !== entity_id) {
+    throw new Error(
+      `il pannello Strategy Tester sta mostrando la strategia ${reportOwner}, non ${entity_id}: `
+      + 'seleziona la strategia giusta nel pannello prima di far partire il grind, '
+      + 'altrimenti i backtest registrerebbero le metriche di quella sbagliata.'
+    );
+  }
 
   const rows = [];
   let executed = 0;

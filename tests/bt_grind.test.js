@@ -29,6 +29,7 @@ function makeDeps({ runs, metricsSeq }) {
         { id: 'in_40', name: 'Initial Capital', type: 'float', group: null },
       ]),
       readInputValues: async () => ({ ...applied }),
+      readComputedReportEntityId: async () => 'ent1',
       sleep: async () => {},
     },
   };
@@ -183,4 +184,33 @@ test('il contatore dei fallimenti consecutivi si azzera a ogni successo (fallime
   assert.equal(out.stopped_reason, null);
   assert.equal(out.executed, 2);
   assert.equal(out.failed, 2);
+});
+
+test('rifiuta di partire se il pannello mostra una strategia diversa da quella bersaglio', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'X', timeframe: '15', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 2 })],
+  });
+  // Il pannello Strategy Tester ha selezionata un'ALTRA strategia: getStrategyResults()
+  // leggerebbe le sue metriche mentre gli input vengono applicati alla nostra.
+  deps.readComputedReportEntityId = async () => 'altra-strategia';
+
+  await assert.rejects(
+    () => grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps),
+    /altra-strategia.*ent1/s
+  );
+  assert.equal(finalized.length, 0);
+});
+
+test('parte lo stesso se nessuna strategia ha ancora un report calcolato', async () => {
+  // null = il pannello non ha ancora prodotto un report: non e' un motivo per bloccare,
+  // il primo getStrategyResults lo fa calcolare.
+  const { deps } = makeDeps({
+    runs: [{ id: 1, symbol: 'X', timeframe: '15', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 2 })],
+  });
+  deps.readComputedReportEntityId = async () => null;
+
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  assert.equal(out.executed, 1);
 });

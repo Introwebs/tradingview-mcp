@@ -2,27 +2,38 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { toFinalizePayload, fingerprint, detectAnomaly } from '../src/core/btMetrics.js';
 
+// Valori REALI letti da TradingView il 2026-08-10 (Imbalance Strategy, TVC:NDQ 5m, un anno di
+// storico). Sono presi dal vivo apposta: la versione precedente di questa fixture usava numeri
+// inventati nella scala sbagliata (12.345 per il 12,345%) e i test passavano confermando una
+// conversione /100 che sui dati veri sbagliava di 100×. Se cambi questi numeri, prendili da un
+// reportData() reale, non a mente.
 const TV = {
-  net_profit: 1234.5, net_profit_percent: 12.345,
-  max_drawdown: 300, max_drawdown_percent: 6.1,
-  profit_factor: 1.8, total_trades: 42,
-  percent_profitable: 55.5, sharpe_ratio: 1.2, sortino_ratio: 2.1,
+  net_profit: 14184.535, net_profit_percent: 0.14184535,
+  max_drawdown: 8065.926, max_drawdown_percent: 0.0668039791187022,
+  profit_factor: 1.1563842825920596, total_trades: 288,
+  percent_profitable: 0.41156462585034015, sharpe_ratio: 1.2, sortino_ratio: 2.1,
   gross_profit: 5000, gross_loss: 3765.5, commission_paid: 88,
 };
 
-test('toFinalizePayload converte le percentuali TV in ratio 0-1', () => {
+test('le percentuali TV passano invariate: sono GIA ratio 0-1, non vanno divise per 100', () => {
   const p = toFinalizePayload(TV, {});
-  assert.equal(p.net_profit_pct, 0.12345);
-  assert.equal(p.max_drawdown_pct, 0.061);
-  assert.equal(p.win_rate, 0.555);
+  assert.equal(p.net_profit_pct, 0.14184535);          // 14,18%
+  assert.equal(p.max_drawdown_pct, 0.0668039791187022); // 6,68%
+  assert.equal(p.win_rate, 0.41156462585034015);        // 41,16%
+});
+
+test('win_rate resta nel range 0-1 che il server valida', () => {
+  const p = toFinalizePayload(TV, {});
+  assert.ok(p.win_rate >= 0 && p.win_rate <= 1, `win_rate fuori range: ${p.win_rate}`);
+  assert.ok(p.max_drawdown_pct >= 0 && p.max_drawdown_pct <= 1);
 });
 
 test('toFinalizePayload tiene i valori assoluti come sono', () => {
   const p = toFinalizePayload(TV, {});
-  assert.equal(p.net_profit, 1234.5);
-  assert.equal(p.max_drawdown, 300);
-  assert.equal(p.profit_factor, 1.8);
-  assert.equal(p.total_trades, 42);
+  assert.equal(p.net_profit, 14184.535);
+  assert.equal(p.max_drawdown, 8065.926);
+  assert.equal(p.profit_factor, 1.1563842825920596);
+  assert.equal(p.total_trades, 288);
   assert.equal(p.sharpe, 1.2);
   assert.equal(p.sortino, 2.1);
 });
