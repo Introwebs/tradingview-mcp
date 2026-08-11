@@ -239,9 +239,20 @@ async function applicaContestoRun(run, ctx) {
 // 15 x 1,5 s = 22 s di margine. Il ricalcolo del report, una volta innescato con "Aggiorna report",
 // ha impiegato 10,6 s su un anno di M5 con 200 trade (misurato). I 4,8 s della prima stesura erano
 // una scommessa, non una misura.
-async function rileggiFinoACambio(entityId, prevFp, { leggiMetriche, periodoRistretto, sleep, tentativi = 15, attesaMs = 1500 }) {
+async function rileggiFinoACambio(entityId, prevFp, {
+  leggiMetriche, periodoRistretto, sleep, aggiornaReport = null, tentativi = 15, attesaMs = 1500,
+}) {
   let ultimo = null;
   for (let i = 0; i < tentativi; i++) {
+    // Il banner "Il report e' obsoleto" va ricercato a OGNI giro, non una volta sola dopo il set.
+    // Misurato il 2026-08-11: compare ~226 ms dopo il cambio di input e resta finche' non lo si
+    // preme, ma puo' arrivare dopo la finestra in cui lo cerchiamo, o il click puo' non atterrare
+    // se il pannello si sta ridisegnando. In quel caso la run moriva di `stale_metrics` con RR
+    // gia' applicato e il pannello fermo sul risultato precedente — cioe' esattamente il difetto
+    // che questo controllo dovrebbe impedire, riprodotto dal rimedio stesso.
+    if (aggiornaReport) {
+      try { await aggiornaReport(); } catch { /* si riprova al giro dopo */ }
+    }
     await sleep(attesaMs);
     ultimo = await leggiMetriche(entityId, periodoRistretto);
     if (ultimo?.success !== false && fingerprint(ultimo?.metrics || {}) !== prevFp) {
@@ -475,6 +486,19 @@ export async function grindSession(opts, deps = {}) {
       const staleContesto = !!(contestoCambiato && preContestoFp !== null && baselineFp === preContestoFp);
 
       const requested = run.input_set || {};
+
+      // Gli input erano GIA' quelli richiesti? Succede regolarmente: la prima run di una matrice e'
+      // quasi sempre la configurazione di default, cioe' quella gia' sul chart. In quel caso non
+      // c'e' nessun ricalcolo da attendere e le metriche restano — legittimamente — identiche alla
+      // baseline. Senza questa distinzione la run 1 di ogni sessione moriva di `silent_noop`.
+      let deltaReale = Object.keys(requested).length > 0;
+      if (deltaReale) {
+        try {
+          const valoriPrima = await readInputValues(entity_id);
+          if (readbackMatches(requested, valoriPrima)) deltaReale = false;
+        } catch { /* in dubbio si assume che un cambiamento ci sia */ }
+      }
+
       let setResult = { updated_inputs: {}, missing: [] };
       if (Object.keys(requested).length) {
         setResult = await setInputs({ entity_id, inputs: requested });
@@ -506,10 +530,10 @@ export async function grindSession(opts, deps = {}) {
       // fotografata dopo averlo applicato. Tenerlo qui dentro renderebbe `stale_metrics` inevitabile
       // per ogni run con `input_set` vuoto — quella run misura legittimamente lo stato post-contesto,
       // che e' esattamente la baseline.
-      const cambiamentoChiesto = Object.keys(requested).length > 0;
+      const cambiamentoChiesto = deltaReale;
       let staleConfermato = false;
       if (sameAsPrevious && cambiamentoChiesto) {
-        const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep });
+        const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep, aggiornaReport: aggiornaReportSeObsoleto });
         if (ri.cambiato) {
           results = ri.results;
           sameAsPrevious = false;
@@ -530,7 +554,9 @@ export async function grindSession(opts, deps = {}) {
       // comportamento giusto, non un no-op silenzioso.
       const anomaly = detectAnomaly({
         setResult, results, readbackOk, sameAsPrevious, staleConfermato, contestoCambiato,
-        recalcObserved: Object.keys(requested).length ? recalcObserved : null,
+        // Se gli input erano gia' quelli richiesti non c'e' nessun no-op da accusare: non
+        // ricalcolare e' il comportamento giusto.
+        recalcObserved: deltaReale ? recalcObserved : null,
       });
 
       // `zero_trades` NON ferma piu' la matrice da solo. Su un asse periodo una finestra corta senza

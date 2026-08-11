@@ -765,3 +765,58 @@ test('la baseline viene fotografata DOPO l applicazione del contesto', async () 
   assert.ok(iTf >= 0 && iInputs > iTf, 'il timeframe si applica prima degli input');
   assert.ok(letturePrimaDegliInput > 0, 'la baseline va letta fra il cambio di contesto e il set degli input');
 });
+
+test('input gia uguali a quelli richiesti: nessun ricalcolo atteso, la run passa', async () => {
+  // La prima run di una matrice e' quasi sempre la configurazione di default, cioe' quella gia'
+  // sul chart. Nessun input cambia, quindi nessun ricalcolo e metriche identiche alla baseline:
+  // e' il comportamento GIUSTO. Il 2026-08-11 questa run moriva di `silent_noop` e la matrice
+  // non partiva nemmeno.
+  const { deps, finalized } = makeDeps({
+    // in_0 vale gia' 1 nel chart finto: la run chiede esattamente quello.
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 1 } }],
+    metricsSeq: [M()],
+    metricheFerme: true,
+  });
+  deps.readStrategyLoading = async () => false;
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason, null);
+  assert.equal(finalized.length, 1);
+});
+
+test('il banner "report obsoleto" viene ricercato a OGNI rilettura, non solo dopo il set', async () => {
+  // Riprodotto dal vivo il 2026-08-11 (run 1156, "M5 - RR target 3.0"): RR applicato a 3, pannello
+  // fermo sui 651 trade della run precedente, nessun banner nella finestra in cui lo cercavamo.
+  // Il banner compare ~226 ms dopo il cambio ma puo' arrivare tardi, o il click puo' non atterrare
+  // se il pannello si sta ridisegnando: va ritentato a ogni giro di rilettura.
+  let chiamate = 0;
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 9 } }],
+    metricsSeq: [M()],
+  });
+  // Il pannello si sblocca solo al TERZO tentativo di aggiornamento.
+  let sbloccato = false;
+  deps.aggiornaReportSeObsoleto = async () => {
+    chiamate += 1;
+    if (chiamate >= 3) sbloccato = true;
+    return { obsoleto: !sbloccato, cliccato: !sbloccato };
+  };
+  const metriche = () => (sbloccato ? M({ total_trades: 77, net_profit: 4242 }) : M());
+  deps.readReportFor = async () => ({ success: true, metrics: metriche() });
+  // Anche il pannello deve raccontare la stessa storia, altrimenti le due fonti divergono e la
+  // scelta cade sul pannello prima ancora che il ritardo si manifesti.
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: metriche() });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 200, recalc_stable_checks: 1, recalc_step_ms: 10,
+  }, deps);
+
+  assert.ok(chiamate >= 3, `il refresh va ritentato: chiamate=${chiamate}`);
+  assert.equal(out.stopped_reason, null);
+  assert.equal(finalized[0].payload.total_trades, 77);
+});
