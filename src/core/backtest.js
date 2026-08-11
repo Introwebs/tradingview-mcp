@@ -407,19 +407,24 @@ export async function grindSession(opts, deps = {}) {
       // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
       const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
 
-      // BASELINE dallo STESSO canale che leggera' le metriche di questa run, presa PRIMA di toccare
-      // qualsiasi cosa. Prima si usava `prevFp`, che a inizio grind veniva da `readReportFor` —
-      // l'API interna, cieca al periodo. Con un periodo ristretto quel valore non c'entra niente col
-      // pannello, quindi la PRIMA run di ogni invocazione sfuggiva al controllo `stale_metrics`:
-      // ecco l'alternanza done/stale/done/stale osservata in produzione il 2026-08-11, con le "done"
-      // che registravano i numeri della configurazione precedente.
-      let baselineFp = prevFp;
-      try {
-        const prima = await leggiMetriche(entity_id, periodoRistretto);
-        if (prima?.success !== false && Object.keys(prima?.metrics || {}).length) {
-          baselineFp = fingerprint(prima.metrics);
-        }
-      } catch { /* si tiene prevFp */ }
+      // Fotografia PRIMA di toccare il contesto, e SOLO per le run che non cambiano input.
+      //
+      // Perche' solo quelle: se la run cambia anche gli input, il confronto baseline(post-contesto)
+      // vs risultato(post-input) copre gia' tutto — se il pannello e' rimasto indietro la baseline
+      // e' il valore vecchio e il confronto successivo se ne accorge. Aggiungere qui un secondo
+      // vincolo ("il contesto DEVE aver mosso i numeri") non aggiungerebbe protezione e potrebbe
+      // fermare la matrice per niente.
+      // Le run a `input_set` vuoto invece non hanno un secondo confronto: se il cambio di periodo o
+      // di timeframe non muove nulla, senza questa fotografia si registrerebbe il report del
+      // contesto precedente sotto l'etichetta di quello nuovo.
+      const soloContesto = Object.keys(run.input_set || {}).length === 0;
+      let preContestoFp = null;
+      if (soloContesto) {
+        try {
+          const p = await leggiMetriche(entity_id, periodoRistretto);
+          if (p?.success !== false && Object.keys(p?.metrics || {}).length) preContestoFp = fingerprint(p.metrics);
+        } catch { /* senza riferimento il controllo sul contesto si salta */ }
+      }
 
       // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
       // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
@@ -431,6 +436,43 @@ export async function grindSession(opts, deps = {}) {
         await api.progress(command_id, `⛔ run ${run.id}: ${a.kind} — mi fermo`);
         break;
       }
+
+      // BASELINE — va presa QUI: contesto gia' applicato, input ANCORA da applicare.
+      //
+      // Prima veniva letta all'inizio della run, cioe' PRIMA del cambio di symbol/timeframe. Su una
+      // transizione M5→M15 la baseline era quindi un valore M5, e il pannello — che dopo il cambio
+      // mostrava ancora il risultato M15 della run PRECEDENTE — risultava "diverso dalla baseline"
+      // e passava il controllo. Successo il 2026-08-11: il backtest #638 ("Solo Long", short
+      // disattivato) ha registrato i 169 trade di #637 ("Solo Conferma", short attivo).
+      //
+      // Perche' serve stabilizzare prima di leggerla: il cambio di contesto manda il report in
+      // "obsoleto" a sua volta. Se la baseline si prendesse a report obsoleto sarebbe di nuovo un
+      // valore vecchio, e il confronto successivo non direbbe niente. Quindi: si aggiorna il report,
+      // si aspetta che i numeri si assestino, e SOLO ALLORA si fotografa lo stato "contesto nuovo,
+      // input vecchi". Da li' in poi qualunque immobilita' e' colpa degli input non applicati.
+      if (contestoCambiato) {
+        const rinfresco = await aggiornaReportSeObsoleto();
+        if (rinfresco.cliccato) {
+          await api.progress(command_id, `run ${run.id}: contesto cambiato, report aggiornato prima della baseline`);
+        }
+      }
+      let baselineFp = prevFp;
+      try {
+        const prima = await waitByFingerprint(entity_id, null, {
+          readReport: (id) => leggiMetriche(id, periodoRistretto), sleep,
+          deadline: Date.now() + Math.min(recalc_timeout_ms, 30000),
+          stepMs: recalc_step_ms, stableChecks: recalc_stable_checks,
+        });
+        if (prima?.success !== false && Object.keys(prima?.metrics || {}).length) {
+          baselineFp = fingerprint(prima.metrics);
+        }
+      } catch { /* si tiene prevFp */ }
+
+      // Il contesto e' cambiato ma i numeri sono gli stessi di prima del cambio: impossibile.
+      // Un altro symbol, un altro timeframe o un'altra finestra temporale non possono produrre lo
+      // stesso identico report. Se succede, il pannello non si e' aggiornato e proseguire
+      // significherebbe etichettare col contesto nuovo dei numeri che appartengono a quello vecchio.
+      const staleContesto = !!(contestoCambiato && preContestoFp !== null && baselineFp === preContestoFp);
 
       const requested = run.input_set || {};
       let setResult = { updated_inputs: {}, missing: [] };
@@ -460,7 +502,11 @@ export async function grindSession(opts, deps = {}) {
       // Metriche identiche alla run precedente DOPO aver chiesto un cambiamento: quasi sempre e' il
       // pannello che non si e' ancora ridisegnato. Si rilegge invece di scrivere. Se il contesto e'
       // cambiato (symbol o timeframe) l'identita' e' addirittura impossibile, non solo sospetta.
-      const cambiamentoChiesto = Object.keys(requested).length > 0 || contestoCambiato;
+      // Solo gli INPUT: il cambio di contesto e' gia' assorbito nella baseline, che viene
+      // fotografata dopo averlo applicato. Tenerlo qui dentro renderebbe `stale_metrics` inevitabile
+      // per ogni run con `input_set` vuoto — quella run misura legittimamente lo stato post-contesto,
+      // che e' esattamente la baseline.
+      const cambiamentoChiesto = Object.keys(requested).length > 0;
       let staleConfermato = false;
       if (sameAsPrevious && cambiamentoChiesto) {
         const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep });
@@ -472,6 +518,9 @@ export async function grindSession(opts, deps = {}) {
           staleConfermato = true;
         }
       }
+      // I due controlli confluiscono: contesto fermo O input fermi, in entrambi i casi si scrive
+      // qualcosa che non appartiene a questa run.
+      if (staleContesto) staleConfermato = true;
 
       const actual = await readInputValues(entity_id);
       const readbackOk = readbackMatches(requested, actual);

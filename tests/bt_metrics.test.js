@@ -104,10 +104,14 @@ test('detectAnomaly NON segnala metriche identiche se il readback conferma il se
   assert.equal(a, null);
 });
 
-test('detectAnomaly segnala il no-op silenzioso: metriche identiche E readback fallito', () => {
+test('readback fallito = readback_mismatch, anche se le metriche sono rimaste identiche', () => {
+  // Prima questo caso tornava `silent_noop`, che mandava a cercare un problema di ricalcolo
+  // quando il problema era che il set non si era applicato. Se il readback dice che i valori non
+  // sono quelli richiesti, QUELLA e' la diagnosi: le metriche ferme ne sono la conseguenza.
   const a = detectAnomaly({
     setResult: { missing: [] }, results: { success: true, metrics: TV },
     readbackOk: false, sameAsPrevious: true,
   });
-  assert.equal(a?.kind, 'silent_noop');
+  assert.equal(a?.kind, 'readback_mismatch');
+  assert.match(a.detail, /invariate/);
 });

@@ -127,13 +127,21 @@ export function detectAnomaly({
   // Nessun ricalcolo E metriche invariate: il set è arrivato a TradingView senza cambiare nulla.
   // Fail-closed di proposito — fermarsi per sbaglio costa un riavvio del grind, proseguire per
   // sbaglio scrive nel database un backtest che non corrisponde agli input dichiarati.
+  // Il readback si valuta PRIMA del no-op: se i valori riletti non sono quelli richiesti, quella e'
+  // la diagnosi primaria e dice cosa fare. Che le metriche siano anche rimaste ferme e' una
+  // conseguenza, non un'informazione in piu': etichettarlo `silent_noop` mandava a cercare un
+  // problema di ricalcolo quando il problema era che il set non si era applicato.
+  if (!readbackOk) {
+    return {
+      kind: 'readback_mismatch',
+      detail: sameAsPrevious
+        ? 'i valori riletti non corrispondono a quelli richiesti, e le metriche sono rimaste invariate'
+        : 'i valori riletti non corrispondono a quelli richiesti',
+    };
+  }
+  // Valori applicati e confermati, ma il motore non si e' mosso e i numeri sono quelli di prima.
   if (recalcObserved === false && sameAsPrevious) {
     return { kind: 'silent_noop', detail: 'nessun ricalcolo osservato dopo il set e metriche invariate' };
-  }
-  if (!readbackOk) {
-    return sameAsPrevious
-      ? { kind: 'silent_noop', detail: 'valori non confermati dal readback e metriche invariate' }
-      : { kind: 'readback_mismatch', detail: 'i valori riletti non corrispondono a quelli richiesti' };
   }
   // PRIMA di `stale_metrics`: due run consecutive a zero trade hanno per forza la stessa firma
   // (sono tutti zeri), e chiamarla "pannello fermo" nasconderebbe il dato vero. E' anche innocuo

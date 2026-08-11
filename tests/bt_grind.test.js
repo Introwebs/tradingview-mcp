@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { grindSession } from '../src/core/backtest.js';
 
-function makeDeps({ runs, metricsSeq }) {
+function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
   const queue = [...runs];
   const finalized = [];
   const seen = { reportIds: [], loadingIds: [], refreshChiamato: 0 };
@@ -11,6 +11,14 @@ function makeDeps({ runs, metricsSeq }) {
   // quando cambia qualcosa: input, symbol, timeframe, periodo. Chi vuole simulare metriche che si
   // muovono DURANTE il ricalcolo sovrascrive readReportFor.
   let call = 0;
+  // Esaurita la sequenza NON si ripete l'ultimo valore: ripeterlo simula un pannello fermo, che e'
+  // il difetto del 2026-08-11 (report obsoleto mai aggiornato), e faceva passare per scenari neutri
+  // dei test che stavano descrivendo un bug. Chi vuole le metriche immobili passa `metricheFerme`.
+  const metricaCorrente = () => {
+    if (call < metricsSeq.length) return metricsSeq[call];
+    const ultimo = metricsSeq[metricsSeq.length - 1];
+    return metricheFerme ? ultimo : { ...ultimo, net_profit: 100000 + call };
+  };
   // Il chart finto tiene davvero lo stato degli input: se non lo facesse, il readback di
   // grindSession vedrebbe valori diversi da quelli richiesti e ogni run finirebbe in
   // readback_mismatch. È esattamente il controllo che vogliamo esercitare.
@@ -31,10 +39,10 @@ function makeDeps({ runs, metricsSeq }) {
         finalize: async (runId, payload) => { finalized.push({ runId, payload }); return { data: { id: runId * 10 } }; },
         progress: async () => null,
       },
-      setInputs: async ({ inputs }) => { applied = { ...applied, ...inputs }; loadingPending = true; call = Math.min(call + 1, metricsSeq.length - 1); return { updated_inputs: inputs, missing: [] }; },
+      setInputs: async ({ inputs }) => { applied = { ...applied, ...inputs }; loadingPending = true; call += 1; return { updated_inputs: inputs, missing: [] }; },
       readReportFor: async (id) => {
         seen.reportIds.push(id);
-        return { success: true, metrics: metricsSeq[Math.min(call, metricsSeq.length - 1)] };
+        return { success: true, metrics: metricaCorrente() };
       },
       readStrategyLoading: async (id) => {
         seen.loadingIds.push(id);
@@ -50,12 +58,12 @@ function makeDeps({ runs, metricsSeq }) {
       // Chart finto: tiene davvero symbol/timeframe/periodo, cosi' le verifiche di
       // applicaContestoRun esercitano il comportamento vero invece di passare a vuoto.
       getChartState: async () => ({ symbol: chart.symbol, resolution: chart.resolution }),
-      setSymbol: async ({ symbol }) => { chart.symbol = symbol; call = Math.min(call + 1, metricsSeq.length - 1); return { success: true }; },
-      setTimeframe: async ({ timeframe }) => { chart.resolution = String(timeframe); call = Math.min(call + 1, metricsSeq.length - 1); return { success: true }; },
+      setSymbol: async ({ symbol }) => { chart.symbol = symbol; call += 1; return { success: true }; },
+      setTimeframe: async ({ timeframe }) => { chart.resolution = String(timeframe); call += 1; return { success: true }; },
       readTestPeriod: async () => ({ ...chart.periodo }),
       setCustomPeriod: async (from, to) => {
         chart.periodo = { label: `${from} — ${to}`, from, to };
-        call = Math.min(call + 1, metricsSeq.length - 1);
+        call += 1;
         return { applied: true, ...chart.periodo };
       },
       // Il pannello finto serve le stesse metriche dell'API: le run che dichiarano un periodo
@@ -63,7 +71,7 @@ function makeDeps({ runs, metricsSeq }) {
       // Il pannello SBIRCIA la stessa metrica dell'API senza far avanzare la sequenza: cosi' le
       // due fonti concordano e i test restano leggibili. Chi vuole esercitare la divergenza
       // (periodo ristretto) sovrascrive questa dep.
-      readPanelMetrics: async () => ({ success: true, source: 'panel', metrics: metricsSeq[Math.min(call, metricsSeq.length - 1)] }),
+      readPanelMetrics: async () => ({ success: true, source: 'panel', metrics: metricaCorrente() }),
       captureScreenshot: async () => ({ file_path: '/tmp/shot.png' }),
       readInputsInfo: async () => ([
         { id: 'in_0', name: 'Risk/Reward', type: 'float', group: 'Ingressi' },
@@ -289,6 +297,7 @@ test('se il ricalcolo non parte mai e le metriche non cambiano è un no-op silen
   const { deps, finalized } = makeDeps({
     runs: [{ id: 1, symbol: 'X', timeframe: '15', input_set: { in_0: 2 } }],
     metricsSeq: [M()], // saturato: le metriche non cambiano mai
+    metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
   deps.readStrategyLoading = async () => false; // isLoading non passa mai a true
 
@@ -464,10 +473,17 @@ test('periodo ristretto: il pannello che arriva in ritardo viene atteso, non fat
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2026-08-08', period_end: '2026-08-11', input_set: { in_0: 2 } }],
     metricsSeq: [M()],
   });
+  // Dopo il ridisegno il pannello deve dare un valore NUOVO: restare su una costante sarebbe il
+  // pannello fermo, cioe' un difetto, non un ritardo.
+  let applicato = false;
+  const setOrig = deps.setInputs;
+  deps.setInputs = async (arg) => { const r = await setOrig(arg); applicato = true; return r; };
   deps.readPanelMetrics = async () => {
     tentativi++;
     if (tentativi <= 3) return { success: false, retryable: true, metrics: {}, source: 'panel', error: 'in ridisegno' };
-    return { success: true, source: 'panel', metrics: M({ total_trades: 5, net_profit: 42 }) };
+    return applicato
+      ? { success: true, source: 'panel', metrics: M({ total_trades: 5, net_profit: 42 }) }
+      : { success: true, source: 'panel', metrics: M({ total_trades: 11, net_profit: 7 }) };
   };
 
   const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 3000, recalc_stable_checks: 1 }, deps);
@@ -536,6 +552,7 @@ test('metriche identiche dopo un cambio di TIMEFRAME: impossibile, si ferma', as
   const { deps, finalized } = makeDeps({
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '5', input_set: {} }],
     metricsSeq: [M()], // il pannello resta fermo sui numeri di prima
+    metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
 
   const out = await grindSession({
@@ -552,6 +569,7 @@ test('metriche identiche dopo un cambio di INPUT: si ferma invece di scrivere', 
   const { deps, finalized } = makeDeps({
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 } }],
     metricsSeq: [M()],
+    metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
 
   const out = await grindSession({
@@ -600,6 +618,7 @@ test('cambio di PERIODO: metriche identiche = stale (l asse periodo da solo deve
   const { deps, finalized } = makeDeps({
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: {}, period_start: '2026-07-12', period_end: '2026-08-11' }],
     metricsSeq: [M()],
+    metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
 
   const out = await grindSession({
@@ -693,4 +712,56 @@ test('le run rimaste appese in running vengono rimesse in coda a inizio grind', 
   await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
 
   assert.deepEqual(recuperate, [1140, 1141]);
+});
+
+// --- La baseline va presa DOPO il cambio di contesto (incidente #638, 2026-08-11) -------------
+// Prima veniva letta a inizio run, cioe' prima del cambio di timeframe. Su una transizione M5→M15
+// la baseline era un valore M5, mentre il pannello mostrava ancora il risultato M15 della run
+// PRECEDENTE: diverso dalla baseline, quindi "cambiato", quindi accettato. Il backtest #638
+// ("Solo Long", short disattivato) ha cosi' registrato i 169 trade di #637 (short attivo).
+
+test('cambio di timeframe + pannello fermo sui numeri della run prima = stale, non "cambiato"', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '5', input_set: { in_0: 7 }, period_start: '2024-08-11', period_end: '2026-08-11' }],
+    metricsSeq: [M()],
+  });
+
+  // Il chart finto parte da TF 15. Il pannello simula il difetto reale:
+  //  - finche' siamo su TF 15 (prima del cambio) mostra il valore della run precedente;
+  //  - dopo il passaggio a TF 5 continua a mostrare LO STESSO valore, perche' non si e' aggiornato.
+  // Con la baseline presa prima del cambio, quel valore sembrava "nuovo". Ora no.
+  const { chart } = makeDeps({ runs: [], metricsSeq: [M()] }); // solo per non confondere le closure
+  void chart;
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: M({ total_trades: 169, net_profit: -630 }) });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2024-08-11', period_end: '2026-08-11',
+    recalc_timeout_ms: 300, recalc_stable_checks: 1, recalc_step_ms: 10,
+  }, deps);
+
+  assert.equal(out.stopped_reason?.kind, 'stale_metrics');
+  assert.equal(finalized.length, 0, 'non deve registrare i numeri della run precedente');
+});
+
+test('la baseline viene fotografata DOPO l applicazione del contesto', async () => {
+  // Ordine atteso: setTimeframe -> (report) -> letture di baseline -> setInputs.
+  const ordine = [];
+  const { deps } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '5', input_set: { in_0: 7 } }],
+    metricsSeq: [M(), M({ net_profit: 999 })],
+  });
+  const tfOrig = deps.setTimeframe;
+  deps.setTimeframe = async (a) => { ordine.push('timeframe'); return tfOrig(a); };
+  const readOrig = deps.readReportFor;
+  deps.readReportFor = async (id) => { ordine.push('lettura'); return readOrig(id); };
+  const setOrig = deps.setInputs;
+  deps.setInputs = async (a) => { ordine.push('inputs'); return setOrig(a); };
+
+  await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 300, recalc_stable_checks: 1, recalc_step_ms: 10 }, deps);
+
+  const iTf = ordine.indexOf('timeframe');
+  const iInputs = ordine.indexOf('inputs');
+  const letturePrimaDegliInput = ordine.slice(iTf, iInputs).filter((x) => x === 'lettura').length;
+  assert.ok(iTf >= 0 && iInputs > iTf, 'il timeframe si applica prima degli input');
+  assert.ok(letturePrimaDegliInput > 0, 'la baseline va letta fra il cambio di contesto e il set degli input');
 });
