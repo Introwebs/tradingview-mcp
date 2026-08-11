@@ -13,9 +13,11 @@ function makeDeps({ runs, metricsSeq }) {
   let applied = { in_0: 1, in_40: 10000 };
   // Il motore finto: applicare input accende il ricalcolo per una lettura, come TradingView.
   let loadingPending = false;
+  const chart = { symbol: 'EURUSD', resolution: '15', periodo: { label: 'Storico completo', from: null, to: null } };
   return {
     finalized,
     seen,
+    chart,
     deps: {
       api: {
         nextRun: async () => queue.shift() ?? null,
@@ -35,8 +37,25 @@ function makeDeps({ runs, metricsSeq }) {
         if (loadingPending) { loadingPending = false; return true; }
         return false;
       },
+      ensureTesterPanel: async () => ({ ok: true, altezza: 400 }),
       ensureVisibleFor: async () => ({ found: true, wasHidden: false, visible: true }),
       setStrategyVisibility: async () => true,
+      // Chart finto: tiene davvero symbol/timeframe/periodo, cosi' le verifiche di
+      // applicaContestoRun esercitano il comportamento vero invece di passare a vuoto.
+      getChartState: async () => ({ symbol: chart.symbol, resolution: chart.resolution }),
+      setSymbol: async ({ symbol }) => { chart.symbol = symbol; return { success: true }; },
+      setTimeframe: async ({ timeframe }) => { chart.resolution = String(timeframe); return { success: true }; },
+      readTestPeriod: async () => ({ ...chart.periodo }),
+      setCustomPeriod: async (from, to) => {
+        chart.periodo = { label: `${from} — ${to}`, from, to };
+        return { applied: true, ...chart.periodo };
+      },
+      // Il pannello finto serve le stesse metriche dell'API: le run che dichiarano un periodo
+      // leggono SOLO da qui, quindi senza di lui fallirebbero (ed e' il comportamento voluto).
+      // Il pannello SBIRCIA la stessa metrica dell'API senza far avanzare la sequenza: cosi' le
+      // due fonti concordano e i test restano leggibili. Chi vuole esercitare la divergenza
+      // (periodo ristretto) sovrascrive questa dep.
+      readPanelMetrics: async () => ({ success: true, source: 'panel', metrics: metricsSeq[Math.min(call, metricsSeq.length - 1)] }),
       captureScreenshot: async () => ({ file_path: '/tmp/shot.png' }),
       readInputsInfo: async () => ([
         { id: 'in_0', name: 'Risk/Reward', type: 'float', group: 'Ingressi' },
@@ -91,18 +110,41 @@ test('si ferma se il readback non conferma i valori richiesti', async () => {
   assert.equal(finalized.length, 0);
 });
 
-test('si ferma e restituisce il controllo su 0 trade', async () => {
+test('una run senza trade non viene finalizzata ma NON ferma la matrice', async () => {
+  // Su un asse periodo una finestra corta senza trade e' un dato, non un guasto: verificato dal
+  // vivo il 2026-08-11 (M15 su 7 giorni fa davvero zero trade). Fermarsi li' buttava via le altre
+  // diciannove run della sessione.
   const { deps, finalized } = makeDeps({
     runs: [
       { id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 } },
       { id: 2, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 } },
     ],
-    metricsSeq: [M(), M({ total_trades: 0 })],
+    metricsSeq: [M({ total_trades: 0 })],
   });
   const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
 
-  assert.equal(out.stopped_reason.kind, 'zero_trades');
-  assert.equal(out.stopped_reason.run_id, 1);
+  // Entrambe le run sono state TENTATE: la prima a zero trade non ha abortito la matrice.
+  assert.equal(out.failed, 2);
+  assert.equal(out.stopped_reason, null);   // due non bastano a dichiarare il guasto sistemico
+  assert.equal(finalized.length, 0);        // ma nessuna viene registrata come backtest valido
+  assert.equal(out.rows.length, 2);
+  assert.equal(out.rows[0].error, 'zero_trades');
+});
+
+test('tre run consecutive a zero trade sono una configurazione rotta, non un periodo corto', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [
+      { id: 1, symbol: 'X', timeframe: '15', input_set: { in_0: 2 } },
+      { id: 2, symbol: 'X', timeframe: '15', input_set: { in_0: 3 } },
+      { id: 3, symbol: 'X', timeframe: '15', input_set: { in_0: 4 } },
+      { id: 4, symbol: 'X', timeframe: '15', input_set: { in_0: 5 } },
+    ],
+    metricsSeq: [M({ total_trades: 0, net_profit: 1 }), M({ total_trades: 0, net_profit: 2 }), M({ total_trades: 0, net_profit: 3 }), M({ total_trades: 0, net_profit: 4 })],
+  });
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+
+  assert.equal(out.stopped_reason.kind, 'zero_trades_systemic');
+  assert.equal(out.failed, 3);
   assert.equal(finalized.length, 0);
 });
 
@@ -301,6 +343,133 @@ test('una run con input_set vuoto non viene scambiata per un no-op silenzioso', 
   assert.equal(finalized.length, 1);
 });
 
+// --- I QUATTRO ASSI DELLA MATRICE ------------------------------------------------------------
+// Questi test esistono per un disastro reale (2026-08-11): bt_grind applicava SOLO l'input_set e
+// scriveva symbol, timeframe e periodo della run nel payload come se li avesse imposti. Venti run
+// richieste su due timeframe e dieci periodi hanno prodotto dieci copie dello stesso backtest,
+// ognuna con un'etichetta che non le apparteneva. Nessuno dei 57 test di allora se ne accorgeva,
+// perche' nessuno faceva variare quegli assi.
+
+test('applica symbol e timeframe della run al chart, non solo gli input', async () => {
+  const { deps, chart } = makeDeps({
+    runs: [{ id: 1, symbol: 'TVC:NDQ', timeframe: '5', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 2 })],
+  });
+  await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(chart.symbol, 'TVC:NDQ');
+  assert.equal(chart.resolution, '5');
+});
+
+test('si ferma se il timeframe non viene applicato davvero', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '5', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 2 })],
+  });
+  deps.setTimeframe = async () => ({ success: true }); // accetta ma non cambia nulla
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(out.stopped_reason.kind, 'timeframe_not_applied');
+  assert.equal(finalized.length, 0);
+});
+
+test('si ferma se il periodo non viene applicato davvero', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2026-08-04', period_end: '2026-08-11', input_set: {} }],
+    metricsSeq: [M()],
+  });
+  deps.setCustomPeriod = async () => ({ applied: false, label: null, from: null, to: null, error: 'dialog non compilabile' });
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(out.stopped_reason.kind, 'period_not_applied');
+  assert.equal(finalized.length, 0);
+});
+
+test('registra il periodo REALE applicato da TradingView, non quello richiesto', async () => {
+  // Caso vero: si chiede dal 2020 ma la storia disponibile parte dal 2023. Il backtest e' valido,
+  // ma va etichettato con quello che e' stato davvero misurato.
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2020-01-01', period_end: '2026-08-11', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 2 })],
+  });
+  deps.setCustomPeriod = async () => ({ applied: true, label: '4 ago 2023 — 11 ago 2026', from: '2023-08-04', to: '2026-08-11' });
+  deps.readTestPeriod = async () => ({ label: '4 ago 2023 — 11 ago 2026', from: '2023-08-04', to: '2026-08-11' });
+
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(out.executed, 1);
+  assert.equal(finalized[0].payload.period_start, '2023-08-04');
+  assert.notEqual(finalized[0].payload.period_start, '2020-01-01');
+  assert.equal(finalized[0].payload.extra_metrics.period_requested, '2020-01-01 → 2026-08-11');
+  assert.equal(finalized[0].payload.extra_metrics.period_applied, '4 ago 2023 — 11 ago 2026');
+});
+
+test('con un periodo ristretto le metriche vengono dal PANNELLO, non dall API interna cieca al periodo', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2026-08-04', period_end: '2026-08-11', input_set: { in_0: 2 } }],
+    metricsSeq: [M({ total_trades: 288, net_profit: 28309 })], // l'API interna vede tutto lo storico
+  });
+  deps.readPanelMetrics = async () => ({
+    success: true, source: 'panel',
+    metrics: { total_trades: 3, net_profit: -101.14, net_profit_percent: -0.001, max_drawdown: 2104.68, max_drawdown_percent: 0.0206, percent_profitable: 0.3333, profit_factor: 0.952 },
+  });
+
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(out.executed, 1);
+  assert.equal(finalized[0].payload.total_trades, 3);
+  assert.equal(finalized[0].payload.net_profit, -101.14);
+  assert.equal(finalized[0].payload.extra_metrics.metrics_source, 'panel');
+});
+
+test('periodo ristretto e pannello illeggibile: NON si ripiega sull API interna, si fallisce', async () => {
+  // Difetto trovato dal vivo il 2026-08-11: dopo un cambio di timeframe il pannello era ancora in
+  // ridisegno, il codice ripiegava sull'API interna — che ignora il periodo — e la run "3 giorni"
+  // ha registrato i 288 trade dello storico intero. Un ripiego su una fonte che si SA sbagliata
+  // per questa configurazione e' peggio di un fallimento.
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2026-08-08', period_end: '2026-08-11', input_set: { in_0: 2 } }],
+    metricsSeq: [M({ total_trades: 288, net_profit: 28309 })],
+  });
+  deps.readPanelMetrics = async () => ({ success: false, retryable: true, metrics: {}, source: 'panel', error: 'pannello in ridisegno' });
+
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+
+  assert.equal(out.executed, 0);
+  assert.equal(finalized.length, 0);
+  assert.equal(out.stopped_reason.kind, 'runtime_error');
+  assert.match(out.stopped_reason.detail, /pannello/i);
+});
+
+test('periodo ristretto: il pannello che arriva in ritardo viene atteso, non fatto fallire', async () => {
+  // Il rovescio del test precedente: un ritardo di rendering non deve bruciare la run.
+  let tentativi = 0;
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2026-08-08', period_end: '2026-08-11', input_set: { in_0: 2 } }],
+    metricsSeq: [M()],
+  });
+  deps.readPanelMetrics = async () => {
+    tentativi++;
+    if (tentativi <= 3) return { success: false, retryable: true, metrics: {}, source: 'panel', error: 'in ridisegno' };
+    return { success: true, source: 'panel', metrics: M({ total_trades: 5, net_profit: 42 }) };
+  };
+
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 3000, recalc_stable_checks: 1 }, deps);
+
+  assert.equal(out.executed, 1);
+  assert.equal(finalized[0].payload.total_trades, 5);
+  assert.ok(tentativi > 3);
+});
+
+test('senza filtro di periodo si usa l API interna, piu ricca (Sharpe e Sortino)', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 } }],
+    metricsSeq: [M({ total_trades: 288, sharpe_ratio: 0.3, sortino_ratio: 0.77 })],
+  });
+  // pannello e API concordano sul numero di trade => nessun filtro attivo
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: { total_trades: 288, net_profit: 1 } });
+
+  await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(finalized[0].payload.extra_metrics.metrics_source, 'internal_api');
+  assert.equal(finalized[0].payload.sharpe, 0.3);
+  assert.equal(finalized[0].payload.sortino, 0.77);
+});
+
 test('rimette nascosta la strategia se era nascosta prima del grind', async () => {
   const { deps } = makeDeps({
     runs: [{ id: 1, symbol: 'X', timeframe: '15', input_set: { in_0: 2 } }],
@@ -327,3 +496,4 @@ test('non tocca la visibilità se la strategia era già visibile', async () => {
   await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
   assert.deepEqual(restored, []);
 });
+

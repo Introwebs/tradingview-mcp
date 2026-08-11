@@ -14,6 +14,9 @@
  */
 import { setInputs as realSetInputs } from './indicators.js';
 import { captureScreenshot as realCaptureScreenshot } from './capture.js';
+import { setSymbol as realSetSymbol, setTimeframe as realSetTimeframe, getState as realGetState } from './chart.js';
+import { setCustomPeriod as realSetCustomPeriod, readTestPeriod as realReadTestPeriod } from './btPeriod.js';
+import { readPanelMetrics as realReadPanelMetrics, ensureTesterPanel as realEnsureTesterPanel } from './btPanel.js';
 import {
   readInputsInfo as realReadInputsInfo,
   readInputValues as realReadInputValues,
@@ -112,6 +115,13 @@ async function waitByFingerprint(entityId, requireChangeFrom, { readReport, slee
 
   for (;;) {
     last = await readReport(entityId);
+    // `retryable` = "non ancora pronto" (tipicamente il pannello in ridisegno dopo un cambio di
+    // timeframe o periodo). Si continua a leggere finche' c'e' tempo, invece di far fallire la run
+    // per un ritardo di rendering — o, peggio, di accontentarsi di una fonte sbagliata.
+    if (last && last.success === false && last.retryable && Date.now() < deadline) {
+      await sleep(stepMs);
+      continue;
+    }
     if (!last || last.success === false) return last;
 
     const fp = fingerprint(last.metrics);
@@ -123,6 +133,128 @@ async function waitByFingerprint(entityId, requireChangeFrom, { readReport, slee
     if (Date.now() >= deadline) return last;
     await sleep(stepMs);
   }
+}
+
+/** "2026-08-08T00:00:00.000000Z" o "2026-08-08" -> "2026-08-08". null se non riconoscibile. */
+export function giornoISO(v) {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v || ''));
+  return m ? m[1] : null;
+}
+
+/** Due ticker coincidono anche se uno e' senza exchange ("TVC:NDQ" vs "NDQ"). */
+function stessoSymbol(a, b) {
+  if (!a || !b) return false;
+  const norm = (s) => String(s).toUpperCase().split(':').pop();
+  return String(a).toUpperCase() === String(b).toUpperCase() || norm(a) === norm(b);
+}
+
+/**
+ * Porta il chart nello stato che la run dichiara — symbol, timeframe, periodo di test — e
+ * VERIFICA che ci sia arrivato davvero.
+ *
+ * E' la funzione che mancava del tutto fino al 2026-08-11: bt_grind applicava solo gli input e
+ * scriveva symbol/timeframe/periodo nel payload come se li avesse imposti. Dieci run con dieci
+ * periodi diversi hanno prodotto dieci copie dello stesso backtest, ognuna con un'etichetta falsa.
+ *
+ * Ogni asse che non si verifica torna come problema: il chiamante NON finalizza. Meglio una run
+ * fallita con un motivo vero che un backtest plausibile e sbagliato.
+ */
+async function applicaContestoRun(run, ctx) {
+  const { getChartState, setSymbol, setTimeframe, setCustomPeriod, readTestPeriod, ensureTesterPanel, sleep } = ctx;
+  const problemi = [];
+  let contestoRicaricato = false;
+
+  const stato = await getChartState();
+
+  if (run.symbol && !stessoSymbol(stato?.symbol, run.symbol)) {
+    await setSymbol({ symbol: run.symbol });
+    await sleep(500);
+    const dopo = await getChartState();
+    if (!stessoSymbol(dopo?.symbol, run.symbol)) {
+      problemi.push({ kind: 'symbol_not_applied', detail: `chiesto ${run.symbol}, il chart e' su ${dopo?.symbol ?? '?'}` });
+    }
+    contestoRicaricato = true;
+  }
+
+  if (run.timeframe && String(stato?.resolution) !== String(run.timeframe)) {
+    await setTimeframe({ timeframe: String(run.timeframe) });
+    await sleep(500);
+    const dopo = await getChartState();
+    if (String(dopo?.resolution) !== String(run.timeframe)) {
+      problemi.push({ kind: 'timeframe_not_applied', detail: `chiesto ${run.timeframe}, il chart e' su ${dopo?.resolution ?? '?'}` });
+    }
+    contestoRicaricato = true;
+  }
+
+  // Cambiare symbol o timeframe RICHIUDE il pannello Strategy Tester: il blocco "Statistiche
+  // chiave" sparisce dal DOM e le run con periodo, che leggono solo da li', si fermano tutte.
+  // Misurato dal vivo il 2026-08-11: nove run M5 filate lisce, poi il passaggio a M15 e stop.
+  // Aprirlo una volta a inizio grind non basta: va riaperto dopo ogni ricarica del contesto.
+  if (contestoRicaricato && ensureTesterPanel) {
+    await sleep(400);
+    await ensureTesterPanel();
+  }
+
+  // Il periodo si rilegge SEMPRE, anche quando non lo cambiamo: e' quello che finira' nel payload,
+  // e deve essere il range vero, non quello che la run sperava (regola di api.md).
+  let periodo = await readTestPeriod();
+  const from = giornoISO(run.period_start);
+  const to = giornoISO(run.period_end);
+  if (from && to && (periodo.from !== from || periodo.to !== to)) {
+    const res = await setCustomPeriod(from, to);
+    periodo = { label: res.label, from: res.from, to: res.to };
+    if (!res.applied) {
+      problemi.push({
+        kind: 'period_not_applied',
+        detail: res.error || `chiesto ${from} → ${to}, TradingView ha applicato ${res.from ?? '?'} → ${res.to ?? '?'}`,
+      });
+    }
+  }
+
+  return { problemi, periodo };
+}
+
+/**
+ * Le metriche EFFETTIVE, scegliendo la fonte giusta invece di fidarsi di una sola.
+ *
+ * `reportData()` (readReportFor) e' cieco al periodo di test: con un periodo ristretto continua a
+ * rispondere sull'intero storico caricato. Il pannello invece mostra il periodo selezionato.
+ * Misurato nello stesso istante: pannello 24 trade / -5,71%, API interna 288 trade / +28,31%.
+ *
+ * Invece di tenere uno stato "c'e' un filtro attivo?" — che si sfasa al primo imprevisto — si
+ * leggono entrambe e si confrontano: se il numero di trade coincide non c'e' filtro e si usa
+ * l'API, che porta 19 metriche fra cui Sharpe e Sortino; se differisce il filtro c'e', e si usa il
+ * pannello. Il confronto vale anche da controllo di coerenza.
+ */
+async function leggiMetricheEffettive(entityId, { readReportFor, readPanelMetrics, periodoRistretto = false }) {
+  // Con un periodo di test ristretto il pannello e' l'UNICA fonte valida: l'API interna risponde
+  // sull'intero storico. Se il pannello non e' leggibile si segnala "riprova", non si ripiega --
+  // un fallback verso una sorgente che si SA sbagliata per questa configurazione produce numeri
+  // plausibili e falsi, che e' il difetto che questo file esiste per non ripetere.
+  // Successo dal vivo il 2026-08-11: la prima run dopo un cambio di timeframe trovava il pannello
+  // ancora in ridisegno e registrava i 288 trade dello storico intero al posto dei 3 del periodo.
+  if (periodoRistretto) {
+    let p = null;
+    try { p = await readPanelMetrics(); } catch { p = null; }
+    if (p?.success) return { ...p, source: 'panel' };
+    return {
+      success: false, retryable: p?.retryable !== false, metrics: {}, source: 'panel',
+      error: p?.error || 'periodo ristretto ma pannello illeggibile: non ripiego sull API interna, che ignora il periodo',
+    };
+  }
+
+  const api = await readReportFor(entityId);
+  let panel = null;
+  try { panel = await readPanelMetrics(); } catch { panel = null; }
+
+  if (!panel?.success) return { ...api, source: 'internal_api', panel_available: false };
+  if (api?.success === false) return { ...panel, source: 'panel' };
+
+  const tApi = Math.round(api?.metrics?.total_trades ?? -1);
+  const tPanel = Math.round(panel?.metrics?.total_trades ?? -2);
+  if (tApi === tPanel) return { ...api, source: 'internal_api' };
+
+  return { ...panel, source: 'panel', internal_api_trades: tApi };
 }
 
 export async function grindSession(opts, deps = {}) {
@@ -146,8 +278,20 @@ export async function grindSession(opts, deps = {}) {
     readStrategyLoading = realReadStrategyLoading,
     ensureVisibleFor = realEnsureVisibleFor,
     setStrategyVisibility = realSetStrategyVisibility,
+    setSymbol = realSetSymbol,
+    setTimeframe = realSetTimeframe,
+    getChartState = realGetState,
+    setCustomPeriod = realSetCustomPeriod,
+    readTestPeriod = realReadTestPeriod,
+    readPanelMetrics = realReadPanelMetrics,
+    ensureTesterPanel = realEnsureTesterPanel,
     sleep = realSleep,
   } = deps;
+
+  // Il lettore di metriche che sceglie la fonte da solo (API interna vs pannello): lo usano sia
+  // l'attesa del ricalcolo sia il payload, cosi' non possono divergere.
+  const leggiMetriche = (id, periodoRistretto) => leggiMetricheEffettive(id, { readReportFor, readPanelMetrics, periodoRistretto });
+  const ctxRun = { getChartState, setSymbol, setTimeframe, setCustomPeriod, readTestPeriod, ensureTesterPanel, sleep };
 
   if (!session_id) throw new Error('session_id è obbligatorio');
   if (!entity_id) throw new Error('entity_id è obbligatorio (prendilo da chart_get_state)');
@@ -160,6 +304,13 @@ export async function grindSession(opts, deps = {}) {
   // sia visibile — e solo la nostra: l'unhide indiscriminato di ensureStrategyTesterReady()
   // accendeva ogni strategia nascosta del chart, e quella appena accesa poteva prendersi il
   // report. Si annota lo stato precedente per rimettere il chart come l'utente l'aveva.
+  // Il pannello serve sia per gli screenshot equity sia — per le run con periodo — come UNICA
+  // fonte di metriche. Se e' collassato il blocco "Statistiche chiave" non e' nel DOM.
+  const pannello = await ensureTesterPanel();
+  if (!pannello.ok) {
+    await api.progress(command_id, `⚠️ pannello Strategy Tester alto ${pannello.altezza}px: le run con periodo potrebbero non essere leggibili`);
+  }
+
   const vis = await ensureVisibleFor(entity_id);
   if (!vis.found) {
     throw new Error(`la strategia ${entity_id} non è fra le data source del chart: aprila prima di far partire il grind.`);
@@ -176,6 +327,9 @@ export async function grindSession(opts, deps = {}) {
   // Capital" non viene riconosciuto tra gli input) ogni run fallisce allo stesso modo e senza
   // questo contatore il grind macinerebbe l'intera coda a vuoto. Si azzera a ogni successo.
   let consecutiveFinalizeFailures = 0;
+  // Run consecutive senza alcun trade: una e' un dato sul periodo, tante di fila sono una
+  // configurazione rotta (vedi il ramo zero_trades nel loop).
+  let consecutiveZeroTrades = 0;
 
   for (;;) {
     if (max_runs && executed + failed >= max_runs) break;
@@ -186,14 +340,27 @@ export async function grindSession(opts, deps = {}) {
     await api.markRunning(run.id);
     await api.progress(command_id, `run ${run.id}${run.label ? ` (${run.label})` : ''}: applico gli input`);
 
+    // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
+    // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
+    const { problemi, periodo } = await applicaContestoRun(run, ctxRun);
+    if (problemi.length) {
+      const a = problemi[0];
+      await api.markFailed(run.id, `${a.kind}: ${a.detail}`);
+      stopped_reason = { ...a, run_id: run.id, label: run.label ?? null };
+      await api.progress(command_id, `⛔ run ${run.id}: ${a.kind} — mi fermo`);
+      break;
+    }
+
     const requested = run.input_set || {};
     let setResult = { updated_inputs: {}, missing: [] };
     if (Object.keys(requested).length) {
       setResult = await setInputs({ entity_id, inputs: requested });
     }
 
+    // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
+    const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
     const { results, recalcObserved } = await waitForRecalc(entity_id, prevFp, {
-      readReport: readReportFor, readLoading: readStrategyLoading, sleep,
+      readReport: (id) => leggiMetriche(id, periodoRistretto), readLoading: readStrategyLoading, sleep,
       timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
       stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
     });
@@ -209,6 +376,33 @@ export async function grindSession(opts, deps = {}) {
       setResult, results, readbackOk, sameAsPrevious,
       recalcObserved: Object.keys(requested).length ? recalcObserved : null,
     });
+
+    // `zero_trades` NON ferma piu' la matrice da solo. Su un asse periodo una finestra corta senza
+    // trade e' un DATO, non un guasto: verificato il 2026-08-11, la strategia su M15 a 7 giorni
+    // fa davvero zero trade, e fermarsi li' buttava via le altre diciannove run. La protezione
+    // originale — "0 trade = di solito leva/size/errore di runtime" — resta, ma scatta solo se il
+    // sintomo si ripete: se sono TUTTE a zero il problema e' di configurazione, non di periodo.
+    if (anomaly?.kind === 'zero_trades') {
+      await api.markFailed(run.id, `${anomaly.kind}: ${anomaly.detail}`);
+      failed++;
+      consecutiveZeroTrades++;
+      rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: 'zero_trades', trades: 0 });
+      await api.progress(command_id, `○ run ${run.id}: nessun trade nel periodo — proseguo`);
+
+      if (consecutiveZeroTrades >= max_consecutive_failures) {
+        stopped_reason = {
+          kind: 'zero_trades_systemic',
+          detail: `${consecutiveZeroTrades} run consecutive senza alcun trade: non e' il periodo, e' la configurazione (badge errore, leva, size — vedi properties.md)`,
+          run_id: run.id, label: run.label ?? null,
+        };
+        await api.progress(command_id, `⛔ ${consecutiveZeroTrades} run di fila a zero trade — mi fermo`);
+        break;
+      }
+      prevFp = fingerprint(results.metrics);
+      continue;
+    }
+    consecutiveZeroTrades = 0;
+
     if (anomaly) {
       // Circuit breaker: NON si ritenta e NON si va avanti a variare a caso. La run resta
       // failed col motivo reale e il controllo torna al modello, che scala all'utente.
@@ -218,16 +412,29 @@ export async function grindSession(opts, deps = {}) {
       break;
     }
 
+    // Il periodo si rilegge dal tester DOPO il ricalcolo, e si registra QUELLO. Mai quello
+    // richiesto: api.md lo dice da sempre ("popola SEMPRE col range REALE"), e scriverlo a fiducia
+    // e' esattamente ciò che ha prodotto dieci backtest identici con dieci etichette diverse.
+    const periodoFinale = await readTestPeriod();
     const { inputs, properties, initialCapital } = buildInputsPayload(info, actual);
     const payload = toFinalizePayload(results.metrics, {
       symbol: run.symbol,
       timeframe: run.timeframe,
-      period_start: run.period_start || period_start,
-      period_end: run.period_end || period_end,
+      period_start: periodoFinale.from || periodo.from || run.period_start || period_start,
+      period_end: periodoFinale.to || periodo.to || run.period_end || period_end,
       initial_capital: initialCapital,
       inputs,
       properties,
     });
+    // Tracciabilita': da dove vengono i numeri, e se il range ottenuto e' quello chiesto.
+    payload.extra_metrics = {
+      ...(payload.extra_metrics || {}),
+      metrics_source: results.source || 'internal_api',
+      period_requested: giornoISO(run.period_start) && giornoISO(run.period_end)
+        ? `${giornoISO(run.period_start)} → ${giornoISO(run.period_end)}`
+        : null,
+      period_applied: periodoFinale.label || null,
+    };
 
     const shot = await captureScreenshot({ region: 'strategy_tester' });
     if (!shot?.file_path) {
