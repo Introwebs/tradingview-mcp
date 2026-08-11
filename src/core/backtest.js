@@ -214,7 +214,31 @@ async function applicaContestoRun(run, ctx) {
     }
   }
 
-  return { problemi, periodo };
+  return { problemi, periodo, contestoCambiato: contestoRicaricato };
+}
+
+/**
+ * Il pannello e' ASINCRONO rispetto al ricalcolo: `isLoading()` torna false quando il motore ha
+ * finito, ma il DOM puo' mostrare ancora i numeri della run PRECEDENTE. Letto in quell'istante, si
+ * registra un backtest con gli input della run corrente e le metriche di quella prima.
+ *
+ * Misurato il 2026-08-11 sulla sessione 43: 15 backtest M5 su 19 con metriche identiche al bit
+ * (667 trade, +15,26%, PF 1,045) pur avendo `input_set` diversi e readback corretto. La prova che
+ * non fosse un caso: lo stesso identico risultato (246 trade, -8,50%, PF 0,920) compariva su TUTTI
+ * i 9 backtest M15 **e su uno M5** — e cambiare timeframe non puo' lasciare i numeri invariati.
+ *
+ * Qui si rilegge finche' la firma cambia. Se non cambia, chi chiama decide: e' `stale_metrics`.
+ */
+async function rileggiFinoACambio(entityId, prevFp, { leggiMetriche, periodoRistretto, sleep, tentativi = 4, attesaMs = 1200 }) {
+  let ultimo = null;
+  for (let i = 0; i < tentativi; i++) {
+    await sleep(attesaMs);
+    ultimo = await leggiMetriche(entityId, periodoRistretto);
+    if (ultimo?.success !== false && fingerprint(ultimo?.metrics || {}) !== prevFp) {
+      return { results: ultimo, cambiato: true, tentativi: i + 1 };
+    }
+  }
+  return { results: ultimo, cambiato: false, tentativi };
 }
 
 /**
@@ -349,7 +373,7 @@ export async function grindSession(opts, deps = {}) {
 
     // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
     // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
-    const { problemi, periodo } = await applicaContestoRun(run, ctxRun);
+    const { problemi, periodo, contestoCambiato } = await applicaContestoRun(run, ctxRun);
     if (problemi.length) {
       const a = problemi[0];
       await api.markFailed(run.id, `${a.kind}: ${a.detail}`);
@@ -366,12 +390,29 @@ export async function grindSession(opts, deps = {}) {
 
     // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
     const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
-    const { results, recalcObserved } = await waitForRecalc(entity_id, prevFp, {
+    const { results: results0, recalcObserved } = await waitForRecalc(entity_id, prevFp, {
       readReport: (id) => leggiMetriche(id, periodoRistretto), readLoading: readStrategyLoading, sleep,
       timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
       stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
     });
-    const sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === prevFp;
+    let results = results0;
+    let sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === prevFp;
+
+    // Metriche identiche alla run precedente DOPO aver chiesto un cambiamento: quasi sempre e' il
+    // pannello che non si e' ancora ridisegnato. Si rilegge invece di scrivere. Se il contesto e'
+    // cambiato (symbol o timeframe) l'identita' e' addirittura impossibile, non solo sospetta.
+    const cambiamentoChiesto = Object.keys(requested).length > 0 || contestoCambiato;
+    let staleConfermato = false;
+    if (sameAsPrevious && cambiamentoChiesto) {
+      const ri = await rileggiFinoACambio(entity_id, prevFp, { leggiMetriche, periodoRistretto, sleep });
+      if (ri.cambiato) {
+        results = ri.results;
+        sameAsPrevious = false;
+        await api.progress(command_id, `run ${run.id}: pannello in ritardo, metriche rilette al tentativo ${ri.tentativi}`);
+      } else {
+        staleConfermato = true;
+      }
+    }
 
     const actual = await readInputValues(entity_id);
     const readbackOk = readbackMatches(requested, actual);
@@ -380,7 +421,7 @@ export async function grindSession(opts, deps = {}) {
     // una run con input_set vuoto gira sugli input correnti, e non ricalcolare è il
     // comportamento giusto, non un no-op silenzioso.
     const anomaly = detectAnomaly({
-      setResult, results, readbackOk, sameAsPrevious,
+      setResult, results, readbackOk, sameAsPrevious, staleConfermato, contestoCambiato,
       recalcObserved: Object.keys(requested).length ? recalcObserved : null,
     });
 

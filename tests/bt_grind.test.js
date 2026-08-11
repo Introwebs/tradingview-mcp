@@ -79,7 +79,10 @@ test('esegue tutte le run pending e finalizza ognuna', async () => {
       { id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, label: 'a' },
       { id: 2, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 }, label: 'b' },
     ],
-    metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 })],
+    // La sequenza deve avere abbastanza valori: il grind legge piu' volte per run (attesa del
+    // ricalcolo + stabilizzazione) e lo stub, esaurita la sequenza, ripete l'ultimo valore — cioe'
+    // simula un pannello fermo, che da oggi e' `stale_metrics`. Serve un valore FRESCO per run.
+    metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 300 }), M({ net_profit: 400 })],
   });
   const out = await grindSession({
     session_id: 7, entity_id: 'ent1',
@@ -332,7 +335,10 @@ test('una run con input_set vuoto non viene scambiata per un no-op silenzioso', 
   // Girare sugli input correnti è legittimo: senza set non c'è ricalcolo, e non ricalcolare
   // NON è un difetto. Fermare la matrice qui sarebbe un falso allarme.
   const { deps, finalized } = makeDeps({
-    runs: [{ id: 1, symbol: 'X', timeframe: '15', input_set: {} }],
+    // Il chart finto parte da EURUSD/15, quindi questa run NON cambia contesto: e' il punto del
+    // test. Prima chiedeva symbol 'X', cioe' un cambio di simbolo — e li' metriche identiche non
+    // sono legittime ma IMPOSSIBILI. Il test passava solo perche' il controllo non esisteva.
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: {} }],
     metricsSeq: [M()], // metriche invariate, come è giusto che sia
   });
   deps.readStrategyLoading = async () => false;
@@ -458,8 +464,14 @@ test('periodo ristretto: il pannello che arriva in ritardo viene atteso, non fat
 
 test('senza filtro di periodo si usa l API interna, piu ricca (Sharpe e Sortino)', async () => {
   const { deps, finalized } = makeDeps({
+    // Due valori in sequenza: il primo e' la baseline letta a inizio grind, il secondo il
+    // risultato DOPO il set. Con un valore solo il risultato sarebbe identico alla baseline —
+    // che dal 2026-08-11 e' `stale_metrics`, non un dato.
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 } }],
-    metricsSeq: [M({ total_trades: 288, sharpe_ratio: 0.3, sortino_ratio: 0.77 })],
+    metricsSeq: [
+      M({ total_trades: 288, net_profit: 1 }),
+      M({ total_trades: 288, sharpe_ratio: 0.3, sortino_ratio: 0.77 }),
+    ],
   });
   // pannello e API concordano sul numero di trade => nessun filtro attivo
   deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: { total_trades: 288, net_profit: 1 } });
@@ -497,3 +509,63 @@ test('non tocca la visibilità se la strategia era già visibile', async () => {
   assert.deepEqual(restored, []);
 });
 
+
+// --- METRICHE FERME (incidente sessione 43, 2026-08-11) ---------------------------------------
+// Il pannello Strategy Tester e' ASINCRONO rispetto al ricalcolo: isLoading() torna false e il DOM
+// mostra ancora i numeri della run PRECEDENTE. detectAnomaly accettava quel caso — bastava che il
+// motore avesse ricalcolato e il readback fosse corretto — e finalizzava. Risultato misurato in
+// produzione: 15 backtest M5 su 19 identici al bit con input_set diversi, e lo stesso identico
+// risultato su tutti i 9 M15 e su uno M5.
+
+test('metriche identiche dopo un cambio di TIMEFRAME: impossibile, si ferma', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '5', input_set: {} }],
+    metricsSeq: [M()], // il pannello resta fermo sui numeri di prima
+  });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason?.kind, 'stale_metrics');
+  assert.match(out.stopped_reason.detail, /impossibile/);
+  assert.equal(finalized.length, 0, 'non deve finalizzare NIENTE con metriche ferme');
+});
+
+test('metriche identiche dopo un cambio di INPUT: si ferma invece di scrivere', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 } }],
+    metricsSeq: [M()],
+  });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason?.kind, 'stale_metrics');
+  assert.equal(finalized.length, 0);
+});
+
+test('pannello LENTO: le riletture recuperano il valore nuovo e la run si finalizza', async () => {
+  // Il caso che il fix deve salvare, non uccidere: il pannello arriva in ritardo ma ARRIVA.
+  // baseline -> ancora baseline (ritardo) -> valore nuovo.
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 } }],
+    metricsSeq: [
+      M({ total_trades: 100, net_profit: 10 }),
+      M({ total_trades: 100, net_profit: 10 }),
+      M({ total_trades: 100, net_profit: 999 }),
+    ],
+  });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason, null);
+  assert.equal(finalized.length, 1);
+  assert.equal(finalized[0].payload.net_profit, 999, 'deve registrare il valore RILETTO, non quello fermo');
+});

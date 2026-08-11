@@ -90,16 +90,33 @@ export function fingerprint(tv = {}) {
  * non si ritenta e non si continua a variare a caso.
  * Ritorna null se tutto è regolare, altrimenti {kind, detail}.
  *
- * Nota sul caso `sameAsPrevious`: metriche identiche NON sono di per sé un'anomalia — due set di
- * input diversi possono legittimamente produrre lo stesso risultato (es. un filtro che non si
- * attiva mai). Diventa anomalia solo se qualcosa dice che il set non ha avuto effetto: il
- * READBACK che rilegge i vecchi valori, oppure il motore che non ha ricalcolato affatto.
+ * ⚠️ CORREZIONE DEL 2026-08-11 — questa nota diceva il contrario, e il contrario era sbagliato ⚠️
+ * La stesura originale ragionava così: «metriche identiche NON sono di per sé un'anomalia — due set
+ * di input diversi possono legittimamente produrre lo stesso risultato (es. un filtro che non si
+ * attiva mai). Diventa anomalia solo se qualcosa dice che il set non ha avuto effetto». Sembra
+ * prudente ed è il buco da cui è passata una sessione intera di dati falsi: con `recalcObserved`
+ * a true — il motore ricalcola davvero — e readback corretto, l'identità veniva accettata e
+ * finalizzata.
+ *
+ * Cos'era davvero: il pannello è ASINCRONO rispetto al ricalcolo e mostrava ancora i numeri della
+ * run precedente. Sessione 43, misurata: 15 backtest M5 su 19 identici al bit, e lo stesso identico
+ * risultato su tutti i 9 M15 **e su uno M5**. Cambiare timeframe non può lasciare i numeri
+ * invariati: quei numeri appartenevano a un'altra run.
+ *
+ * La regola giusta: l'identità è **sempre** sospetta quando è stato chiesto un cambiamento. Chi
+ * chiama rilegge il pannello finché la firma cambia (`rileggiFinoACambio`); se dopo i tentativi
+ * resta identica passa `staleConfermato` e qui ci si ferma. Un test che produce davvero lo stesso
+ * risultato del precedente costa un fermo e una ripartenza; un pannello lento non riletto costa un
+ * database di numeri plausibili e falsi.
  *
  * `recalcObserved`: true = si è visto `isLoading()` passare a true (o le metriche cambiare);
  * false = il set non ha smosso il motore; null = segnale non leggibile, e allora NON si accusa
  * un no-op che non si è in grado di vedere.
  */
-export function detectAnomaly({ setResult, results, readbackOk = true, sameAsPrevious = false, recalcObserved = null } = {}) {
+export function detectAnomaly({
+  setResult, results, readbackOk = true, sameAsPrevious = false,
+  staleConfermato = false, contestoCambiato = false, recalcObserved = null,
+} = {}) {
   const missing = setResult?.missing || [];
   if (missing.length) {
     return { kind: 'inputs_not_applied', detail: `id non applicati: ${missing.join(', ')}` };
@@ -118,8 +135,21 @@ export function detectAnomaly({ setResult, results, readbackOk = true, sameAsPre
       ? { kind: 'silent_noop', detail: 'valori non confermati dal readback e metriche invariate' }
       : { kind: 'readback_mismatch', detail: 'i valori riletti non corrispondono a quelli richiesti' };
   }
+  // PRIMA di `stale_metrics`: due run consecutive a zero trade hanno per forza la stessa firma
+  // (sono tutti zeri), e chiamarla "pannello fermo" nasconderebbe il dato vero. E' anche innocuo
+  // metterlo prima, perche' `zero_trades` non finalizza nulla: marca la run failed e prosegue.
   if (Math.round(results.metrics?.total_trades ?? 0) === 0) {
     return { kind: 'zero_trades', detail: 'la strategia non ha prodotto alcun trade (verifica badge errore, pannello, leva e size nelle Proprietà)' };
+  }
+  // Il pannello non si e' mosso nemmeno dopo le riletture. Con un cambio di symbol/timeframe di
+  // mezzo non e' nemmeno un dubbio: metriche identiche fra due contesti diversi sono impossibili.
+  if (staleConfermato) {
+    return {
+      kind: 'stale_metrics',
+      detail: contestoCambiato
+        ? 'metriche identiche alla run precedente DOPO un cambio di symbol/timeframe: impossibile, il pannello sta ancora mostrando i numeri della run prima'
+        : 'metriche identiche alla run precedente dopo il cambio di input, invariate anche alle riletture: il pannello non si e\' aggiornato',
+    };
   }
   return null;
 }
