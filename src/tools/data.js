@@ -18,20 +18,25 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_strategy_results', 'Get strategy performance metrics from Strategy Tester. Auto-opens the panel and auto-unhides a hidden strategy (TradingView never computes reports for hidden strategies); result includes unhidden_strategies when that happened.', {}, async () => {
-    try { return jsonResult(await core.getStrategyResults()); }
+  server.tool('data_get_strategy_results', 'Get strategy performance metrics from Strategy Tester. PASS entity_id on any chart holding more than one strategy: without it the report of whichever strategy currently holds one is returned, which may not be the one you are working on (the call errors out instead of guessing). Auto-opens the panel and unhides ONLY the requested strategy.', {
+    entity_id: z.string().optional().describe('Entity ID of the strategy to read (from chart_get_state). Required when the chart has 2+ strategies.'),
+  }, async ({ entity_id }) => {
+    try { return jsonResult(await core.getStrategyResults({ entity_id })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_trades', 'Get trade list from Strategy Tester. Auto-opens the panel and auto-unhides a hidden strategy.', {
+  server.tool('data_get_trades', 'Get trade list from Strategy Tester. Pass entity_id to say which strategy; auto-opens the panel and unhides only that one.', {
     max_trades: z.coerce.number().optional().describe('Maximum trades to return'),
-  }, async ({ max_trades }) => {
-    try { return jsonResult(await core.getTrades({ max_trades })); }
+    entity_id: z.string().optional().describe('Entity ID of the strategy to read (from chart_get_state)'),
+  }, async ({ max_trades, entity_id }) => {
+    try { return jsonResult(await core.getTrades({ max_trades, entity_id })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('data_get_equity', 'Get equity curve data from Strategy Tester', {}, async () => {
-    try { return jsonResult(await core.getEquity()); }
+  server.tool('data_get_equity', 'Get equity curve data from Strategy Tester. Pass entity_id to say which strategy.', {
+    entity_id: z.string().optional().describe('Entity ID of the strategy to read (from chart_get_state)'),
+  }, async ({ entity_id }) => {
+    try { return jsonResult(await core.getEquity({ entity_id })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

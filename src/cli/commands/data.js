@@ -60,18 +60,25 @@ register('data', {
     }],
     ['strategy', {
       description: 'Get strategy performance metrics',
-      handler: () => core.getStrategyResults(),
+      options: {
+        entity: { type: 'string', short: 'e', description: 'Strategy entity ID (required on charts with 2+ strategies)' },
+      },
+      handler: (opts) => core.getStrategyResults({ entity_id: opts.entity }),
     }],
     ['trades', {
       description: 'Get strategy trade list',
       options: {
         max: { type: 'string', short: 'n', description: 'Max trades to return' },
+        entity: { type: 'string', short: 'e', description: 'Strategy entity ID' },
       },
-      handler: (opts) => core.getTrades({ max_trades: opts.max ? Number(opts.max) : undefined }),
+      handler: (opts) => core.getTrades({ max_trades: opts.max ? Number(opts.max) : undefined, entity_id: opts.entity }),
     }],
     ['equity', {
       description: 'Get strategy equity curve',
-      handler: () => core.getEquity(),
+      options: {
+        entity: { type: 'string', short: 'e', description: 'Strategy entity ID' },
+      },
+      handler: (opts) => core.getEquity({ entity_id: opts.entity }),
     }],
     ['depth', {
       description: 'Get order book / DOM data',

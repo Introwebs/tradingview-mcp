@@ -38,17 +38,38 @@ const FIND_STRATEGY_JS = `
       try { mi = s.metaInfo ? s.metaInfo() : null; } catch (e) {}
       var isStrat = mi && (mi.isTVScriptStrategy || mi.is_strategy);
       if ((isStrat || typeof s.reportData === 'function') && typeof s.reportData === 'function') {
-        strategies.push({ s: s, name: mi ? mi.description : null });
+        var sid = null;
+        try { sid = (typeof s.id === 'function') ? s.id() : s.id; } catch (e) {}
+        strategies.push({ s: s, id: sid, name: mi ? mi.description : null });
       }
     }
     return strategies;
   }
-  // Returns { strat, report } — prefers a strategy whose report is actually
-  // computed (the one selected in the Strategy Tester panel). With multiple
-  // strategies on the chart, only the selected one has non-null reportData,
-  // so returning the first strategy blindly reads the wrong (empty) one.
-  function findStrategy() {
+  function strategyList() {
+    var l = findStrategies(), out = [];
+    for (var i = 0; i < l.length; i++) out.push({ entity_id: l[i].id, name: l[i].name });
+    return out;
+  }
+  // Returns { strat, report } for the strategy with entity_id === wantId.
+  //
+  // Without wantId it falls back to "the first source that has a computed
+  // report". That fallback is only safe on a single-strategy chart: with two
+  // strategies it silently reads whichever one happens to hold the report,
+  // which is NOT necessarily the one the caller is working on. Verified live
+  // on 2026-08-11 — a hidden "Index Grow Test Claude" sitting earlier in
+  // dataSources() order took over the report of "Imbalance Strategy" and its
+  // numbers (208 trades / -1.86%) were recorded as the other strategy's.
+  // Callers with an entity_id MUST pass it; callers without one get an
+  // explicit ambiguity error rather than a plausible wrong answer.
+  function findStrategy(wantId) {
     var strategies = findStrategies();
+    if (wantId) {
+      for (var i = 0; i < strategies.length; i++) {
+        if (strategies[i].id !== wantId) continue;
+        return { strat: strategies[i].s, report: _reportOf(strategies[i].s), name: strategies[i].name, strategy_count: strategies.length };
+      }
+      return null;
+    }
     // Prefer one with a computed report (has .performance).
     for (var j = 0; j < strategies.length; j++) {
       var rd = _reportOf(strategies[j].s);
@@ -60,12 +81,18 @@ const FIND_STRATEGY_JS = `
   }
   // TradingView never computes a report for a hidden strategy (crossed-out eye
   // in the legend), so a hidden one looks identical to "panel not opened yet".
-  // Unhide any hidden strategies and report their names so callers can tell
-  // the user what changed.
-  function unhideStrategies() {
+  //
+  // Unhiding is therefore necessary — but it must be TARGETED. Unhiding every
+  // hidden strategy makes the newly-woken one compute its own report, and if it
+  // sits earlier in dataSources() it steals the report the caller is about to
+  // read. Without a wantId we only unhide when there is exactly one strategy,
+  // i.e. when there is nothing to confuse it with.
+  function unhideStrategies(wantId) {
     var unhidden = [];
     var strategies = findStrategies();
+    if (!wantId && strategies.length > 1) return unhidden;
     for (var i = 0; i < strategies.length; i++) {
+      if (wantId && strategies[i].id !== wantId) continue;
       var s = strategies[i].s;
       try {
         var vis = null;
@@ -80,6 +107,25 @@ const FIND_STRATEGY_JS = `
       } catch (e) {}
     }
     return unhidden;
+  }
+`;
+
+/** JS literal for an optional entity_id: the quoted id, or `null`. */
+const wantIdJs = (entityId) => (entityId ? safeString(entityId) : 'null');
+
+/**
+ * Error returned when no entity_id was given and the chart carries more than one strategy.
+ * Fail-closed on purpose: an ambiguous read used to succeed and return someone else's numbers.
+ */
+const AMBIGUOUS_JS = `
+  if (!WANT_ID) {
+    var _all = strategyList();
+    if (_all.length > 1) {
+      return { metrics: {}, source: 'internal_api', strategies: _all,
+        error: 'Chart has ' + _all.length + ' strategies: pass entity_id to say which one you mean. '
+             + 'Without it the report of whichever strategy holds it would be returned, which may not be yours. '
+             + 'Candidates: ' + _all.map(function(x){ return (x.name || '?') + ' (' + x.entity_id + ')'; }).join(', ') };
+    }
   }
 `;
 
@@ -213,7 +259,8 @@ export async function getIndicator({ entity_id }) {
 // strategies, and wait for reportData to populate, so the strategy read tools
 // work even when the panel started closed or the strategy was hidden.
 // Returns { status, unhidden } — unhidden lists strategies made visible.
-async function ensureStrategyTesterReady(maxWaitMs = 6000) {
+async function ensureStrategyTesterReady(entityId = null, maxWaitMs = 6000) {
+  const WANT = wantIdJs(entityId);
   const unhidden = await evaluate(`
     (function() {
       ${FIND_STRATEGY_JS}
@@ -221,7 +268,7 @@ async function ensureStrategyTesterReady(maxWaitMs = 6000) {
         var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
         if (bwb && typeof bwb.showWidget === 'function') bwb.showWidget('backtesting');
       } catch (e) {}
-      return unhideStrategies();
+      return unhideStrategies(${WANT});
     })()
   `);
   const deadline = Date.now() + maxWaitMs;
@@ -230,7 +277,7 @@ async function ensureStrategyTesterReady(maxWaitMs = 6000) {
     const ready = await evaluate(`
       (function() {
         ${FIND_STRATEGY_JS}
-        var f = findStrategy();
+        var f = findStrategy(${WANT});
         if (!f) return 'no-strategy';
         return f.report && f.report.performance ? 'ready' : 'pending';
       })()
@@ -241,14 +288,19 @@ async function ensureStrategyTesterReady(maxWaitMs = 6000) {
   return { status, unhidden: unhidden || [] };
 }
 
-export async function getStrategyResults() {
-  const ready = await ensureStrategyTesterReady();
+export async function getStrategyResults({ entity_id = null } = {}) {
+  const ready = await ensureStrategyTesterReady(entity_id);
+  const WANT_ID = wantIdJs(entity_id);
   const results = await evaluate(`
     (function() {
       ${FIND_STRATEGY_JS}
+      var WANT_ID = ${WANT_ID};
       try {
-        var found = findStrategy();
-        if (!found) return {metrics: {}, source: 'internal_api', error: 'No strategy found on chart. Add a strategy first (e.g. indicator_add with a "... Strategy" script).'};
+        ${AMBIGUOUS_JS}
+        var found = findStrategy(WANT_ID);
+        if (!found) return {metrics: {}, source: 'internal_api', strategies: strategyList(), error: WANT_ID
+          ? 'Strategy ' + WANT_ID + ' is not on the chart. Use chart_get_state to list entity IDs.'
+          : 'No strategy found on chart. Add a strategy first (e.g. indicator_add with a "... Strategy" script).'};
         var rd = found.report;
         if (!rd || !rd.performance) return {metrics: {}, source: 'internal_api', error: 'Strategy report not computed yet. Retry in a few seconds; if it persists, check the Strategy Tester panel is open (ui_open_panel strategy-tester) and the strategy is not hidden on the chart.'};
         var perf = rd.performance;
@@ -288,19 +340,22 @@ export async function getStrategyResults() {
     strategy: results?.strategy, currency: results?.currency, source: results?.source,
     metrics: results?.metrics || {},
     ...(ready.unhidden.length && { unhidden_strategies: ready.unhidden, note: 'Strategy was hidden on the chart; it was made visible so the report could compute.' }),
+    ...(results?.strategies && { strategies: results.strategies }),
     error: results?.error,
   };
 }
 
-export async function getTrades({ max_trades } = {}) {
+export async function getTrades({ max_trades, entity_id = null } = {}) {
   const limit = Math.min(max_trades || 20, MAX_TRADES);
-  const ready = await ensureStrategyTesterReady();
+  const ready = await ensureStrategyTesterReady(entity_id);
+  const WANT_ID = wantIdJs(entity_id);
   const trades = await evaluate(`
     (function() {
       ${FIND_STRATEGY_JS}
+      var WANT_ID = ${WANT_ID};
       try {
-        var found = findStrategy();
-        if (!found) return {trades: [], source: 'internal_api', error: 'No strategy found on chart.'};
+        var found = findStrategy(WANT_ID);
+        if (!found) return {trades: [], source: 'internal_api', strategies: strategyList(), error: WANT_ID ? 'Strategy ' + WANT_ID + ' is not on the chart.' : 'No strategy found on chart.'};
         var strat = found.strat;
         var orders = strat.ordersData(); if (orders && typeof orders.value === 'function') orders = orders.value();
         if (!orders || !Array.isArray(orders)) return {trades: [], source: 'internal_api', total_orders: 0, error: 'Strategy orders not computed yet. Open the Strategy Tester panel (ui_open_panel strategy-tester) and retry.'};
@@ -336,14 +391,16 @@ export async function getTrades({ max_trades } = {}) {
   };
 }
 
-export async function getEquity() {
-  const ready = await ensureStrategyTesterReady();
+export async function getEquity({ entity_id = null } = {}) {
+  const ready = await ensureStrategyTesterReady(entity_id);
+  const WANT_ID = wantIdJs(entity_id);
   const equity = await evaluate(`
     (function() {
       ${FIND_STRATEGY_JS}
+      var WANT_ID = ${WANT_ID};
       try {
-        var found = findStrategy();
-        if (!found) return {data: [], source: 'internal_api', error: 'No strategy found on chart.'};
+        var found = findStrategy(WANT_ID);
+        if (!found) return {data: [], source: 'internal_api', strategies: strategyList(), error: WANT_ID ? 'Strategy ' + WANT_ID + ' is not on the chart.' : 'No strategy found on chart.'};
         var rd = found.report;
         if (!rd) return {data: [], source: 'internal_api', error: 'Strategy report not computed yet. Open the Strategy Tester panel and retry.'};
         // buyHold is the per-bar account curve; the equity curve is built from
