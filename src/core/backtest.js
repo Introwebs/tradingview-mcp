@@ -27,18 +27,39 @@ import { toFinalizePayload, fingerprint, detectAnomaly } from './btMetrics.js';
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Attende che il report della strategia cambi rispetto alla firma precedente.
- * Se scade il tempo senza cambiamenti ritorna comunque l'ultimo report: NON è un errore
- * di per sé (due input diversi possono dare lo stesso risultato) — la discriminazione la
- * fa il readback in detectAnomaly.
+ * Attende che il report della strategia sia CAMBIATO rispetto a prima **e si sia STABILIZZATO**.
+ *
+ * Le due condizioni sono entrambe necessarie, e la seconda è quella che costa cara se manca.
+ * TradingView pubblica risultati PARZIALI mentre ricalcola: il report cresce trade dopo trade
+ * fino al valore finale. Una versione precedente si fermava al primo cambiamento e registrava
+ * un fotogramma di mezzo — misurato dal vivo il 2026-08-11: salvati 208 trade / -1,86% mentre
+ * il risultato vero, un paio di secondi dopo, era 288 trade / +41,57%. Numeri plausibili e
+ * completamente falsi, senza nessun errore da nessuna parte.
+ *
+ * Quindi: prima si aspetta che la firma cambi (il ricalcolo è partito), poi che resti IDENTICA
+ * per `stableChecks` letture consecutive (il ricalcolo è finito).
+ *
+ * Se scade il tempo ritorna comunque l'ultimo report: metriche invariate NON sono un errore di
+ * per sé (due input diversi possono dare lo stesso risultato) — la discriminazione la fa il
+ * readback in detectAnomaly.
  */
-async function waitForRecalc(prevFp, { getStrategyResults, sleep, timeoutMs = 20000, stepMs = 700 }) {
+async function waitForRecalc(prevFp, { getStrategyResults, sleep, timeoutMs = 45000, stepMs = 700, stableChecks = 3 }) {
   let last = null;
+  let lastFp = null;
+  let stable = 0;
+  let changed = false;
   const deadline = Date.now() + timeoutMs;
+
   for (;;) {
     last = await getStrategyResults();
     if (!last || last.success === false) return last;
-    if (fingerprint(last.metrics) !== prevFp) return last;
+
+    const fp = fingerprint(last.metrics);
+    if (fp !== prevFp) changed = true;
+    stable = fp === lastFp ? stable + 1 : 0;
+    lastFp = fp;
+
+    if (changed && stable >= stableChecks) return last;
     if (Date.now() >= deadline) return last;
     await sleep(stepMs);
   }
@@ -47,7 +68,10 @@ async function waitForRecalc(prevFp, { getStrategyResults, sleep, timeoutMs = 20
 export async function grindSession(opts, deps = {}) {
   const {
     session_id, entity_id, command_id = null, max_runs = 0,
-    period_start = null, period_end = null, recalc_timeout_ms = 20000,
+    // 45s: un ricalcolo su un anno di dati intraday impiega diversi secondi, e a questi va
+    // sommato il tempo di stabilizzazione. Meglio abbondare: il costo di aspettare troppo e'
+    // qualche secondo per run, quello di aspettare troppo poco e' un backtest falso.
+    period_start = null, period_end = null, recalc_timeout_ms = 45000, recalc_stable_checks = 3,
     max_consecutive_failures = 3,
   } = opts;
 
@@ -109,7 +133,9 @@ export async function grindSession(opts, deps = {}) {
       setResult = await setInputs({ entity_id, inputs: requested });
     }
 
-    const results = await waitForRecalc(prevFp, { getStrategyResults, sleep, timeoutMs: recalc_timeout_ms });
+    const results = await waitForRecalc(prevFp, {
+      getStrategyResults, sleep, timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
+    });
     const sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === prevFp;
 
     const actual = await readInputValues(entity_id);

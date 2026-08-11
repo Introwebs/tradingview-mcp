@@ -52,6 +52,7 @@ test('esegue tutte le run pending e finalizza ognuna', async () => {
   const out = await grindSession({
     session_id: 7, entity_id: 'ent1',
     period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
   }, deps);
 
   assert.equal(out.executed, 2);
@@ -72,7 +73,7 @@ test('si ferma se il readback non conferma i valori richiesti', async () => {
   });
   // Dropdown che accetta il set ma non lo applica: il no-op silenzioso noto.
   deps.setInputs = async () => ({ updated_inputs: {}, missing: [] });
-  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
   assert.equal(out.stopped_reason.kind, 'readback_mismatch');
   assert.equal(finalized.length, 0);
 });
@@ -85,7 +86,7 @@ test('si ferma e restituisce il controllo su 0 trade', async () => {
     ],
     metricsSeq: [M(), M({ total_trades: 0 })],
   });
-  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
 
   assert.equal(out.stopped_reason.kind, 'zero_trades');
   assert.equal(out.stopped_reason.run_id, 1);
@@ -101,7 +102,7 @@ test('rispetta max_runs', async () => {
     ],
     metricsSeq: [M(), M({ net_profit: 2 }), M({ net_profit: 3 }), M({ net_profit: 4 })],
   });
-  const out = await grindSession({ session_id: 7, entity_id: 'ent1', max_runs: 2, period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', max_runs: 2, period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
   assert.equal(out.executed, 2);
   assert.equal(finalized.length, 2);
 });
@@ -111,7 +112,7 @@ test('la run usa i propri period_start/period_end quando li ha', async () => {
     runs: [{ id: 1, symbol: 'X', timeframe: '15', input_set: {}, period_start: '2020-01-01', period_end: '2021-01-01' }],
     metricsSeq: [M(), M({ net_profit: 2 })],
   });
-  await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
   assert.equal(finalized[0].payload.period_start, '2020-01-01');
   assert.equal(finalized[0].payload.period_end, '2021-01-01');
 });
@@ -130,7 +131,7 @@ test('un 422 sul finalize marca la run failed e prosegue con la successiva', asy
     finalized.push({ runId, payload });
     return { data: { id: 20 } };
   };
-  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
   assert.equal(out.failed, 1);
   assert.equal(out.executed, 1);
   assert.equal(out.stopped_reason, null);
@@ -152,7 +153,7 @@ test('tre fallimenti consecutivi in finalize sono un guasto sistemico: il grind 
   const origNextRun = deps.api.nextRun;
   deps.api.nextRun = async (...args) => { nextRunCalls++; return origNextRun(...args); };
 
-  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
 
   assert.equal(out.stopped_reason.kind, 'systemic_failure');
   assert.equal(out.stopped_reason.run_id, 3);
@@ -180,7 +181,7 @@ test('il contatore dei fallimenti consecutivi si azzera a ogni successo (fallime
     finalized.push({ runId, payload });
     return { data: { id: runId * 10 } };
   };
-  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
   assert.equal(out.stopped_reason, null);
   assert.equal(out.executed, 2);
   assert.equal(out.failed, 2);
@@ -196,7 +197,7 @@ test('rifiuta di partire se il pannello mostra una strategia diversa da quella b
   deps.readComputedReportEntityId = async () => 'altra-strategia';
 
   await assert.rejects(
-    () => grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps),
+    () => grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps),
     /altra-strategia.*ent1/s
   );
   assert.equal(finalized.length, 0);
@@ -211,6 +212,31 @@ test('parte lo stesso se nessuna strategia ha ancora un report calcolato', async
   });
   deps.readComputedReportEntityId = async () => null;
 
-  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01' }, deps);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
   assert.equal(out.executed, 1);
+});
+
+test('registra il risultato STABILIZZATO, non il primo fotogramma del ricalcolo', async () => {
+  // TradingView pubblica risultati parziali mentre ricalcola: il report cresce trade dopo
+  // trade fino al valore finale. Qui la sequenza simula esattamente quello — due stati
+  // intermedi e poi il valore che si assesta. Il grind deve salvare l'ULTIMO.
+  const parziale1 = M({ total_trades: 90, net_profit: 5 });
+  const parziale2 = M({ total_trades: 208, net_profit: -18 });
+  const finale = M({ total_trades: 288, net_profit: 415 });
+
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'X', timeframe: '15', input_set: { in_0: 2 } }],
+    metricsSeq: [M({ total_trades: 1, net_profit: 0 }), parziale1, parziale2, finale],
+  });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1',
+    period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 2000, recalc_stable_checks: 3,
+  }, deps);
+
+  assert.equal(out.executed, 1);
+  assert.equal(finalized[0].payload.total_trades, 288);
+  assert.equal(finalized[0].payload.net_profit, 415);
+  assert.notEqual(finalized[0].payload.total_trades, 208); // il fotogramma di mezzo
 });
