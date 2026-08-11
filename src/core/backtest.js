@@ -16,7 +16,10 @@ import { setInputs as realSetInputs } from './indicators.js';
 import { captureScreenshot as realCaptureScreenshot } from './capture.js';
 import { setSymbol as realSetSymbol, setTimeframe as realSetTimeframe, getState as realGetState } from './chart.js';
 import { setCustomPeriod as realSetCustomPeriod, readTestPeriod as realReadTestPeriod } from './btPeriod.js';
-import { readPanelMetrics as realReadPanelMetrics, ensureTesterPanel as realEnsureTesterPanel } from './btPanel.js';
+import {
+  readPanelMetrics as realReadPanelMetrics, ensureTesterPanel as realEnsureTesterPanel,
+  aggiornaReportSeObsoleto as realAggiornaReport,
+} from './btPanel.js';
 import {
   readInputsInfo as realReadInputsInfo,
   readInputValues as realReadInputValues,
@@ -233,7 +236,10 @@ async function applicaContestoRun(run, ctx) {
  *
  * Qui si rilegge finche' la firma cambia. Se non cambia, chi chiama decide: e' `stale_metrics`.
  */
-async function rileggiFinoACambio(entityId, prevFp, { leggiMetriche, periodoRistretto, sleep, tentativi = 4, attesaMs = 1200 }) {
+// 15 x 1,5 s = 22 s di margine. Il ricalcolo del report, una volta innescato con "Aggiorna report",
+// ha impiegato 10,6 s su un anno di M5 con 200 trade (misurato). I 4,8 s della prima stesura erano
+// una scommessa, non una misura.
+async function rileggiFinoACambio(entityId, prevFp, { leggiMetriche, periodoRistretto, sleep, tentativi = 15, attesaMs = 1500 }) {
   let ultimo = null;
   for (let i = 0; i < tentativi; i++) {
     await sleep(attesaMs);
@@ -316,6 +322,7 @@ export async function grindSession(opts, deps = {}) {
     readTestPeriod = realReadTestPeriod,
     readPanelMetrics = realReadPanelMetrics,
     ensureTesterPanel = realEnsureTesterPanel,
+    aggiornaReportSeObsoleto = realAggiornaReport,
     sleep = realSleep,
   } = deps;
 
@@ -375,6 +382,23 @@ export async function grindSession(opts, deps = {}) {
     await api.markRunning(run.id);
     await api.progress(command_id, `run ${run.id}${run.label ? ` (${run.label})` : ''}: applico gli input`);
 
+    // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
+    const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
+
+    // BASELINE dallo STESSO canale che leggera' le metriche di questa run, presa PRIMA di toccare
+    // qualsiasi cosa. Prima si usava `prevFp`, che a inizio grind veniva da `readReportFor` —
+    // l'API interna, cieca al periodo. Con un periodo ristretto quel valore non c'entra niente col
+    // pannello, quindi la PRIMA run di ogni invocazione sfuggiva al controllo `stale_metrics`:
+    // ecco l'alternanza done/stale/done/stale osservata in produzione il 2026-08-11, con le "done"
+    // che registravano i numeri della configurazione precedente.
+    let baselineFp = prevFp;
+    try {
+      const prima = await leggiMetriche(entity_id, periodoRistretto);
+      if (prima?.success !== false && Object.keys(prima?.metrics || {}).length) {
+        baselineFp = fingerprint(prima.metrics);
+      }
+    } catch { /* si tiene prevFp */ }
+
     // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
     // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
     const { problemi, periodo, contestoCambiato } = await applicaContestoRun(run, ctxRun);
@@ -392,15 +416,24 @@ export async function grindSession(opts, deps = {}) {
       setResult = await setInputs({ entity_id, inputs: requested });
     }
 
-    // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
-    const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
-    const { results: results0, recalcObserved } = await waitForRecalc(entity_id, prevFp, {
+    // ⛔ IL PASSO SENZA IL QUALE NIENTE FUNZIONA ⛔
+    // Con un periodo di test personalizzato TradingView NON ricalcola il report da solo: lo marca
+    // obsoleto e aspetta il pulsante "Aggiorna report". Senza questa chiamata il pannello resta sui
+    // numeri della configurazione precedente e ogni backtest della matrice esce identico al primo.
+    // Vedi il commento in btPanel.js: RR 2->6 e trenta secondi di attesa non muovono nulla, il
+    // click porta i numeri nuovi in 10,6 s.
+    const report = await aggiornaReportSeObsoleto();
+    if (report.cliccato) {
+      await api.progress(command_id, `run ${run.id}: report obsoleto → premuto "Aggiorna report"`);
+    }
+
+    const { results: results0, recalcObserved } = await waitForRecalc(entity_id, baselineFp, {
       readReport: (id) => leggiMetriche(id, periodoRistretto), readLoading: readStrategyLoading, sleep,
       timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
       stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
     });
     let results = results0;
-    let sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === prevFp;
+    let sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === baselineFp;
 
     // Metriche identiche alla run precedente DOPO aver chiesto un cambiamento: quasi sempre e' il
     // pannello che non si e' ancora ridisegnato. Si rilegge invece di scrivere. Se il contesto e'
@@ -408,7 +441,7 @@ export async function grindSession(opts, deps = {}) {
     const cambiamentoChiesto = Object.keys(requested).length > 0 || contestoCambiato;
     let staleConfermato = false;
     if (sameAsPrevious && cambiamentoChiesto) {
-      const ri = await rileggiFinoACambio(entity_id, prevFp, { leggiMetriche, periodoRistretto, sleep });
+      const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep });
       if (ri.cambiato) {
         results = ri.results;
         sameAsPrevious = false;

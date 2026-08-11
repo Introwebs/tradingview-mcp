@@ -22,6 +22,63 @@
  * -0.0010.
  */
 import { evaluate as realEvaluate } from '../connection.js';
+import { mouseClick as realMouseClick } from './ui.js';
+
+/**
+ * ⛔ LA CAUSA DI TUTTO — leggere prima di toccare il grind ⛔
+ *
+ * Col "Periodo di test" impostato su un intervallo personalizzato (modalita' ESTESO), TradingView
+ * **NON ricalcola il report quando cambi un input**. Marca il report come obsoleto e mostra una
+ * snackbar «Il report e' obsoleto — Aggiorna report», e resta li' finche' qualcuno non preme quel
+ * pulsante. Misurato dal vivo il 2026-08-11 su TVC:NDQ M5, periodo 11 ago 2025 - 11 ago 2026:
+ *
+ *     RR target 2 -> 6, poi 30 secondi di attesa   ->  pannello FERMO su +53.121,85 / 203 trade
+ *     click su "Aggiorna report"                    ->  +12.971,66 / 161 trade dopo 10,6 s
+ *
+ * Ecco perche' `isLoading()` diceva `false`: e' vero, non stava caricando niente — non stava
+ * ricalcolando affatto. E perche' i backtest uscivano tutti identici: erano i numeri della
+ * configurazione precedente, con gli input della corrente in etichetta.
+ *
+ * ⚠️ `dataSource.recalculate()` NON serve: ricalcola il pane e fa ricomparire il banner (misurato,
+ * banner di nuovo presente dopo 219 ms, pannello invariato). L'unico trigger del report e' il
+ * pulsante.
+ *
+ * Nota storica: questo e' anche il motivo per cui "prima funzionava". Senza periodo di test
+ * personalizzato TradingView ricalcola da solo; e' stato l'asse periodo — cioe' proprio quello
+ * aggiunto da questo lavoro di ottimizzazione — a portare il chart in modalita' ESTESO.
+ *
+ * @returns {Promise<{obsoleto: boolean, cliccato: boolean}>}
+ */
+export async function aggiornaReportSeObsoleto({
+  evaluate = realEvaluate, mouseClick = realMouseClick, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  tentativi = 6, attesaMs = 400,
+} = {}) {
+  // Il banner compare ~200 ms dopo il set, non nello stesso istante: si guarda piu' volte.
+  for (let i = 0; i < tentativi; i++) {
+    const info = await evaluate(`
+      (function() {
+        var bs = document.querySelectorAll('button');
+        for (var i = 0; i < bs.length; i++) {
+          var t = (bs[i].textContent || '').trim();
+          if (/^(Aggiorna report|Update report)$/i.test(t)) {
+            var r = bs[i].getBoundingClientRect();
+            if (r.width < 1 || r.height < 1) continue;
+            return { trovato: true, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+          }
+        }
+        return { trovato: false };
+      })()
+    `);
+    if (info && info.trovato) {
+      // Click VERO: e' una snackbar, e come le voci del menu del periodo non risponde al .click()
+      // del DOM in modo affidabile.
+      await mouseClick({ x: info.x, y: info.y });
+      return { obsoleto: true, cliccato: true };
+    }
+    await sleep(attesaMs);
+  }
+  return { obsoleto: false, cliccato: false };
+}
 
 /** "2.104,68" -> 2104.68 ; "−0,10" -> -0.10 (il meno del pannello e' U+2212, non ASCII). */
 export function numeroItaliano(s) {

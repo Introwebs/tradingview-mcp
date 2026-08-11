@@ -5,7 +5,11 @@ import { grindSession } from '../src/core/backtest.js';
 function makeDeps({ runs, metricsSeq }) {
   const queue = [...runs];
   const finalized = [];
-  const seen = { reportIds: [], loadingIds: [] };
+  const seen = { reportIds: [], loadingIds: [], refreshChiamato: 0 };
+  // `call` NON avanza piu' a ogni lettura: un motore non cambia risultato perche' lo guardi, e
+  // quella finzione mascherava il difetto vero (il report obsoleto che non si ricalcola). Avanza
+  // quando cambia qualcosa: input, symbol, timeframe, periodo. Chi vuole simulare metriche che si
+  // muovono DURANTE il ricalcolo sovrascrive readReportFor.
   let call = 0;
   // Il chart finto tiene davvero lo stato degli input: se non lo facesse, il readback di
   // grindSession vedrebbe valori diversi da quelli richiesti e ogni run finirebbe in
@@ -27,10 +31,10 @@ function makeDeps({ runs, metricsSeq }) {
         finalize: async (runId, payload) => { finalized.push({ runId, payload }); return { data: { id: runId * 10 } }; },
         progress: async () => null,
       },
-      setInputs: async ({ inputs }) => { applied = { ...applied, ...inputs }; loadingPending = true; return { updated_inputs: inputs, missing: [] }; },
+      setInputs: async ({ inputs }) => { applied = { ...applied, ...inputs }; loadingPending = true; call = Math.min(call + 1, metricsSeq.length - 1); return { updated_inputs: inputs, missing: [] }; },
       readReportFor: async (id) => {
         seen.reportIds.push(id);
-        return { success: true, metrics: metricsSeq[Math.min(call++, metricsSeq.length - 1)] };
+        return { success: true, metrics: metricsSeq[Math.min(call, metricsSeq.length - 1)] };
       },
       readStrategyLoading: async (id) => {
         seen.loadingIds.push(id);
@@ -38,16 +42,20 @@ function makeDeps({ runs, metricsSeq }) {
         return false;
       },
       ensureTesterPanel: async () => ({ ok: true, altezza: 400 }),
+      // Col periodo di test personalizzato TradingView non ricalcola da solo: marca il report
+      // obsoleto e aspetta il pulsante "Aggiorna report". Lo stub registra se il grind lo cerca.
+      aggiornaReportSeObsoleto: async () => { seen.refreshChiamato = (seen.refreshChiamato || 0) + 1; return { obsoleto: false, cliccato: false }; },
       ensureVisibleFor: async () => ({ found: true, wasHidden: false, visible: true }),
       setStrategyVisibility: async () => true,
       // Chart finto: tiene davvero symbol/timeframe/periodo, cosi' le verifiche di
       // applicaContestoRun esercitano il comportamento vero invece di passare a vuoto.
       getChartState: async () => ({ symbol: chart.symbol, resolution: chart.resolution }),
-      setSymbol: async ({ symbol }) => { chart.symbol = symbol; return { success: true }; },
-      setTimeframe: async ({ timeframe }) => { chart.resolution = String(timeframe); return { success: true }; },
+      setSymbol: async ({ symbol }) => { chart.symbol = symbol; call = Math.min(call + 1, metricsSeq.length - 1); return { success: true }; },
+      setTimeframe: async ({ timeframe }) => { chart.resolution = String(timeframe); call = Math.min(call + 1, metricsSeq.length - 1); return { success: true }; },
       readTestPeriod: async () => ({ ...chart.periodo }),
       setCustomPeriod: async (from, to) => {
         chart.periodo = { label: `${from} — ${to}`, from, to };
+        call = Math.min(call + 1, metricsSeq.length - 1);
         return { applied: true, ...chart.periodo };
       },
       // Il pannello finto serve le stesse metriche dell'API: le run che dichiarano un periodo
@@ -411,9 +419,16 @@ test('con un periodo ristretto le metriche vengono dal PANNELLO, non dall API in
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2026-08-04', period_end: '2026-08-11', input_set: { in_0: 2 } }],
     metricsSeq: [M({ total_trades: 288, net_profit: 28309 })], // l'API interna vede tutto lo storico
   });
+  // Il pannello deve CAMBIARE dopo il set: uno stub che risponde sempre lo stesso valore e' il
+  // pannello fermo che dal 2026-08-11 rifiutiamo (stale_metrics), non un caso legittimo.
+  let dopoIlSet = false;
+  const setOriginale = deps.setInputs;
+  deps.setInputs = async (arg) => { const r = await setOriginale(arg); dopoIlSet = true; return r; };
   deps.readPanelMetrics = async () => ({
     success: true, source: 'panel',
-    metrics: { total_trades: 3, net_profit: -101.14, net_profit_percent: -0.001, max_drawdown: 2104.68, max_drawdown_percent: 0.0206, percent_profitable: 0.3333, profit_factor: 0.952 },
+    metrics: dopoIlSet
+      ? { total_trades: 3, net_profit: -101.14, net_profit_percent: -0.001, max_drawdown: 2104.68, max_drawdown_percent: 0.0206, percent_profitable: 0.3333, profit_factor: 0.952 }
+      : { total_trades: 9, net_profit: -50, net_profit_percent: -0.0005, max_drawdown: 1000, max_drawdown_percent: 0.01, percent_profitable: 0.2, profit_factor: 0.8 },
   });
 
   const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
@@ -553,12 +568,20 @@ test('pannello LENTO: le riletture recuperano il valore nuovo e la run si finali
   // baseline -> ancora baseline (ritardo) -> valore nuovo.
   const { deps, finalized } = makeDeps({
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 } }],
-    metricsSeq: [
-      M({ total_trades: 100, net_profit: 10 }),
-      M({ total_trades: 100, net_profit: 10 }),
-      M({ total_trades: 100, net_profit: 999 }),
-    ],
+    metricsSeq: [M({ total_trades: 100, net_profit: 10 })],
   });
+  // Il pannello arriva in ritardo: due letture col valore vecchio, poi quello nuovo. Serve uno
+  // stub esplicito perche' le letture di makeDeps sono (giustamente) idempotenti.
+  let letture = 0;
+  let cambiato = false;
+  const setOrig = deps.setInputs;
+  deps.setInputs = async (arg) => { const r = await setOrig(arg); cambiato = true; letture = 0; return r; };
+  deps.readReportFor = async () => {
+    if (!cambiato) return { success: true, metrics: M({ total_trades: 100, net_profit: 10 }) };
+    letture += 1;
+    return { success: true, metrics: letture <= 3 ? M({ total_trades: 100, net_profit: 10 }) : M({ total_trades: 100, net_profit: 999 }) };
+  };
+  deps.readPanelMetrics = async () => ({ success: false, retryable: true, metrics: {}, source: 'panel' });
 
   const out = await grindSession({
     session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
@@ -586,4 +609,48 @@ test('cambio di PERIODO: metriche identiche = stale (l asse periodo da solo deve
 
   assert.equal(out.stopped_reason?.kind, 'stale_metrics');
   assert.equal(finalized.length, 0);
+});
+
+// --- "Il report è obsoleto" (causa radice, 2026-08-11) ----------------------------------------
+// Col Periodo di test su un intervallo personalizzato (modalita' ESTESO) TradingView NON ricalcola
+// il report quando cambia un input: lo marca obsoleto e aspetta il pulsante "Aggiorna report".
+// Misurato: RR 2->6 + 30 s di attesa = pannello fermo; click = numeri nuovi dopo 10,6 s.
+// Senza questo passo OGNI run della matrice registra le metriche della configurazione precedente.
+
+test('ogni run chiede l aggiornamento del report obsoleto', async () => {
+  const { deps, seen } = makeDeps({
+    runs: [
+      { id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 } },
+      { id: 2, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 } },
+    ],
+    metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 300 }), M({ net_profit: 400 })],
+  });
+
+  await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(seen.refreshChiamato, 2, 'va chiamato una volta per run, dopo il set degli input');
+});
+
+test('la baseline viene dallo stesso canale delle metriche, non dall API interna', async () => {
+  // Il buco che produceva l'alternanza done/stale/done/stale in produzione: a inizio grind
+  // `prevFp` veniva da readReportFor (API interna, cieca al periodo), quindi con un periodo
+  // ristretto la PRIMA run di ogni invocazione non veniva mai confrontata col pannello e
+  // finalizzava i numeri della configurazione precedente.
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, period_start: '2026-07-12', period_end: '2026-08-11' }],
+    metricsSeq: [M()],
+  });
+  // Il pannello resta FERMO su un valore, mentre l'API interna ne dà un altro (è cieca al periodo).
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: M({ total_trades: 777 }) });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason?.kind, 'stale_metrics');
+  assert.equal(finalized.length, 0, 'il pannello fermo non deve piu sfuggire alla prima run');
 });
