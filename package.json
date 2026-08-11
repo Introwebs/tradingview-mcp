@@ -19,6 +19,9 @@
     "test:e2e": "node --test tests/e2e.test.js",
     "test:unit": "node --test tests/pine_analyze.test.js tests/pine_editor_target.test.js tests/cli.test.js tests/sanitization.test.js tests/replay.test.js tests/launch.test.js tests/chart_indicator.test.js tests/chart_history.test.js tests/update.test.js",
     "test:cli": "node --test tests/cli.test.js",
+    "test:bt": "node --test tests/bt_chart.test.js tests/bt_grind.test.js tests/bt_inputs.test.js tests/bt_metrics.test.js tests/bt_pinealgos.test.js",
+    "_comment_e2e": "ATTENZIONE: test:e2e, test, test:all e test:verbose PILOTANO LA TRADINGVIEW VERA — cambiano simbolo, timeframe, visibilita degli indicatori ed entrano in replay. Non lanciarli su un chart di lavoro: lasciano il chart in uno stato diverso da come l'hai trovato. Per il codice del grind usa test:bt, che e' interamente offline.",
+    "test:offline": "node --test tests/bt_chart.test.js tests/bt_grind.test.js tests/bt_inputs.test.js tests/bt_metrics.test.js tests/bt_pinealgos.test.js tests/pine_analyze.test.js tests/cli.test.js",
     "test:all": "node --test tests/e2e.test.js tests/pine_analyze.test.js tests/pine_editor_target.test.js tests/cli.test.js tests/sanitization.test.js tests/replay.test.js tests/launch.test.js tests/chart_indicator.test.js tests/chart_history.test.js tests/update.test.js",
     "test:verbose": "node --test --test-reporter=spec tests/e2e.test.js tests/pine_analyze.test.js",
     "test:count": "node --test --test-reporter=spec tests/e2e.test.js 2>&1 | tail -5"
