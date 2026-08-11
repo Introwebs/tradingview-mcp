@@ -13,12 +13,14 @@
  * controllo appena compare un'anomalia (circuit breaker).
  */
 import { setInputs as realSetInputs } from './indicators.js';
-import { getStrategyResults as realGetStrategyResults } from './data.js';
 import { captureScreenshot as realCaptureScreenshot } from './capture.js';
 import {
   readInputsInfo as realReadInputsInfo,
   readInputValues as realReadInputValues,
-  readComputedReportEntityId as realReadComputedReportEntityId,
+  readReportFor as realReadReportFor,
+  readStrategyLoading as realReadStrategyLoading,
+  ensureVisibleFor as realEnsureVisibleFor,
+  setStrategyVisibility as realSetStrategyVisibility,
   readbackMatches,
 } from './btChart.js';
 import { buildInputsPayload } from './btInputs.js';
@@ -27,35 +29,93 @@ import { toFinalizePayload, fingerprint, detectAnomaly } from './btMetrics.js';
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Attende che il report della strategia sia CAMBIATO rispetto a prima **e si sia STABILIZZATO**.
+ * Attende che il ricalcolo della strategia sia PARTITO e poi FINITO, sincronizzandosi sul
+ * segnale autoritativo di TradingView (`isLoading()` della data source) invece di indovinarlo
+ * dal movimento dei numeri.
  *
- * Le due condizioni sono entrambe necessarie, e la seconda è quella che costa cara se manca.
- * TradingView pubblica risultati PARZIALI mentre ricalcola: il report cresce trade dopo trade
- * fino al valore finale. Una versione precedente si fermava al primo cambiamento e registrava
- * un fotogramma di mezzo — misurato dal vivo il 2026-08-11: salvati 208 trade / -1,86% mentre
- * il risultato vero, un paio di secondi dopo, era 288 trade / +41,57%. Numeri plausibili e
- * completamente falsi, senza nessun errore da nessuna parte.
+ * Perché non basta guardare le firme. Una versione precedente si fermava al primo cambiamento
+ * e una successiva aspettava che i numeri si assestassero; entrambe deducevano lo stato del
+ * motore da ciò che pubblicava. È fragile in due direzioni: il report può restare fermo mentre
+ * il calcolo è in corso, e può assestarsi su un plateau intermedio.
  *
- * Quindi: prima si aspetta che la firma cambi (il ricalcolo è partito), poi che resti IDENTICA
- * per `stableChecks` letture consecutive (il ricalcolo è finito).
+ * Tempi misurati dal vivo il 2026-08-11 (campionamento a 50 ms nella stessa evaluate del set,
+ * quindi senza latenza di round-trip fra i due):
  *
- * Se scade il tempo ritorna comunque l'ultimo report: metriche invariate NON sono un errore di
- * per sé (due input diversi possono dare lo stesso risultato) — la discriminazione la fa il
- * readback in detectAnomaly.
+ *   setValue → isLoading=true   616 ms e 670 ms su due ripetizioni
+ *   durata isLoading=true      1243 ms e 1088 ms
+ *   metriche nuove             pubblicate al ritorno a false
+ *
+ * NOTA per chi legge il git log: il commit 870cd44 giustificava l'attesa di stabilizzazione con
+ * un incidente da "risultato parziale" (208 trade / -1,86% salvati al posto di 288 / +41,57%).
+ * Quella diagnosi era SBAGLIATA, verificato il 2026-08-11: 208 trade / -1,86% era il report
+ * completo di un'ALTRA strategia del chart, letta al posto della nostra. La causa vera è il
+ * difetto che `readReportFor` chiude leggendo per entity_id. La conferma di stabilità qui sotto
+ * resta come rete di sicurezza — costa qualche centinaio di ms — ma non è lei a reggere la
+ * correttezza.
+ *
+ * @returns {Promise<{results: Object, recalcObserved: boolean|null}>}
+ *          `recalcObserved` è null quando `isLoading()` non è leggibile: in quel caso si degrada
+ *          all'euristica sulle firme e NON si accusa un no-op che non si è in grado di vedere.
  */
-async function waitForRecalc(prevFp, { getStrategyResults, sleep, timeoutMs = 45000, stepMs = 700, stableChecks = 3 }) {
+async function waitForRecalc(entityId, prevFp, {
+  readReport, readLoading, sleep,
+  timeoutMs = 45000, stepMs = 250, stableChecks = 3, startGraceMs = 5000,
+}) {
+  const deadline = Date.now() + timeoutMs;
+  const graceEnd = Date.now() + Math.min(startGraceMs, timeoutMs);
+  let last = await readReport(entityId);
+  let recalcObserved = false;
+
+  // Fase 1 — il ricalcolo è partito? Misurato a ~0,6 s dal set, quindi la grazia di default
+  // (5 s) è larga otto volte il necessario. Il polling a 250 ms sta comodo dentro la finestra
+  // di ~1,1 s in cui isLoading resta true.
+  for (;;) {
+    const loading = await readLoading(entityId);
+    if (loading === null) {
+      // isLoading non leggibile (strategia sparita dal chart, o API di TV cambiata): non si può
+      // né confermare né negare il ricalcolo. Si torna all'euristica storica.
+      return { results: await waitByFingerprint(entityId, prevFp, { readReport, sleep, deadline, stepMs, stableChecks }), recalcObserved: null };
+    }
+    if (loading === true) { recalcObserved = true; break; }
+
+    // Il ricalcolo può essere iniziato E finito fra due campioni: se le metriche sono già
+    // cambiate è avvenuto, e chiamarlo no-op sarebbe un falso allarme.
+    last = await readReport(entityId);
+    if (last?.success !== false && fingerprint(last?.metrics || {}) !== prevFp) { recalcObserved = true; break; }
+
+    if (Date.now() >= graceEnd) break;
+    await sleep(stepMs);
+  }
+
+  // Fase 2 — attesa della fine. Se il ricalcolo non è mai partito si salta: non c'è nulla da
+  // attendere, e il chiamante lo tratterà come no-op silenzioso.
+  while (recalcObserved && Date.now() < deadline) {
+    if (await readLoading(entityId) === false) break;
+    await sleep(stepMs);
+  }
+
+  // Fase 3 — conferma di stabilità: rete di sicurezza, non il meccanismo portante.
+  const results = await waitByFingerprint(entityId, null, { readReport, sleep, deadline, stepMs, stableChecks });
+  return { results, recalcObserved };
+}
+
+/**
+ * Legge finché la firma delle metriche resta identica per `stableChecks` letture consecutive.
+ * Con `requireChangeFrom` valorizzato pretende anche che sia DIVERSA da quella firma (è la
+ * vecchia euristica, usata solo come fallback quando `isLoading()` non è leggibile).
+ */
+async function waitByFingerprint(entityId, requireChangeFrom, { readReport, sleep, deadline, stepMs, stableChecks }) {
   let last = null;
   let lastFp = null;
   let stable = 0;
-  let changed = false;
-  const deadline = Date.now() + timeoutMs;
+  let changed = requireChangeFrom === null;
 
   for (;;) {
-    last = await getStrategyResults();
+    last = await readReport(entityId);
     if (!last || last.success === false) return last;
 
     const fp = fingerprint(last.metrics);
-    if (fp !== prevFp) changed = true;
+    if (requireChangeFrom !== null && fp !== requireChangeFrom) changed = true;
     stable = fp === lastFp ? stable + 1 : 0;
     lastFp = fp;
 
@@ -72,17 +132,20 @@ export async function grindSession(opts, deps = {}) {
     // sommato il tempo di stabilizzazione. Meglio abbondare: il costo di aspettare troppo e'
     // qualche secondo per run, quello di aspettare troppo poco e' un backtest falso.
     period_start = null, period_end = null, recalc_timeout_ms = 45000, recalc_stable_checks = 3,
+    recalc_step_ms = 250, recalc_start_grace_ms = 5000,
     max_consecutive_failures = 3,
   } = opts;
 
   const {
     api,
     setInputs = realSetInputs,
-    getStrategyResults = realGetStrategyResults,
     captureScreenshot = realCaptureScreenshot,
     readInputsInfo = realReadInputsInfo,
     readInputValues = realReadInputValues,
-    readComputedReportEntityId = realReadComputedReportEntityId,
+    readReportFor = realReadReportFor,
+    readStrategyLoading = realReadStrategyLoading,
+    ensureVisibleFor = realEnsureVisibleFor,
+    setStrategyVisibility = realSetStrategyVisibility,
     sleep = realSleep,
   } = deps;
 
@@ -93,25 +156,21 @@ export async function grindSession(opts, deps = {}) {
   const info = await readInputsInfo(entity_id);
   if (!info.length) throw new Error(`nessun input leggibile per entity_id=${entity_id}: la strategia è sul chart?`);
 
-  // Il report lo legge getStrategyResults(), che NON accetta un entity_id: prende la prima
-  // strategia con un report calcolato, cioè quella selezionata nel pannello Strategy Tester.
-  // Se non è la nostra, il grind applicherebbe gli input a una strategia e registrerebbe le
-  // metriche di un'altra — con numeri perfettamente plausibili e nessun errore. Si verifica
-  // una volta sola: la selezione del pannello non cambia da sé durante il grind.
-  const reportOwner = await readComputedReportEntityId();
-  if (reportOwner && reportOwner !== entity_id) {
-    throw new Error(
-      `il pannello Strategy Tester sta mostrando la strategia ${reportOwner}, non ${entity_id}: `
-      + 'seleziona la strategia giusta nel pannello prima di far partire il grind, '
-      + 'altrimenti i backtest registrerebbero le metriche di quella sbagliata.'
-    );
+  // TradingView non calcola il report di una strategia invisibile. Serve quindi che la NOSTRA
+  // sia visibile — e solo la nostra: l'unhide indiscriminato di ensureStrategyTesterReady()
+  // accendeva ogni strategia nascosta del chart, e quella appena accesa poteva prendersi il
+  // report. Si annota lo stato precedente per rimettere il chart come l'utente l'aveva.
+  const vis = await ensureVisibleFor(entity_id);
+  if (!vis.found) {
+    throw new Error(`la strategia ${entity_id} non è fra le data source del chart: aprila prima di far partire il grind.`);
   }
+  const restoreHidden = vis.wasHidden;
 
   const rows = [];
   let executed = 0;
   let failed = 0;
   let stopped_reason = null;
-  let prevFp = fingerprint((await getStrategyResults())?.metrics || {});
+  let prevFp = fingerprint((await readReportFor(entity_id))?.metrics || {});
   // Fallimenti CONSECUTIVI in finalize: un 422 isolato è un test storto e non deve fermare
   // la matrice, ma se la causa è sistemica (es. initialCapital sempre null perché "Initial
   // Capital" non viene riconosciuto tra gli input) ogni run fallisce allo stesso modo e senza
@@ -133,15 +192,23 @@ export async function grindSession(opts, deps = {}) {
       setResult = await setInputs({ entity_id, inputs: requested });
     }
 
-    const results = await waitForRecalc(prevFp, {
-      getStrategyResults, sleep, timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
+    const { results, recalcObserved } = await waitForRecalc(entity_id, prevFp, {
+      readReport: readReportFor, readLoading: readStrategyLoading, sleep,
+      timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
+      stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
     });
     const sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === prevFp;
 
     const actual = await readInputValues(entity_id);
     const readbackOk = readbackMatches(requested, actual);
 
-    const anomaly = detectAnomaly({ setResult, results, readbackOk, sameAsPrevious });
+    // "il motore non ha ricalcolato" è un'accusa sensata solo se qualcosa È stato chiesto:
+    // una run con input_set vuoto gira sugli input correnti, e non ricalcolare è il
+    // comportamento giusto, non un no-op silenzioso.
+    const anomaly = detectAnomaly({
+      setResult, results, readbackOk, sameAsPrevious,
+      recalcObserved: Object.keys(requested).length ? recalcObserved : null,
+    });
     if (anomaly) {
       // Circuit breaker: NON si ritenta e NON si va avanti a variare a caso. La run resta
       // failed col motivo reale e il controllo torna al modello, che scala all'utente.
@@ -205,5 +272,14 @@ export async function grindSession(opts, deps = {}) {
     prevFp = fingerprint(results.metrics);
   }
 
-  return { success: true, session_id, executed, failed, stopped_reason, rows };
+  // Il chart va restituito com'era: se la strategia era nascosta e l'abbiamo accesa noi per
+  // farle calcolare il report, la si rimette nascosta. Un fallimento qui non deve invalidare
+  // un grind riuscito, quindi non propaga.
+  let restored = null;
+  if (restoreHidden) {
+    try { restored = await setStrategyVisibility(entity_id, false); }
+    catch { restored = false; }
+  }
+
+  return { success: true, session_id, executed, failed, stopped_reason, rows, ...(restoreHidden && { visibility_restored: restored }) };
 }

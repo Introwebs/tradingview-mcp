@@ -92,16 +92,26 @@ export function fingerprint(tv = {}) {
  *
  * Nota sul caso `sameAsPrevious`: metriche identiche NON sono di per sé un'anomalia — due set di
  * input diversi possono legittimamente produrre lo stesso risultato (es. un filtro che non si
- * attiva mai). Diventa anomalia solo se il READBACK dice che i valori non sono stati applicati:
- * quello è il no-op silenzioso noto dei dropdown input.string con options.
+ * attiva mai). Diventa anomalia solo se qualcosa dice che il set non ha avuto effetto: il
+ * READBACK che rilegge i vecchi valori, oppure il motore che non ha ricalcolato affatto.
+ *
+ * `recalcObserved`: true = si è visto `isLoading()` passare a true (o le metriche cambiare);
+ * false = il set non ha smosso il motore; null = segnale non leggibile, e allora NON si accusa
+ * un no-op che non si è in grado di vedere.
  */
-export function detectAnomaly({ setResult, results, readbackOk = true, sameAsPrevious = false } = {}) {
+export function detectAnomaly({ setResult, results, readbackOk = true, sameAsPrevious = false, recalcObserved = null } = {}) {
   const missing = setResult?.missing || [];
   if (missing.length) {
     return { kind: 'inputs_not_applied', detail: `id non applicati: ${missing.join(', ')}` };
   }
   if (!results || results.success === false) {
     return { kind: 'runtime_error', detail: results?.error || 'report della strategia non disponibile' };
+  }
+  // Nessun ricalcolo E metriche invariate: il set è arrivato a TradingView senza cambiare nulla.
+  // Fail-closed di proposito — fermarsi per sbaglio costa un riavvio del grind, proseguire per
+  // sbaglio scrive nel database un backtest che non corrisponde agli input dichiarati.
+  if (recalcObserved === false && sameAsPrevious) {
+    return { kind: 'silent_noop', detail: 'nessun ricalcolo osservato dopo il set e metriche invariate' };
   }
   if (!readbackOk) {
     return sameAsPrevious

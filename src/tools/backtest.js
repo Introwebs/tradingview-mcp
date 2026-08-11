@@ -14,7 +14,9 @@ export function registerBacktestTools(server) {
       period_end: z.string().describe('Fine periodo ISO (YYYY-MM-DD) usata quando la run non ne ha una propria'),
       command_id: z.number().int().optional().describe('Id del comando operatore, per postare i progress in console'),
       max_runs: z.number().int().optional().describe('Massimo di run da eseguire in questa chiamata (0 = tutte le pending)'),
-      recalc_timeout_ms: z.number().int().optional().describe('Attesa massima del ricalcolo per run (default 20000)'),
+      recalc_timeout_ms: z.number().int().optional().describe('Attesa massima del ricalcolo per run (default 45000)'),
+      recalc_step_ms: z.number().int().optional().describe('Passo di campionamento di isLoading (default 250; la finestra di ricalcolo misurata dura ~1,1 s)'),
+      recalc_start_grace_ms: z.number().int().optional().describe('Quanto attendere che il ricalcolo PARTA prima di dichiarare no-op (default 5000; misurato ~0,6 s)'),
     },
     async (args) => {
       try {
