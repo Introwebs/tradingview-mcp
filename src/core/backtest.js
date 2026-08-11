@@ -206,6 +206,10 @@ async function applicaContestoRun(run, ctx) {
   if (from && to && (periodo.from !== from || periodo.to !== to)) {
     const res = await setCustomPeriod(from, to);
     periodo = { label: res.label, from: res.from, to: res.to };
+    // Anche il PERIODO e' un cambio di contesto: una finestra diversa non puo' produrre le stesse
+    // identiche metriche. Senza questa riga, su una matrice che varia solo il periodo — cioe' il
+    // caso classico — il controllo `stale_metrics` non sarebbe mai scattato.
+    if (res.applied) contestoRicaricato = true;
     if (!res.applied) {
       problemi.push({
         kind: 'period_not_applied',

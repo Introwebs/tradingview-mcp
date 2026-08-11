@@ -569,3 +569,21 @@ test('pannello LENTO: le riletture recuperano il valore nuovo e la run si finali
   assert.equal(finalized.length, 1);
   assert.equal(finalized[0].payload.net_profit, 999, 'deve registrare il valore RILETTO, non quello fermo');
 });
+
+test('cambio di PERIODO: metriche identiche = stale (l asse periodo da solo deve bastare)', async () => {
+  // Il caso classico della matrice: stesso symbol, stesso timeframe, stesso input_set, cambia solo
+  // la finestra. Se il periodo non contasse come cambio di contesto, il controllo non scatterebbe
+  // proprio dove serve di piu'.
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: {}, period_start: '2026-07-12', period_end: '2026-08-11' }],
+    metricsSeq: [M()],
+  });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason?.kind, 'stale_metrics');
+  assert.equal(finalized.length, 0);
+});
