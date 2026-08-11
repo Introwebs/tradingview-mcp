@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseDataItaliana, parseEtichettaPeriodo, setCustomPeriod, readTestPeriod } from '../src/core/btPeriod.js';
-import { numeroItaliano, parsePannello, readPanelMetrics } from '../src/core/btPanel.js';
+import { numeroItaliano, parsePannello, readPanelMetrics, ensureTesterPanel } from '../src/core/btPanel.js';
 
 // I testi qui sotto sono COPIATI dal pannello vero il 2026-08-11, non scritti a mente.
 // La lezione del progetto: una fixture inventata che codifica la stessa assunzione del codice
@@ -168,4 +168,82 @@ test('setCustomPeriod segnala applied:false se TV applica un range diverso da qu
   });
   assert.equal(out.applied, false);
   assert.equal(out.from, '2023-08-04');
+});
+
+// ---------------------------------------------------------------------------
+// Regressione del 2026-08-11 (secondo incidente): ensureTesterPanel deduceva lo
+// stato del pannello dai PIXEL, misurando per giunta l'elemento sbagliato
+// (`bottom-widgetbar-handle`, alto 7px sempre). Il risultato era `h < 120` sempre
+// vero e `toggleMaximize()` a ogni chiamata: la funzione che doveva garantire il
+// pannello ne invertiva lo stato a ogni run. Poi il grind si fermava con "voce
+// «Intervallo date personalizzato» non trovata" — e la voce c'era.
+// ---------------------------------------------------------------------------
+
+function stubPannello(stato) {
+  const jsVisto = [];
+  const evaluate = async (js) => {
+    jsVisto.push(js);
+    if (/showWidget|turnOffMaximize/.test(js) && !/isVisible:/.test(js)) return { ok: true };
+    return stato;
+  };
+  return { evaluate, jsVisto };
+}
+
+test('ensureTesterPanel legge lo stato dal MODELLO, mai dai pixel', async () => {
+  const { evaluate, jsVisto } = stubPannello({ visibile: true, mode: 'normal', altezza: 333, attivo: 'backtesting' });
+  const out = await ensureTesterPanel({ evaluate, sleep: async () => {} });
+  assert.equal(out.ok, true);
+  assert.equal(out.altezza, 333);
+  const tuttoIlJs = jsVisto.join('\n');
+  // I due difetti veri, sbarrati per costruzione.
+  assert.ok(!/getBoundingClientRect/.test(tuttoIlJs), 'non deve misurare pixel');
+  assert.ok(!/toggleMaximize/.test(tuttoIlJs), 'toggleMaximize e\' un toggle cieco: vietato');
+  assert.ok(!/bottom-widgetbar"\]|data-name="backtesting"/.test(tuttoIlJs), 'niente selettori DOM marci');
+});
+
+test('ensureTesterPanel rilegge lo stato in una evaluate SEPARATA, non nello stesso tick', async () => {
+  const { evaluate, jsVisto } = stubPannello({ visibile: true, mode: 'normal', altezza: 333, attivo: 'backtesting' });
+  await ensureTesterPanel({ evaluate, sleep: async () => {} });
+  assert.equal(jsVisto.length, 2, 'agire e verificare devono essere due evaluate distinte');
+});
+
+test('ensureTesterPanel: pannello minimizzato = NON pronto, con il motivo vero', async () => {
+  const { evaluate } = stubPannello({ visibile: true, mode: 'minimized', altezza: 0, attivo: 'backtesting' });
+  const out = await ensureTesterPanel({ evaluate, sleep: async () => {} });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /minimizzat/i);
+});
+
+test('ensureTesterPanel: tab sbagliata (pine-editor) = NON pronto', async () => {
+  const { evaluate } = stubPannello({ visibile: true, mode: 'normal', altezza: 333, attivo: 'pine-editor' });
+  const out = await ensureTesterPanel({ evaluate, sleep: async () => {} });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /pine-editor/);
+});
+
+test('setCustomPeriod: bottone assente = pannello chiuso, NON "voce non trovata"', async () => {
+  // E' il messaggio che ha mandato fuori strada la diagnosi il 2026-08-11.
+  let clic = 0;
+  const out = await setCustomPeriod('2026-08-04', '2026-08-11', {
+    evaluate: async (js) => (/_paPeriodBtn/.test(js) ? { bottoneTrovato: false, voci: [] } : null),
+    mouseClick: async () => { clic++; },
+    sleep: async () => {},
+  });
+  assert.equal(out.applied, false);
+  assert.equal(out.retryable, true);
+  assert.match(out.error, /pannello Strategy Tester/i);
+  assert.ok(!/voce "Intervallo date personalizzato" non trovata/.test(out.error), 'non deve incolpare il menu');
+  assert.equal(clic, 0);
+});
+
+test('setCustomPeriod: voce mancante davvero -> l\'errore ELENCA le voci lette', async () => {
+  const out = await setCustomPeriod('2026-08-04', '2026-08-11', {
+    evaluate: async (js) => (/_paPeriodBtn/.test(js)
+      ? { bottoneTrovato: true, voci: [{ testo: 'Ultimi 7 giorni', x: 1, y: 2 }, { testo: 'Storico completo', x: 1, y: 3 }] }
+      : null),
+    mouseClick: async () => {},
+    sleep: async () => {},
+  });
+  assert.equal(out.applied, false);
+  assert.match(out.error, /Ultimi 7 giorni \| Storico completo/);
 });

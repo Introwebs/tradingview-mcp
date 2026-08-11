@@ -74,11 +74,15 @@ export async function readTestPeriod({ evaluate = realEvaluate } = {}) {
  * copiate da una sessione precedente, ha gia' cliccato la voce sbagliata.
  */
 export async function openTestPeriodMenu({ evaluate = realEvaluate } = {}) {
-  const voci = await evaluate(`
+  const out = await evaluate(`
     (function() {
       ${BTN_JS}
       var b = _paPeriodBtn();
-      if (!b) return null;
+      // Bottone assente = pannello chiuso/minimizzato, NON menu senza la voce giusta. Distinguerli
+      // e' l'unica ragione per cui questa funzione non torna piu' un array secco: il 2026-08-11 il
+      // grind si e' fermato due volte su "voce non trovata" mentre la voce c'era eccome, e il vero
+      // problema era il pannello che ensureTesterPanel aveva appena richiuso da solo.
+      if (!b) return { bottoneTrovato: false, voci: [] };
       b.click();
       var out = [];
       var all = document.querySelectorAll('div[class*="title-"]');
@@ -94,10 +98,11 @@ export async function openTestPeriodMenu({ evaluate = realEvaluate } = {}) {
         var r = (node || all[i]).getBoundingClientRect();
         out.push({ testo: t, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
       }
-      return out;
+      return { bottoneTrovato: true, voci: out };
     })()
   `);
-  return Array.isArray(voci) ? voci : [];
+  if (Array.isArray(out)) return { bottoneTrovato: true, voci: out }; // compat con stub vecchi
+  return { bottoneTrovato: !!out?.bottoneTrovato, voci: Array.isArray(out?.voci) ? out.voci : [] };
 }
 
 /** Chiude il menu se e' rimasto aperto (Escape), per non lasciare overlay sul chart. */
@@ -126,11 +131,21 @@ export async function setCustomPeriod(from, to, {
     return { applied: false, label: null, from: null, to: null, error: `date non ISO: ${from} / ${to}` };
   }
 
-  const voci = await openTestPeriodMenu({ evaluate });
+  const { bottoneTrovato, voci } = await openTestPeriodMenu({ evaluate });
+  if (!bottoneTrovato) {
+    return {
+      applied: false, label: null, from: null, to: null, retryable: true,
+      error: 'pulsante del periodo di test non presente: il pannello Strategy Tester e\' chiuso o minimizzato',
+    };
+  }
   const custom = voci.find((v) => /personalizzat/i.test(v.testo));
   if (!custom) {
     await closeTestPeriodMenu({ evaluate });
-    return { applied: false, label: null, from: null, to: null, error: 'voce "Intervallo date personalizzato" non trovata nel menu del periodo di test' };
+    const elenco = voci.length ? voci.map((v) => v.testo).join(' | ') : '(menu vuoto)';
+    return {
+      applied: false, label: null, from: null, to: null,
+      error: `voce "Intervallo date personalizzato" non trovata nel menu del periodo di test. Voci lette: ${elenco}`,
+    };
   }
 
   // Click VERO: col .click() del DOM il dialog non si apre.

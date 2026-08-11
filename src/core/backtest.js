@@ -192,7 +192,10 @@ async function applicaContestoRun(run, ctx) {
   // Aprirlo una volta a inizio grind non basta: va riaperto dopo ogni ricarica del contesto.
   if (contestoRicaricato && ensureTesterPanel) {
     await sleep(400);
-    await ensureTesterPanel();
+    const p = await ensureTesterPanel();
+    if (!p.ok) {
+      problemi.push({ kind: 'panel_not_open', detail: p.error || 'pannello Strategy Tester non pronto dopo il cambio di contesto' });
+    }
   }
 
   // Il periodo si rilegge SEMPRE, anche quando non lo cambiamo: e' quello che finira' nel payload,
@@ -306,9 +309,13 @@ export async function grindSession(opts, deps = {}) {
   // report. Si annota lo stato precedente per rimettere il chart come l'utente l'aveva.
   // Il pannello serve sia per gli screenshot equity sia — per le run con periodo — come UNICA
   // fonte di metriche. Se e' collassato il blocco "Statistiche chiave" non e' nel DOM.
+  // Fail-closed: senza pannello le run con periodo non hanno una fonte di metriche valida e il
+  // pulsante del periodo non esiste nemmeno. Partire lo stesso significa fallire alla run 1 con un
+  // motivo che punta altrove — successo il 2026-08-11, due volte di fila. Meglio fermarsi qui,
+  // dove il motivo e' ancora vero.
   const pannello = await ensureTesterPanel();
   if (!pannello.ok) {
-    await api.progress(command_id, `⚠️ pannello Strategy Tester alto ${pannello.altezza}px: le run con periodo potrebbero non essere leggibili`);
+    throw new Error(`${pannello.error || 'pannello Strategy Tester non pronto'}. Aprilo (ui_open_panel strategy-tester) e rilancia: il grind riparte dalle run pending.`);
   }
 
   const vis = await ensureVisibleFor(entity_id);

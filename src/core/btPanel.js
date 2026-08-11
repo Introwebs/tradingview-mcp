@@ -86,34 +86,93 @@ export function parsePannello(testo) {
 }
 
 /**
- * Garantisce che il pannello Strategy Tester sia aperto E non collassato.
+ * Garantisce che il pannello Strategy Tester sia aperto e non minimizzato.
  *
- * Serve perche' il grind ora DIPENDE dal pannello per le run con periodo ristretto: se e'
- * minimizzato, il blocco "Statistiche chiave" non e' proprio nel DOM. Misurato dal vivo il
- * 2026-08-11: pannello alto 7px, `document.body` senza nemmeno la stringa "Statistiche chiave",
- * e il grind che si fermava alla prima run. Il pulsante del periodo invece resta visibile anche
- * da collassato, quindi non e' un indizio affidabile dello stato del pannello.
+ * Serve perche' il grind DIPENDE dal pannello per le run con periodo ristretto: se e' minimizzato,
+ * il blocco "Statistiche chiave" non e' proprio nel DOM.
  *
- * @returns {Promise<{ok: boolean, altezza: number, error?: string}>}
+ * ⚠️ NON MISURARE PIXEL QUI — LEGGERE PERCHE' PRIMA DI RITOCCARE ⚠️
+ * La prima stesura (2026-08-11) deduceva lo stato del pannello da
+ * `document.querySelector('[data-name="backtesting"], [class*="bottom-widgetbar"]')` e
+ * dall'altezza del rettangolo. Due difetti in fila, entrambi silenziosi:
+ *
+ *  1. `[data-name="backtesting"]` NON ESISTE PIU' su TradingView (verificato dal vivo: null).
+ *     E' un selettore ereditato da monte — `ui_open_panel` di tradesdontlie/tradingview-mcp usa
+ *     ancora lo stesso, ed e' gia' marcio anche li'.
+ *  2. Il fallback `[class*="bottom-widgetbar"]` matcha `bottom-widgetbar-handle`, la maniglia di
+ *     trascinamento, alta 7px SEMPRE — pannello aperto o chiuso. Quindi `h < 120` era sempre vero
+ *     e `toggleMaximize()` scattava a OGNI chiamata: la funzione che doveva garantire il pannello
+ *     ne invertiva lo stato a ogni run. Sulla run col pannello chiuso spariva il pulsante del
+ *     periodo di test, e il grind si fermava con "voce «Intervallo date personalizzato» non
+ *     trovata" — un messaggio che punta nel posto sbagliato.
+ *
+ * Le classi CSS di TradingView sono hash rigenerati a ogni build (`title-FtwwRr7u`): dedurre lo
+ * stato dal DOM e' garantito rompersi. La bottom bar espone lo stato come valori osservabili del
+ * modello, che e' lo stesso tier di `dataSources()`/`reportData()` e non e' mai cambiato:
+ *
+ *     bwb.isVisible().value()     -> true
+ *     bwb.mode().value()          -> 'normal' | 'maximized' | 'minimized'
+ *     bwb.height().value()        -> 333
+ *     bwb.activeWidget().value()  -> 'backtesting'
+ *
+ * REGOLA: se esiste un'API del modello, lo stato non si deduce mai dal DOM.
+ *
+ * @returns {Promise<{ok: boolean, altezza: number, stato: object|null, error?: string}>}
  */
-export async function ensureTesterPanel({ evaluate = realEvaluate } = {}) {
-  const out = await evaluate(`
+export async function ensureTesterPanel({
+  evaluate = realEvaluate, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  const azione = await evaluate(`
     (function() {
+      function v(x) { try { return (x && typeof x.value === 'function') ? x.value() : x; } catch (e) { return null; } }
       try {
         var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
-        if (bwb && typeof bwb.showWidget === 'function') bwb.showWidget('backtesting');
-        var h = 0;
-        var el = document.querySelector('[data-name="backtesting"], [class*="bottom-widgetbar"]');
-        if (el) h = el.getBoundingClientRect().height;
-        // Collassato: lo si riapre. toggleMaximize e' l'unica leva esposta dalla bottom bar.
-        if (h < 120 && bwb && typeof bwb.toggleMaximize === 'function') bwb.toggleMaximize();
-        if (el) h = el.getBoundingClientRect().height;
-        return { altezza: Math.round(h) };
-      } catch (e) { return { altezza: 0, error: e.message }; }
+        if (!bwb) return { error: 'window.TradingView.bottomWidgetBar non disponibile' };
+        if (v(bwb.isVisible && bwb.isVisible()) !== true && typeof bwb.show === 'function') bwb.show();
+        if (typeof bwb.showWidget === 'function') bwb.showWidget('backtesting');
+        // open() e' l'inverso esatto di close(): riporta a 'normal' un pannello minimizzato.
+        // (toggleMinimize() no: e' un toggle, e su un pannello gia' aperto lo CHIUDE.)
+        if (v(bwb.mode && bwb.mode()) === 'minimized' && typeof bwb.open === 'function') bwb.open();
+        // Massimizzato il pannello funziona, ma mangia il chart e sposta ogni coordinata del menu
+        // del periodo. turnOffMaximize() agisce solo se serve davvero.
+        if (typeof bwb.turnOffMaximize === 'function') bwb.turnOffMaximize();
+        return { ok: true };
+      } catch (e) { return { error: e.message }; }
     })()
   `);
-  const altezza = out?.altezza ?? 0;
-  return { ok: altezza >= 120, altezza, ...(out?.error && { error: out.error }) };
+  if (azione && azione.error) return { ok: false, altezza: 0, stato: null, error: azione.error };
+
+  // showWidget() e' async e open()/turnOffMaximize() rilanciano il layout: lo stato si rilegge
+  // DOPO, in una evaluate separata. Rileggerlo nello stesso tick e' come non rileggerlo.
+  await sleep(250);
+
+  const stato = await evaluate(`
+    (function() {
+      function v(x) { try { return (x && typeof x.value === 'function') ? x.value() : x; } catch (e) { return null; } }
+      try {
+        var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+        if (!bwb) return { error: 'window.TradingView.bottomWidgetBar non disponibile' };
+        return {
+          visibile: v(bwb.isVisible && bwb.isVisible()),
+          mode: v(bwb.mode && bwb.mode()),
+          altezza: v(bwb.height && bwb.height()),
+          attivo: v(bwb.activeWidget && bwb.activeWidget()),
+        };
+      } catch (e) { return { error: e.message }; }
+    })()
+  `);
+  if (!stato || stato.error) {
+    return { ok: false, altezza: 0, stato: null, error: stato?.error || 'stato del pannello illeggibile' };
+  }
+
+  const ok = stato.visibile === true && stato.mode !== 'minimized' && stato.attivo === 'backtesting';
+  const altezza = Number(stato.altezza) || 0;
+  if (ok) return { ok: true, altezza, stato };
+
+  const perche = stato.visibile !== true ? 'la barra inferiore e\' nascosta'
+    : stato.mode === 'minimized' ? 'il pannello e\' minimizzato'
+      : `la tab attiva e' "${stato.attivo}" invece di "backtesting"`;
+  return { ok: false, altezza, stato, error: `pannello Strategy Tester non pronto: ${perche}` };
 }
 
 /**
