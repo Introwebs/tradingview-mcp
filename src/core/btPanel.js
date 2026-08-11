@@ -49,6 +49,57 @@ import { mouseClick as realMouseClick } from './ui.js';
  *
  * @returns {Promise<{obsoleto: boolean, cliccato: boolean}>}
  */
+/**
+ * Il report e' dichiarato obsoleto da TradingView? E' il segnale AUTORITATIVO, e vale piu' di
+ * qualunque confronto fra numeri.
+ *
+ * Perche' conta: due `input_set` diversi possono produrre lo stesso identico report, e non e' un
+ * caso limite. Misurato il 2026-08-11 su `Imbalance Strategy`: `RR target (Classic)` a 1.5, 2 e 3
+ * da' sempre 651 trade e +57,27%, perche' quel parametro agisce solo in mgmt mode "Classic", che
+ * non era attivo. Dedurre lo stato dal movimento dei numeri fermava quindi una matrice sana con
+ * `stale_metrics` — un falso allarme su un risultato legittimo.
+ *
+ * La domanda giusta non e' "i numeri sono cambiati?" ma "TradingView considera il report attuale?".
+ * Banner assente = report attuale per gli input correnti, anche se i numeri coincidono con quelli
+ * di prima.
+ */
+export async function reportObsoleto({ evaluate = realEvaluate } = {}) {
+  const out = await evaluate(`
+    (function() {
+      var bs = document.querySelectorAll('button');
+      for (var i = 0; i < bs.length; i++) {
+        if (/^(Aggiorna report|Update report)$/i.test((bs[i].textContent || '').trim())) return true;
+      }
+      return /Il report è obsoleto|Report is outdated/i.test(document.body.textContent || '');
+    })()
+  `);
+  return out === true;
+}
+
+/**
+ * Preme "Aggiorna report" finche' il report non risulta attuale.
+ *
+ * @returns {Promise<{aggiornato: boolean, click: number}>} `aggiornato:false` significa che il
+ *          banner non se n'e' andato entro il tempo: le metriche NON sono affidabili.
+ */
+export async function attendiReportAggiornato({
+  evaluate = realEvaluate, mouseClick = realMouseClick,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  timeoutMs = 60000, passoMs = 1000,
+} = {}) {
+  const scadenza = Date.now() + timeoutMs;
+  let click = 0;
+  // Il banner compare ~226 ms dopo il cambio: una prima occhiata immediata lo mancherebbe.
+  await sleep(500);
+  for (;;) {
+    const esito = await aggiornaReportSeObsoleto({ evaluate, mouseClick, sleep, tentativi: 1, attesaMs: 0 });
+    if (esito.cliccato) click += 1;
+    else if (!(await reportObsoleto({ evaluate }))) return { aggiornato: true, click };
+    if (Date.now() >= scadenza) return { aggiornato: false, click };
+    await sleep(passoMs);
+  }
+}
+
 export async function aggiornaReportSeObsoleto({
   evaluate = realEvaluate, mouseClick = realMouseClick, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   tentativi = 6, attesaMs = 400,

@@ -19,6 +19,7 @@ import { setCustomPeriod as realSetCustomPeriod, readTestPeriod as realReadTestP
 import {
   readPanelMetrics as realReadPanelMetrics, ensureTesterPanel as realEnsureTesterPanel,
   aggiornaReportSeObsoleto as realAggiornaReport,
+  attendiReportAggiornato as realAttendiReport,
 } from './btPanel.js';
 import {
   readInputsInfo as realReadInputsInfo,
@@ -334,6 +335,7 @@ export async function grindSession(opts, deps = {}) {
     readPanelMetrics = realReadPanelMetrics,
     ensureTesterPanel = realEnsureTesterPanel,
     aggiornaReportSeObsoleto = realAggiornaReport,
+    attendiReportAggiornato = realAttendiReport,
     sleep = realSleep,
   } = deps;
 
@@ -510,9 +512,13 @@ export async function grindSession(opts, deps = {}) {
       // numeri della configurazione precedente e ogni backtest della matrice esce identico al primo.
       // Vedi il commento in btPanel.js: RR 2->6 e trenta secondi di attesa non muovono nulla, il
       // click porta i numeri nuovi in 10,6 s.
-      const report = await aggiornaReportSeObsoleto();
-      if (report.cliccato) {
-        await api.progress(command_id, `run ${run.id}: report obsoleto → premuto "Aggiorna report"`);
+      // Si aspetta che TradingView dichiari il report ATTUALE, non che i numeri si muovano.
+      // Due input_set diversi possono dare lo stesso identico report (misurato: RR target 1.5/2/3
+      // -> sempre 651 trade, perche' agisce solo in mgmt mode "Classic"), quindi "numeri fermi" non
+      // e' una prova di niente. Banner sparito = report attuale per QUESTI input.
+      const report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+      if (report.click > 0) {
+        await api.progress(command_id, `run ${run.id}: report obsoleto → premuto "Aggiorna report"${report.click > 1 ? ` (${report.click}x)` : ''}`);
       }
 
       const { results: results0, recalcObserved } = await waitForRecalc(entity_id, baselineFp, {
@@ -532,7 +538,9 @@ export async function grindSession(opts, deps = {}) {
       // che e' esattamente la baseline.
       const cambiamentoChiesto = deltaReale;
       let staleConfermato = false;
-      if (sameAsPrevious && cambiamentoChiesto) {
+      // `report.aggiornato` false = il banner non se n'e' andato: le metriche non sono affidabili
+      // e l'identita' con la run precedente e' un sintomo vero, non una coincidenza.
+      if (sameAsPrevious && cambiamentoChiesto && !report.aggiornato) {
         const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep, aggiornaReport: aggiornaReportSeObsoleto });
         if (ri.cambiato) {
           results = ri.results;
@@ -544,7 +552,7 @@ export async function grindSession(opts, deps = {}) {
       }
       // I due controlli confluiscono: contesto fermo O input fermi, in entrambi i casi si scrive
       // qualcosa che non appartiene a questa run.
-      if (staleContesto) staleConfermato = true;
+      if (staleContesto && !report.aggiornato) staleConfermato = true;
 
       const actual = await readInputValues(entity_id);
       const readbackOk = readbackMatches(requested, actual);

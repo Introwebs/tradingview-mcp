@@ -53,6 +53,9 @@ function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
       // Col periodo di test personalizzato TradingView non ricalcola da solo: marca il report
       // obsoleto e aspetta il pulsante "Aggiorna report". Lo stub registra se il grind lo cerca.
       aggiornaReportSeObsoleto: async () => { seen.refreshChiamato = (seen.refreshChiamato || 0) + 1; return { obsoleto: false, cliccato: false }; },
+      // Segnale AUTORITATIVO: TradingView dichiara il report attuale. Di default si assume di si',
+      // cosi' i test descrivono il caso sano; chi vuole il banner che non se ne va lo sovrascrive.
+      attendiReportAggiornato: async () => { seen.refreshChiamato = (seen.refreshChiamato || 0) + 1; return { aggiornato: true, click: 0 }; },
       ensureVisibleFor: async () => ({ found: true, wasHidden: false, visible: true }),
       setStrategyVisibility: async () => true,
       // Chart finto: tiene davvero symbol/timeframe/periodo, cosi' le verifiche di
@@ -554,6 +557,9 @@ test('metriche identiche dopo un cambio di TIMEFRAME: impossibile, si ferma', as
     metricsSeq: [M()], // il pannello resta fermo sui numeri di prima
     metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
+  // Il banner NON se ne va: TradingView continua a dichiarare il report obsoleto. E' questa la
+  // condizione che rende sospetta l'identita' dei numeri — non l'identita' in se'.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 1 });
 
   const out = await grindSession({
     session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
@@ -571,6 +577,9 @@ test('metriche identiche dopo un cambio di INPUT: si ferma invece di scrivere', 
     metricsSeq: [M()],
     metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
+  // Il banner NON se ne va: TradingView continua a dichiarare il report obsoleto. E' questa la
+  // condizione che rende sospetta l'identita' dei numeri — non l'identita' in se'.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 1 });
 
   const out = await grindSession({
     session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
@@ -588,6 +597,9 @@ test('pannello LENTO: le riletture recuperano il valore nuovo e la run si finali
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 } }],
     metricsSeq: [M({ total_trades: 100, net_profit: 10 })],
   });
+  // Il banner NON se ne va: TradingView continua a dichiarare il report obsoleto. E' questa la
+  // condizione che rende sospetta l'identita' dei numeri — non l'identita' in se'.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 1 });
   // Il pannello arriva in ritardo: due letture col valore vecchio, poi quello nuovo. Serve uno
   // stub esplicito perche' le letture di makeDeps sono (giustamente) idempotenti.
   let letture = 0;
@@ -620,6 +632,9 @@ test('cambio di PERIODO: metriche identiche = stale (l asse periodo da solo deve
     metricsSeq: [M()],
     metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
+  // Il banner NON se ne va: TradingView continua a dichiarare il report obsoleto. E' questa la
+  // condizione che rende sospetta l'identita' dei numeri — non l'identita' in se'.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 1 });
 
   const out = await grindSession({
     session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
@@ -662,6 +677,9 @@ test('la baseline viene dallo stesso canale delle metriche, non dall API interna
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, period_start: '2026-07-12', period_end: '2026-08-11' }],
     metricsSeq: [M()],
   });
+  // Il banner NON se ne va: TradingView continua a dichiarare il report obsoleto. E' questa la
+  // condizione che rende sospetta l'identita' dei numeri — non l'identita' in se'.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 1 });
   // Il pannello resta FERMO su un valore, mentre l'API interna ne dà un altro (è cieca al periodo).
   deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: M({ total_trades: 777 }) });
 
@@ -725,6 +743,9 @@ test('cambio di timeframe + pannello fermo sui numeri della run prima = stale, n
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '5', input_set: { in_0: 7 }, period_start: '2024-08-11', period_end: '2026-08-11' }],
     metricsSeq: [M()],
   });
+  // Il banner NON se ne va: TradingView continua a dichiarare il report obsoleto. E' questa la
+  // condizione che rende sospetta l'identita' dei numeri — non l'identita' in se'.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 1 });
 
   // Il chart finto parte da TF 15. Il pannello simula il difetto reale:
   //  - finche' siamo su TF 15 (prima del cambio) mostra il valore della run precedente;
@@ -798,6 +819,9 @@ test('il banner "report obsoleto" viene ricercato a OGNI rilettura, non solo dop
     runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 9 } }],
     metricsSeq: [M()],
   });
+  // Il banner NON se ne va: TradingView continua a dichiarare il report obsoleto. E' questa la
+  // condizione che rende sospetta l'identita' dei numeri — non l'identita' in se'.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 1 });
   // Il pannello si sblocca solo al TERZO tentativo di aggiornamento.
   let sbloccato = false;
   deps.aggiornaReportSeObsoleto = async () => {
