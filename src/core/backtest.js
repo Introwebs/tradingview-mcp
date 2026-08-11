@@ -562,9 +562,13 @@ export async function grindSession(opts, deps = {}) {
       // comportamento giusto, non un no-op silenzioso.
       const anomaly = detectAnomaly({
         setResult, results, readbackOk, sameAsPrevious, staleConfermato, contestoCambiato,
-        // Se gli input erano gia' quelli richiesti non c'e' nessun no-op da accusare: non
-        // ricalcolare e' il comportamento giusto.
-        recalcObserved: deltaReale ? recalcObserved : null,
+        // Due casi in cui NON si accusa un no-op, per ragioni diverse ma entrambe autoritative:
+        //  - gli input erano gia' quelli richiesti: non ricalcolare e' corretto;
+        //  - TradingView dichiara il report ATTUALE (banner sparito): il calcolo e' avvenuto, e se
+        //    i numeri coincidono con quelli di prima e' perche' quell'input non li muove — misurato
+        //    su RR target 1.5/2/3, sempre 651 trade. `isLoading()` non vede il ricalcolo innescato
+        //    dal pulsante, quindi qui varrebbe zero.
+        recalcObserved: (deltaReale && !report.aggiornato) ? recalcObserved : null,
       });
 
       // `zero_trades` NON ferma piu' la matrice da solo. Su un asse periodo una finestra corta senza

@@ -302,6 +302,9 @@ test('se il ricalcolo non parte mai e le metriche non cambiano è un no-op silen
     metricsSeq: [M()], // saturato: le metriche non cambiano mai
     metricheFerme: true, // il pannello NON si aggiorna: e' il difetto che il test descrive
   });
+  // Perche' sia un no-op vero serve anche che TradingView NON dichiari il report attuale:
+  // se lo dichiara, numeri fermi significano solo che quell'input non li muove.
+  deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 0 });
   deps.readStrategyLoading = async () => false; // isLoading non passa mai a true
 
   const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
@@ -843,4 +846,26 @@ test('il banner "report obsoleto" viene ricercato a OGNI rilettura, non solo dop
   assert.ok(chiamate >= 3, `il refresh va ritentato: chiamate=${chiamate}`);
   assert.equal(out.stopped_reason, null);
   assert.equal(finalized[0].payload.total_trades, 77);
+});
+
+test('report dichiarato ATTUALE + numeri identici = risultato legittimo, non anomalia', async () => {
+  // Misurato dal vivo: RR target (Classic) a 1.5, 2 e 3 da' sempre 651 trade, perche' agisce solo
+  // in mgmt mode "Classic" che non era attivo. Tre run legittimamente identiche fermavano il grind
+  // prima con `stale_metrics`, poi con `silent_noop`. Se TradingView dice che il report e' attuale,
+  // il risultato e' valido anche se coincide con quello di prima.
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 42 } }],
+    metricsSeq: [M()],
+    metricheFerme: true,
+  });
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  deps.readStrategyLoading = async () => false; // nessun ricalcolo visibile: lo innesca il pulsante
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 60, recalc_stable_checks: 1, recalc_step_ms: 10,
+  }, deps);
+
+  assert.equal(out.stopped_reason, null, 'un risultato identico ma confermato non e un guasto');
+  assert.equal(finalized.length, 1);
 });
