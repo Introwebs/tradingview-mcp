@@ -74,6 +74,26 @@ export function makeApi({ base, token, fetchImpl = globalThis.fetch, timeoutMs =
     markFailed(runId, error) {
       return req('PATCH', `/api/v1/backtest-runs/${runId}`, { body: { status: 'failed', error: String(error).slice(0, 2000) } });
     },
+    /** Le run in un dato stato. Serve al recupero delle `running` orfane e al conteggio finale. */
+    async listRuns(sessionId, status = null) {
+      const q = status ? `?status=${encodeURIComponent(status)}` : '';
+      const out = await req('GET', `/api/v1/backtest-sessions/${sessionId}/runs${q}`);
+      const data = out?.data;
+      return Array.isArray(data) ? data : [];
+    },
+    /**
+     * Rimette `pending` una run rimasta appesa in `running`.
+     *
+     * Serve perche' `nextRun` serve SOLO le pending: una run marcata `running` da un grind poi
+     * morto e' persa per sempre, e la matrice non puo' piu' completarsi. Successo il 2026-08-11
+     * sulla run 1140: bt_grind e' uscito per un'eccezione dopo `markRunning`, e le 10 run M15 non
+     * sono mai state eseguite mentre la sessione risultava chiusa.
+     */
+    reclaimRun(runId) {
+      return req('PATCH', `/api/v1/backtest-runs/${runId}`, {
+        body: { status: 'pending', error: 'ripresa: era rimasta running da un grind interrotto' },
+      });
+    },
     async stageEquity(runId, filePath) {
       const form = new FormData();
       const buf = readFileSync(filePath);

@@ -654,3 +654,43 @@ test('la baseline viene dallo stesso canale delle metriche, non dall API interna
   assert.equal(out.stopped_reason?.kind, 'stale_metrics');
   assert.equal(finalized.length, 0, 'il pannello fermo non deve piu sfuggire alla prima run');
 });
+
+// --- Sessione "completata" che non lo era (incidente 2026-08-11, run 1140) --------------------
+// bt_grind e' uscito per un'eccezione DOPO markRunning: la run e' rimasta `running`, e siccome
+// nextRun serve solo le `pending` era persa per sempre. Risultato: sessione chiusa con 10
+// backtest su 20 e nessun errore visibile.
+
+test('un eccezione durante la run NON la lascia appesa in running', async () => {
+  const { deps } = makeDeps({
+    // TF 5 contro il chart finto che parte da 15: cosi' il cambio di timeframe avviene davvero
+    // ed e' quello a esplodere. Con '15' non sarebbe stato chiamato affatto.
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '5', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 2 })],
+  });
+  const falliti = [];
+  deps.api.markFailed = async (runId, err) => { falliti.push({ runId, err }); return {}; };
+  // Qualunque cosa esploda a meta' run: qui il cambio di timeframe, che e' il punto in cui e'
+  // successo davvero.
+  deps.setTimeframe = async () => { throw new Error('CDP timeout durante il cambio di timeframe'); };
+
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+
+  assert.equal(falliti.length, 1, 'la run va marcata failed, non lasciata running');
+  assert.match(falliti[0].err, /CDP timeout/);
+  assert.equal(out.stopped_reason?.kind, 'runtime_error');
+  assert.match(out.stopped_reason.detail, /CDP timeout/);
+});
+
+test('le run rimaste appese in running vengono rimesse in coda a inizio grind', async () => {
+  const { deps } = makeDeps({
+    runs: [{ id: 9, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 2 })],
+  });
+  const recuperate = [];
+  deps.api.listRuns = async (sid, status) => (status === 'running' ? [{ id: 1140 }, { id: 1141 }] : []);
+  deps.api.reclaimRun = async (id) => { recuperate.push(id); return {}; };
+
+  await grindSession({ session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+
+  assert.deepEqual(recuperate, [1140, 1141]);
+});

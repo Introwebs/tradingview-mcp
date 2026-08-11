@@ -359,6 +359,21 @@ export async function grindSession(opts, deps = {}) {
   }
   const restoreHidden = vis.wasHidden;
 
+  // Recupero delle run orfane: se un grind precedente e' morto dopo `markRunning`, quella run e'
+  // rimasta `running` — e `nextRun` serve SOLO le `pending`, quindi era persa per sempre e la
+  // matrice non poteva piu' chiudersi. Successo il 2026-08-11 (run 1140): sessione dichiarata
+  // completata con 10 backtest su 20. Qui le si rimette in coda prima di cominciare.
+  // Presuppone un solo grind alla volta sulla stessa sessione, che e' il modello d'uso reale.
+  if (typeof api.listRuns === 'function' && typeof api.reclaimRun === 'function') {
+    try {
+      const orfane = await api.listRuns(session_id, 'running');
+      for (const r of orfane) {
+        await api.reclaimRun(r.id);
+        await api.progress(command_id, `run ${r.id}: era rimasta appesa in running, rimessa in coda`);
+      }
+    } catch { /* il recupero e' un di piu': se fallisce si prosegue con le pending */ }
+  }
+
   const rows = [];
   let executed = 0;
   let failed = 0;
@@ -382,186 +397,206 @@ export async function grindSession(opts, deps = {}) {
     await api.markRunning(run.id);
     await api.progress(command_id, `run ${run.id}${run.label ? ` (${run.label})` : ''}: applico gli input`);
 
-    // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
-    const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
-
-    // BASELINE dallo STESSO canale che leggera' le metriche di questa run, presa PRIMA di toccare
-    // qualsiasi cosa. Prima si usava `prevFp`, che a inizio grind veniva da `readReportFor` —
-    // l'API interna, cieca al periodo. Con un periodo ristretto quel valore non c'entra niente col
-    // pannello, quindi la PRIMA run di ogni invocazione sfuggiva al controllo `stale_metrics`:
-    // ecco l'alternanza done/stale/done/stale osservata in produzione il 2026-08-11, con le "done"
-    // che registravano i numeri della configurazione precedente.
-    let baselineFp = prevFp;
+    // Rete di sicurezza: QUALUNQUE eccezione qui dentro deve comunque togliere la run dallo
+    // stato `running`. Senza questo catch, un throw dopo markRunning la lasciava appesa per
+    // sempre — e siccome `nextRun` serve solo le `pending`, quella run spariva dalla matrice.
+    // Successo il 2026-08-11 sulla run 1140: il grind e' uscito per un'eccezione, le 10 run M15
+    // non sono mai partite e la sessione risultava chiusa con 10 backtest su 20.
     try {
-      const prima = await leggiMetriche(entity_id, periodoRistretto);
-      if (prima?.success !== false && Object.keys(prima?.metrics || {}).length) {
-        baselineFp = fingerprint(prima.metrics);
-      }
-    } catch { /* si tiene prevFp */ }
 
-    // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
-    // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
-    const { problemi, periodo, contestoCambiato } = await applicaContestoRun(run, ctxRun);
-    if (problemi.length) {
-      const a = problemi[0];
-      await api.markFailed(run.id, `${a.kind}: ${a.detail}`);
-      stopped_reason = { ...a, run_id: run.id, label: run.label ?? null };
-      await api.progress(command_id, `⛔ run ${run.id}: ${a.kind} — mi fermo`);
-      break;
-    }
+      // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
+      const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
 
-    const requested = run.input_set || {};
-    let setResult = { updated_inputs: {}, missing: [] };
-    if (Object.keys(requested).length) {
-      setResult = await setInputs({ entity_id, inputs: requested });
-    }
+      // BASELINE dallo STESSO canale che leggera' le metriche di questa run, presa PRIMA di toccare
+      // qualsiasi cosa. Prima si usava `prevFp`, che a inizio grind veniva da `readReportFor` —
+      // l'API interna, cieca al periodo. Con un periodo ristretto quel valore non c'entra niente col
+      // pannello, quindi la PRIMA run di ogni invocazione sfuggiva al controllo `stale_metrics`:
+      // ecco l'alternanza done/stale/done/stale osservata in produzione il 2026-08-11, con le "done"
+      // che registravano i numeri della configurazione precedente.
+      let baselineFp = prevFp;
+      try {
+        const prima = await leggiMetriche(entity_id, periodoRistretto);
+        if (prima?.success !== false && Object.keys(prima?.metrics || {}).length) {
+          baselineFp = fingerprint(prima.metrics);
+        }
+      } catch { /* si tiene prevFp */ }
 
-    // ⛔ IL PASSO SENZA IL QUALE NIENTE FUNZIONA ⛔
-    // Con un periodo di test personalizzato TradingView NON ricalcola il report da solo: lo marca
-    // obsoleto e aspetta il pulsante "Aggiorna report". Senza questa chiamata il pannello resta sui
-    // numeri della configurazione precedente e ogni backtest della matrice esce identico al primo.
-    // Vedi il commento in btPanel.js: RR 2->6 e trenta secondi di attesa non muovono nulla, il
-    // click porta i numeri nuovi in 10,6 s.
-    const report = await aggiornaReportSeObsoleto();
-    if (report.cliccato) {
-      await api.progress(command_id, `run ${run.id}: report obsoleto → premuto "Aggiorna report"`);
-    }
-
-    const { results: results0, recalcObserved } = await waitForRecalc(entity_id, baselineFp, {
-      readReport: (id) => leggiMetriche(id, periodoRistretto), readLoading: readStrategyLoading, sleep,
-      timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
-      stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
-    });
-    let results = results0;
-    let sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === baselineFp;
-
-    // Metriche identiche alla run precedente DOPO aver chiesto un cambiamento: quasi sempre e' il
-    // pannello che non si e' ancora ridisegnato. Si rilegge invece di scrivere. Se il contesto e'
-    // cambiato (symbol o timeframe) l'identita' e' addirittura impossibile, non solo sospetta.
-    const cambiamentoChiesto = Object.keys(requested).length > 0 || contestoCambiato;
-    let staleConfermato = false;
-    if (sameAsPrevious && cambiamentoChiesto) {
-      const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep });
-      if (ri.cambiato) {
-        results = ri.results;
-        sameAsPrevious = false;
-        await api.progress(command_id, `run ${run.id}: pannello in ritardo, metriche rilette al tentativo ${ri.tentativi}`);
-      } else {
-        staleConfermato = true;
-      }
-    }
-
-    const actual = await readInputValues(entity_id);
-    const readbackOk = readbackMatches(requested, actual);
-
-    // "il motore non ha ricalcolato" è un'accusa sensata solo se qualcosa È stato chiesto:
-    // una run con input_set vuoto gira sugli input correnti, e non ricalcolare è il
-    // comportamento giusto, non un no-op silenzioso.
-    const anomaly = detectAnomaly({
-      setResult, results, readbackOk, sameAsPrevious, staleConfermato, contestoCambiato,
-      recalcObserved: Object.keys(requested).length ? recalcObserved : null,
-    });
-
-    // `zero_trades` NON ferma piu' la matrice da solo. Su un asse periodo una finestra corta senza
-    // trade e' un DATO, non un guasto: verificato il 2026-08-11, la strategia su M15 a 7 giorni
-    // fa davvero zero trade, e fermarsi li' buttava via le altre diciannove run. La protezione
-    // originale — "0 trade = di solito leva/size/errore di runtime" — resta, ma scatta solo se il
-    // sintomo si ripete: se sono TUTTE a zero il problema e' di configurazione, non di periodo.
-    if (anomaly?.kind === 'zero_trades') {
-      await api.markFailed(run.id, `${anomaly.kind}: ${anomaly.detail}`);
-      failed++;
-      consecutiveZeroTrades++;
-      rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: 'zero_trades', trades: 0 });
-      await api.progress(command_id, `○ run ${run.id}: nessun trade nel periodo — proseguo`);
-
-      if (consecutiveZeroTrades >= max_consecutive_failures) {
-        stopped_reason = {
-          kind: 'zero_trades_systemic',
-          detail: `${consecutiveZeroTrades} run consecutive senza alcun trade: non e' il periodo, e' la configurazione (badge errore, leva, size — vedi properties.md)`,
-          run_id: run.id, label: run.label ?? null,
-        };
-        await api.progress(command_id, `⛔ ${consecutiveZeroTrades} run di fila a zero trade — mi fermo`);
+      // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
+      // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
+      const { problemi, periodo, contestoCambiato } = await applicaContestoRun(run, ctxRun);
+      if (problemi.length) {
+        const a = problemi[0];
+        await api.markFailed(run.id, `${a.kind}: ${a.detail}`);
+        stopped_reason = { ...a, run_id: run.id, label: run.label ?? null };
+        await api.progress(command_id, `⛔ run ${run.id}: ${a.kind} — mi fermo`);
         break;
       }
-      prevFp = fingerprint(results.metrics);
-      continue;
-    }
-    consecutiveZeroTrades = 0;
 
-    if (anomaly) {
-      // Circuit breaker: NON si ritenta e NON si va avanti a variare a caso. La run resta
-      // failed col motivo reale e il controllo torna al modello, che scala all'utente.
-      await api.markFailed(run.id, `${anomaly.kind}: ${anomaly.detail}`);
-      stopped_reason = { ...anomaly, run_id: run.id, label: run.label ?? null };
-      await api.progress(command_id, `⛔ run ${run.id}: ${anomaly.kind} — mi fermo`);
-      break;
-    }
+      const requested = run.input_set || {};
+      let setResult = { updated_inputs: {}, missing: [] };
+      if (Object.keys(requested).length) {
+        setResult = await setInputs({ entity_id, inputs: requested });
+      }
 
-    // Il periodo si rilegge dal tester DOPO il ricalcolo, e si registra QUELLO. Mai quello
-    // richiesto: api.md lo dice da sempre ("popola SEMPRE col range REALE"), e scriverlo a fiducia
-    // e' esattamente ciò che ha prodotto dieci backtest identici con dieci etichette diverse.
-    const periodoFinale = await readTestPeriod();
-    const { inputs, properties, initialCapital } = buildInputsPayload(info, actual);
-    const payload = toFinalizePayload(results.metrics, {
-      symbol: run.symbol,
-      timeframe: run.timeframe,
-      period_start: periodoFinale.from || periodo.from || run.period_start || period_start,
-      period_end: periodoFinale.to || periodo.to || run.period_end || period_end,
-      initial_capital: initialCapital,
-      inputs,
-      properties,
-    });
-    // Tracciabilita': da dove vengono i numeri, e se il range ottenuto e' quello chiesto.
-    payload.extra_metrics = {
-      ...(payload.extra_metrics || {}),
-      metrics_source: results.source || 'internal_api',
-      period_requested: giornoISO(run.period_start) && giornoISO(run.period_end)
-        ? `${giornoISO(run.period_start)} → ${giornoISO(run.period_end)}`
-        : null,
-      period_applied: periodoFinale.label || null,
-    };
+      // ⛔ IL PASSO SENZA IL QUALE NIENTE FUNZIONA ⛔
+      // Con un periodo di test personalizzato TradingView NON ricalcola il report da solo: lo marca
+      // obsoleto e aspetta il pulsante "Aggiorna report". Senza questa chiamata il pannello resta sui
+      // numeri della configurazione precedente e ogni backtest della matrice esce identico al primo.
+      // Vedi il commento in btPanel.js: RR 2->6 e trenta secondi di attesa non muovono nulla, il
+      // click porta i numeri nuovi in 10,6 s.
+      const report = await aggiornaReportSeObsoleto();
+      if (report.cliccato) {
+        await api.progress(command_id, `run ${run.id}: report obsoleto → premuto "Aggiorna report"`);
+      }
 
-    const shot = await captureScreenshot({ region: 'strategy_tester' });
-    if (!shot?.file_path) {
-      await api.markFailed(run.id, 'screenshot equity non prodotto');
-      failed++;
-      rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: 'no screenshot' });
-      continue;
-    }
-
-    try {
-      await api.stageEquity(run.id, shot.file_path);
-      await api.finalize(run.id, payload);
-      executed++;
-      consecutiveFinalizeFailures = 0;
-      rows.push({
-        run_id: run.id, label: run.label ?? null, status: 'done',
-        symbol: run.symbol, timeframe: run.timeframe, period_label: run.period_label ?? null,
-        net_profit_pct: payload.net_profit_pct, max_dd_pct: payload.max_drawdown_pct,
-        win_rate: payload.win_rate, profit_factor: payload.profit_factor, trades: payload.total_trades,
+      const { results: results0, recalcObserved } = await waitForRecalc(entity_id, baselineFp, {
+        readReport: (id) => leggiMetriche(id, periodoRistretto), readLoading: readStrategyLoading, sleep,
+        timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
+        stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
       });
-      await api.progress(command_id, `✔ run ${run.id}: ${payload.total_trades} trade, PF ${payload.profit_factor}`);
-    } catch (err) {
-      // Un 422 isolato non blocca la matrice (garanzia della piattaforma): la run resta
-      // failed e si prosegue. Ma se il fallimento si ripete N volte DI FILA è un guasto
-      // sistemico (stesso campo obbligatorio sempre rifiutato): ci si ferma e si restituisce
-      // il controllo, invece di macinare l'intera matrice senza produrre nulla.
-      await api.markFailed(run.id, err.message);
-      failed++;
-      consecutiveFinalizeFailures++;
-      rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: err.message.slice(0, 300) });
+      let results = results0;
+      let sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === baselineFp;
 
-      if (consecutiveFinalizeFailures >= max_consecutive_failures) {
-        stopped_reason = {
-          kind: 'systemic_failure', detail: err.message,
-          run_id: run.id, label: run.label ?? null,
-        };
-        await api.progress(command_id, `⛔ ${consecutiveFinalizeFailures} fallimenti consecutivi in finalize (run ${run.id}: ${err.message}) — mi fermo`);
+      // Metriche identiche alla run precedente DOPO aver chiesto un cambiamento: quasi sempre e' il
+      // pannello che non si e' ancora ridisegnato. Si rilegge invece di scrivere. Se il contesto e'
+      // cambiato (symbol o timeframe) l'identita' e' addirittura impossibile, non solo sospetta.
+      const cambiamentoChiesto = Object.keys(requested).length > 0 || contestoCambiato;
+      let staleConfermato = false;
+      if (sameAsPrevious && cambiamentoChiesto) {
+        const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep });
+        if (ri.cambiato) {
+          results = ri.results;
+          sameAsPrevious = false;
+          await api.progress(command_id, `run ${run.id}: pannello in ritardo, metriche rilette al tentativo ${ri.tentativi}`);
+        } else {
+          staleConfermato = true;
+        }
+      }
+
+      const actual = await readInputValues(entity_id);
+      const readbackOk = readbackMatches(requested, actual);
+
+      // "il motore non ha ricalcolato" è un'accusa sensata solo se qualcosa È stato chiesto:
+      // una run con input_set vuoto gira sugli input correnti, e non ricalcolare è il
+      // comportamento giusto, non un no-op silenzioso.
+      const anomaly = detectAnomaly({
+        setResult, results, readbackOk, sameAsPrevious, staleConfermato, contestoCambiato,
+        recalcObserved: Object.keys(requested).length ? recalcObserved : null,
+      });
+
+      // `zero_trades` NON ferma piu' la matrice da solo. Su un asse periodo una finestra corta senza
+      // trade e' un DATO, non un guasto: verificato il 2026-08-11, la strategia su M15 a 7 giorni
+      // fa davvero zero trade, e fermarsi li' buttava via le altre diciannove run. La protezione
+      // originale — "0 trade = di solito leva/size/errore di runtime" — resta, ma scatta solo se il
+      // sintomo si ripete: se sono TUTTE a zero il problema e' di configurazione, non di periodo.
+      if (anomaly?.kind === 'zero_trades') {
+        await api.markFailed(run.id, `${anomaly.kind}: ${anomaly.detail}`);
+        failed++;
+        consecutiveZeroTrades++;
+        rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: 'zero_trades', trades: 0 });
+        await api.progress(command_id, `○ run ${run.id}: nessun trade nel periodo — proseguo`);
+
+        if (consecutiveZeroTrades >= max_consecutive_failures) {
+          stopped_reason = {
+            kind: 'zero_trades_systemic',
+            detail: `${consecutiveZeroTrades} run consecutive senza alcun trade: non e' il periodo, e' la configurazione (badge errore, leva, size — vedi properties.md)`,
+            run_id: run.id, label: run.label ?? null,
+          };
+          await api.progress(command_id, `⛔ ${consecutiveZeroTrades} run di fila a zero trade — mi fermo`);
+          break;
+        }
+        prevFp = fingerprint(results.metrics);
+        continue;
+      }
+      consecutiveZeroTrades = 0;
+
+      if (anomaly) {
+        // Circuit breaker: NON si ritenta e NON si va avanti a variare a caso. La run resta
+        // failed col motivo reale e il controllo torna al modello, che scala all'utente.
+        await api.markFailed(run.id, `${anomaly.kind}: ${anomaly.detail}`);
+        stopped_reason = { ...anomaly, run_id: run.id, label: run.label ?? null };
+        await api.progress(command_id, `⛔ run ${run.id}: ${anomaly.kind} — mi fermo`);
         break;
       }
-    }
 
-    prevFp = fingerprint(results.metrics);
+      // Il periodo si rilegge dal tester DOPO il ricalcolo, e si registra QUELLO. Mai quello
+      // richiesto: api.md lo dice da sempre ("popola SEMPRE col range REALE"), e scriverlo a fiducia
+      // e' esattamente ciò che ha prodotto dieci backtest identici con dieci etichette diverse.
+      const periodoFinale = await readTestPeriod();
+      const { inputs, properties, initialCapital } = buildInputsPayload(info, actual);
+      const payload = toFinalizePayload(results.metrics, {
+        symbol: run.symbol,
+        timeframe: run.timeframe,
+        period_start: periodoFinale.from || periodo.from || run.period_start || period_start,
+        period_end: periodoFinale.to || periodo.to || run.period_end || period_end,
+        initial_capital: initialCapital,
+        inputs,
+        properties,
+      });
+      // Tracciabilita': da dove vengono i numeri, e se il range ottenuto e' quello chiesto.
+      payload.extra_metrics = {
+        ...(payload.extra_metrics || {}),
+        metrics_source: results.source || 'internal_api',
+        period_requested: giornoISO(run.period_start) && giornoISO(run.period_end)
+          ? `${giornoISO(run.period_start)} → ${giornoISO(run.period_end)}`
+          : null,
+        period_applied: periodoFinale.label || null,
+      };
+
+      const shot = await captureScreenshot({ region: 'strategy_tester' });
+      if (!shot?.file_path) {
+        await api.markFailed(run.id, 'screenshot equity non prodotto');
+        failed++;
+        rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: 'no screenshot' });
+        continue;
+      }
+
+      try {
+        await api.stageEquity(run.id, shot.file_path);
+        await api.finalize(run.id, payload);
+        executed++;
+        consecutiveFinalizeFailures = 0;
+        rows.push({
+          run_id: run.id, label: run.label ?? null, status: 'done',
+          symbol: run.symbol, timeframe: run.timeframe, period_label: run.period_label ?? null,
+          net_profit_pct: payload.net_profit_pct, max_dd_pct: payload.max_drawdown_pct,
+          win_rate: payload.win_rate, profit_factor: payload.profit_factor, trades: payload.total_trades,
+        });
+        await api.progress(command_id, `✔ run ${run.id}: ${payload.total_trades} trade, PF ${payload.profit_factor}`);
+      } catch (err) {
+        // Un 422 isolato non blocca la matrice (garanzia della piattaforma): la run resta
+        // failed e si prosegue. Ma se il fallimento si ripete N volte DI FILA è un guasto
+        // sistemico (stesso campo obbligatorio sempre rifiutato): ci si ferma e si restituisce
+        // il controllo, invece di macinare l'intera matrice senza produrre nulla.
+        await api.markFailed(run.id, err.message);
+        failed++;
+        consecutiveFinalizeFailures++;
+        rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: err.message.slice(0, 300) });
+
+        if (consecutiveFinalizeFailures >= max_consecutive_failures) {
+          stopped_reason = {
+            kind: 'systemic_failure', detail: err.message,
+            run_id: run.id, label: run.label ?? null,
+          };
+          await api.progress(command_id, `⛔ ${consecutiveFinalizeFailures} fallimenti consecutivi in finalize (run ${run.id}: ${err.message}) — mi fermo`);
+          break;
+        }
+      }
+
+      prevFp = fingerprint(results.metrics);
+    } catch (err) {
+      // Non si sa cosa sia andato storto, ma si sa che la run non deve restare `running`.
+      await api.markFailed(run.id, `runtime_error: ${err.message}`);
+      failed++;
+      rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: String(err.message).slice(0, 300) });
+      stopped_reason = {
+        kind: 'runtime_error',
+        detail: `eccezione durante la run: ${err.message}`,
+        run_id: run.id, label: run.label ?? null,
+      };
+      await api.progress(command_id, `⛔ run ${run.id}: errore imprevisto — ${err.message}`);
+      break;
+    }
   }
 
   // Il chart va restituito com'era: se la strategia era nascosta e l'abbiamo accesa noi per
