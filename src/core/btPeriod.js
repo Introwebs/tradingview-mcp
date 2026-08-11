@@ -43,13 +43,39 @@ export function parseEtichettaPeriodo(label) {
   return { from: parseDataItaliana(parti[0]), to: parseDataItaliana(parti[parti.length - 1]), label: testo };
 }
 
-/** JS iniettato: trova il pulsante del periodo di test (quello col badge "Esteso"). */
+/**
+ * L'etichetta del pulsante "Periodo di test" somiglia a un periodo?
+ *
+ * ⚠️ NON cercare il badge "Esteso" ⚠️ La prima stesura identificava il pulsante con /Esteso/i.
+ * Quel badge e' CONDIZIONALE: compare solo quando il Backtester esteso e' attivo. Verificato dal
+ * vivo il 2026-08-11 su OANDA:EURUSD dopo un riavvio di TradingView — pulsante presente e
+ * funzionante, etichetta "3 mag 2026 — 11 ago 2026", badge assente. Risultato: pulsante non
+ * trovato, e il grind si fermava su venti run senza eseguirne una.
+ *
+ * Si riconosce invece dal CONTENUTO, che e' quello che il pulsante ha sempre: un range di date,
+ * oppure uno dei preset del menu. Esportata perche' e' testabile solo cosi': dentro `BTN_JS` viene
+ * iniettata la stessa identica funzione (via `String`), quindi non esistono due copie da tenere
+ * allineate.
+ */
+export function etichettaSembraPeriodo(t) {
+  if (!t) return false;
+  const s = String(t).trim();
+  if (s.length > 80) return false;
+  // "3 mag 2026 — 11 ago 2026", con o senza badge appiccicato in coda.
+  if (/\d{1,2}\s+[a-z]{3}[a-z.]*\s+\d{4}/i.test(s)) return true;
+  // I preset: "Intervallo grafico disponibile", "Storico completo", "Ultimi 30 giorni".
+  return /^(Intervallo grafico|Storico completo|Ultimi \d+ giorni)/i.test(s.replace(/Esteso/ig, '').trim());
+}
+
+/** JS iniettato: trova il pulsante del periodo di test dentro il pannello Strategy Tester. */
 const BTN_JS = `
+  ${String(etichettaSembraPeriodo)}
   function _paPeriodBtn() {
-    var bs = document.querySelectorAll('button');
+    // Ancorato al pannello: fuori di li' un'altra etichetta con una data non c'entra nulla.
+    var scope = document.querySelector('[class*="backtesting"]') || document;
+    var bs = scope.querySelectorAll('button');
     for (var i = 0; i < bs.length; i++) {
-      var t = (bs[i].textContent || '').trim();
-      if (/Esteso/i.test(t) && t.length < 80) return bs[i];
+      if (etichettaSembraPeriodo((bs[i].textContent || '').trim())) return bs[i];
     }
     return null;
   }

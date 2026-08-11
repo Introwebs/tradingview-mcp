@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseDataItaliana, parseEtichettaPeriodo, setCustomPeriod, readTestPeriod } from '../src/core/btPeriod.js';
+import { parseDataItaliana, parseEtichettaPeriodo, setCustomPeriod, readTestPeriod, etichettaSembraPeriodo } from '../src/core/btPeriod.js';
 import { numeroItaliano, parsePannello, readPanelMetrics, ensureTesterPanel } from '../src/core/btPanel.js';
 
 // I testi qui sotto sono COPIATI dal pannello vero il 2026-08-11, non scritti a mente.
@@ -246,4 +246,26 @@ test('setCustomPeriod: voce mancante davvero -> l\'errore ELENCA le voci lette',
   });
   assert.equal(out.applied, false);
   assert.match(out.error, /Ultimi 7 giorni \| Storico completo/);
+});
+
+// --- Il pulsante del periodo NON si riconosce dal badge "Esteso" (2026-08-11) ----------------
+// Il badge e' condizionale: compare solo col Backtester esteso attivo. Misurato dal vivo su
+// OANDA:EURUSD dopo un riavvio di TradingView: pulsante presente e funzionante, etichetta
+// "3 mag 2026 — 11 ago 2026", nessun badge. Il grind si e' fermato sulla prima di venti run.
+
+test('il pulsante del periodo si riconosce SENZA il badge "Esteso"', () => {
+  assert.equal(etichettaSembraPeriodo('3 mag 2026 — 11 ago 2026'), true);   // il caso reale che rompeva
+  assert.equal(etichettaSembraPeriodo('11 ago 2025 — 11 ago 2026Esteso'), true);
+  assert.equal(etichettaSembraPeriodo('Storico completo'), true);
+  assert.equal(etichettaSembraPeriodo('Ultimi 30 giorni'), true);
+  assert.equal(etichettaSembraPeriodo('Intervallo grafico disponibile'), true);
+});
+
+test('non scambia per periodo gli altri pulsanti del pannello', () => {
+  // Sono i pulsanti veri letti accanto a quello del periodo il 2026-08-11.
+  assert.equal(etichettaSembraPeriodo('100 K USD'), false);
+  assert.equal(etichettaSembraPeriodo('Livello di dettaglio predefinito'), false);
+  assert.equal(etichettaSembraPeriodo('Esecuzione dello script1'), false);
+  assert.equal(etichettaSembraPeriodo(''), false);
+  assert.equal(etichettaSembraPeriodo(null), false);
 });
