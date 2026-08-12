@@ -1019,3 +1019,65 @@ test('una run fallita tiene il suo errore anche col digest allegato', async () =
   assert.equal(out.rows[0].status, 'failed');
   assert.equal(out.rows[0].error, 'no screenshot');
 });
+
+// ── La corsa fra il banner e il ridisegno del pannello ───────────────────────────────────────────
+// Sessione 54 (2026-08-12): 8 coppie CONSECUTIVE di backtest con input diversi e metriche identiche
+// al bit. Es. #812 (Impulse Cont Bullish+Bearish) e #813 (Morning Star Soft): pattern completamente
+// diversi, stesso identico 334 trade / +8,57%. Tutte le coppie a 7,0 s contro una mediana di 8,0 s.
+//
+// Il buco era nella regola C4. C4 diceva — giustamente — che due input diversi possono dare lo
+// stesso risultato, e che quindi l'identita' non e' una prova di guasto se TradingView dichiara il
+// report attuale. Ma il banner e il RIDISEGNO del pannello non sono la stessa cosa: il banner
+// sparisce quando il ricalcolo e' finito, il DOM si aggiorna un istante dopo. In quella finestra
+// leggevamo i numeri della run precedente e li accettavamo, perche' il banner diceva "attuale".
+//
+// La distinzione vera non e' "cosa dice il banner" ma "rileggendo, i numeri si muovono?".
+
+test('pannello non ancora ridisegnato: si rilegge anche se il banner dice ATTUALE', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 42 }, label: 'Morning Star' }],
+    metricsSeq: [M()],
+  });
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  // `isLoading()` NON vede il ricalcolo innescato dal pulsante (§4.4): resta false, quindi
+  // `waitForRecalc` esaurisce la grace di avvio e torna con le metriche ANCORA vecchie.
+  deps.readStrategyLoading = async () => false;
+
+  const vecchio = M({ total_trades: 334, net_profit_percent: 0.0857 });
+  const nuovo = M({ total_trades: 91, net_profit_percent: -0.0213 });
+  // Il pannello si ridipinge TARDI: dopo che waitForRecalc ha gia' rinunciato. Lo si simula
+  // facendolo arrivare solo quando qualcuno torna a guardare (il ciclo di rilettura) — che e'
+  // esattamente cio' che il codice deve fare e prima non faceva.
+  let ridipinto = false;
+  let setFatto = false;
+  const setOrig = deps.setInputs;
+  deps.setInputs = async (a) => { setFatto = true; return setOrig(a); };
+  deps.aggiornaReportSeObsoleto = async () => { if (setFatto) ridipinto = true; return { obsoleto: false, cliccato: false }; };
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: ridipinto ? nuovo : vecchio });
+  deps.readReportFor = async () => ({ success: true, metrics: ridipinto ? nuovo : vecchio });
+
+  const out = await grindSession(opzioni(), deps);
+
+  assert.equal(out.stopped_reason, null);
+  assert.equal(finalized.length, 1);
+  assert.equal(finalized[0].payload.total_trades, 91, 'deve finalizzare i numeri NUOVI, non quelli della run prima');
+});
+
+test('identita che resiste alla rilettura resta un dato, non un guasto', async () => {
+  // Il rovescio: se anche rileggendo i numeri non si muovono E il banner dice attuale, l'identita'
+  // e' legittima (RR target 1.5/2/3 -> sempre 651 trade, perche' agisce solo in mgmt mode Classic).
+  // Questa e' la regola C4, e deve continuare a valere: il costo di un falso allarme e' una matrice
+  // interrotta e un utente che non sa piu' a cosa credere.
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 42 } }],
+    metricsSeq: [M()],
+    metricheFerme: true,
+  });
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  deps.readStrategyLoading = async () => false;
+
+  const out = await grindSession(opzioni(), deps);
+
+  assert.equal(out.stopped_reason, null, 'un risultato identico ma confermato non e un guasto');
+  assert.equal(finalized.length, 1);
+});

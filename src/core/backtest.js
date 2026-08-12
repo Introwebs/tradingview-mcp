@@ -554,17 +554,43 @@ export async function grindSession(opts, deps = {}) {
       // Un quasi-incidente recuperato: non merita una riga sua, ma non va perso. Finisce in coda
       // alla riga della run conclusa, dove chi legge lo vede accanto al risultato che spiega.
       let avviso = null;
-      // `report.aggiornato` false = il banner non se n'e' andato: le metriche non sono affidabili
-      // e l'identita' con la run precedente e' un sintomo vero, non una coincidenza.
-      if (sameAsPrevious && cambiamentoChiesto && !report.aggiornato) {
-        const ri = await rileggiFinoACambio(entity_id, baselineFp, { leggiMetriche, periodoRistretto, sleep, aggiornaReport: aggiornaReportSeObsoleto });
+      // ⛔ IL BANNER E IL RIDISEGNO DEL PANNELLO NON SONO LA STESSA COSA ⛔
+      //
+      // Qui c'era `&& !report.aggiornato`: se TradingView dichiarava il report attuale, l'identita'
+      // con la run precedente veniva accettata come legittima (regola C4) e non si rileggeva.
+      // Sessione 54 (2026-08-12): 8 coppie CONSECUTIVE di backtest con input diversi e metriche
+      // identiche al bit — #812 (Impulse Cont Bullish+Bearish) e #813 (Morning Star Soft), pattern
+      // completamente diversi, stesso 334 trade / +8,57%. Tutte a 7,0 s contro una mediana di 8,0.
+      //
+      // La meccanica: `isLoading()` non vede il ricalcolo innescato dal pulsante, quindi
+      // `waitForRecalc` esaurisce la grace di avvio (5 s) e torna con le metriche ANCORA vecchie;
+      // il banner intanto e' gia' sparito, perche' sparisce quando il calcolo finisce, non quando
+      // il DOM si ridipinge. In quella finestra si registravano i numeri della run precedente.
+      //
+      // C4 resta valida — due input diversi POSSONO dare lo stesso risultato — ma la domanda giusta
+      // non e' "cosa dice il banner": e' "rileggendo, i numeri si muovono?". Se si muovono era
+      // stale; se non si muovono nemmeno insistendo, l'identita' e' vera.
+      if (sameAsPrevious && cambiamentoChiesto) {
+        // Budget diverso a seconda di chi dice cosa. Banner ancora su = il ricalcolo non e' partito,
+        // vale la pena insistere a lungo. Banner sparito = e' una CORSA col ridisegno, e una corsa
+        // si risolve in un paio di secondi o non era una corsa: insistere di piu' rallenterebbe
+        // soltanto le run legittimamente identiche.
+        const corsaColRidisegno = report.aggiornato;
+        const ri = await rileggiFinoACambio(entity_id, baselineFp, {
+          leggiMetriche, periodoRistretto, sleep, aggiornaReport: aggiornaReportSeObsoleto,
+          ...(corsaColRidisegno ? { tentativi: 4, attesaMs: 1000 } : {}),
+        });
         if (ri.cambiato) {
           results = ri.results;
           sameAsPrevious = false;
           avviso = `pannello in ritardo, metriche rilette al tentativo ${ri.tentativi}`;
-        } else {
+        } else if (!report.aggiornato) {
+          // Numeri fermi E banner ancora su: non e' un'identita' legittima, e' un report mai
+          // ricalcolato.
           staleConfermato = true;
         }
+        // Numeri fermi ma banner sparito, anche dopo aver riletto: identita' LEGITTIMA (C4).
+        // Si accetta — il costo di un falso allarme e' una matrice interrotta.
       }
       // I due controlli confluiscono: contesto fermo O input fermi, in entrambi i casi si scrive
       // qualcosa che non appartiene a questa run.
