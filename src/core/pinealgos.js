@@ -94,6 +94,22 @@ export function makeApi({ base, token, fetchImpl = globalThis.fetch, timeoutMs =
         body: { status: 'pending', error: 'ripresa: era rimasta running da un grind interrotto' },
       });
     },
+    /**
+     * Lo stato compatto della sessione: cosa e' gia' stato provato, cosa e' rimasto fermo, qual e'
+     * il migliore per gruppo e come ci si e' arrivati.
+     *
+     * Si allega al ritorno di OGNI grind, invece di lasciare all'operatore il compito di chiederlo.
+     * Il passo "rileggi lo stato dal DB prima di ogni mossa" era un'istruzione scritta nello skill,
+     * e il difetto C1 l'ha aggirata: sessione chiusa con 10 run su 20 fidandosi di `executed`.
+     * Un passo che il modello deve ricordarsi di fare, prima o poi non lo fa.
+     *
+     * `?compact=1` perche' qui si paga a ogni chiamata: niente `fixed_inputs` (costante dentro la
+     * sessione) e solo le ultime mosse. Misurato in produzione sulla sessione 37 (20 backtest):
+     * GET completo 68.593 byte, digest pieno 7.438, compatto 3.628.
+     */
+    async sessionDigest(sessionId) {
+      return req('GET', `/api/v1/backtest-sessions/${sessionId}/digest?compact=1`);
+    },
     async stageEquity(runId, filePath) {
       const form = new FormData();
       const buf = readFileSync(filePath);

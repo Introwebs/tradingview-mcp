@@ -6,7 +6,7 @@ import { resolveConfig, makeApi } from '../core/pinealgos.js';
 export function registerBacktestTools(server) {
   server.tool(
     'bt_grind',
-    'Esegue le run PENDING di una sessione di backtest Pine Algos senza tornare al modello a ogni passo: applica input_set, attende il ricalcolo, legge le metriche, cattura l\'equity, finalizza. Si ferma da solo su anomalia (0 trade, errore di runtime, input non applicati) e restituisce una tabella compatta.',
+    'Esegue le run PENDING di una sessione di backtest Pine Algos senza tornare al modello a ogni passo: applica input_set, attende il ricalcolo, legge le metriche, cattura l\'equity, finalizza. Si ferma da solo su anomalia (0 trade, errore di runtime, input non applicati) e restituisce una tabella compatta. Allega anche il DIGEST della sessione (assi esplorati, known-good per gruppo, mosse): non richiamare l\'endpoint digest dopo un grind, ce l\'hai già nel ritorno.',
     {
       session_id: z.number().int().describe('Id della BacktestSession Pine Algos'),
       entity_id: z.string().describe('entity_id della strategia bersaglio sul chart (da chart_get_state)'),

@@ -38,6 +38,9 @@ function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
         stageEquity: async () => ({}),
         finalize: async (runId, payload) => { finalized.push({ runId, payload }); return { data: { id: runId * 10 } }; },
         progress: async (_cmd, msg) => { seen.progress.push(String(msg)); return null; },
+        // Il digest si allega al ritorno di OGNI grind: senza stub i test cadrebbero
+        // sull'implementazione vera, che cerca la rete, e la suite si IMPIANTA invece di fallire.
+        sessionDigest: async (id) => ({ data: { session: { id }, compact: true, groups: [], moves: { total: 0, omitted: 0, items: [] } } }),
       },
       setInputs: async ({ inputs }) => { applied = { ...applied, ...inputs }; loadingPending = true; call += 1; return { updated_inputs: inputs, missing: [] }; },
       readReportFor: async (id) => {
@@ -963,4 +966,56 @@ test('gli stop restano visibili anche in modalita compatta', async () => {
 
   assert.equal(out.stopped_reason?.kind, 'inputs_not_applied');
   assert.ok(seen.progress.some((m) => /^⛔ run 1:/.test(m)), JSON.stringify(seen.progress));
+});
+
+// ── Il digest torna insieme al risultato ────────────────────────────────────────────────────────
+// Un passo che il modello deve ricordarsi di fare, prima o poi non lo fa: e' il difetto C1, dove
+// una sessione fu chiusa a 10 run su 20 fidandosi di `executed`. Qui lo stato ARRIVA.
+
+test('il digest torna col risultato, senza doverlo chiedere', async () => {
+  const { deps } = makeDeps(unaRun());
+  const out = await grindSession(opzioni(), deps);
+  assert.equal(out.digest.session.id, 7);
+  assert.equal(out.digest.compact, true);
+});
+
+test('un digest irraggiungibile non fa fallire un grind riuscito', async () => {
+  // A questo punto i backtest sono gia' finalizzati e validi: perderli per un 500 sull'endpoint
+  // sarebbe assurdo.
+  const { deps, finalized } = makeDeps(unaRun());
+  deps.api.sessionDigest = async () => { throw new Error('500 dal server'); };
+  const out = await grindSession(opzioni(), deps);
+
+  assert.equal(out.executed, 1);
+  assert.equal(finalized.length, 1);
+  assert.equal(out.digest, null);
+  assert.match(out.digest_error, /500/);
+});
+
+test('col digest le metriche non si pagano due volte nei rows', async () => {
+  const { deps } = makeDeps(unaRun());
+  const out = await grindSession(opzioni(), deps);
+  assert.deepEqual(Object.keys(out.rows[0]).sort(), ['label', 'run_id', 'status']);
+});
+
+test('senza digest i rows restano completi: il grind non diventa muto', async () => {
+  const { deps } = makeDeps(unaRun());
+  deps.api.sessionDigest = async () => { throw new Error('giu'); };
+  const out = await grindSession(opzioni(), deps);
+  assert.ok('profit_factor' in out.rows[0], JSON.stringify(out.rows[0]));
+  assert.ok('trades' in out.rows[0]);
+});
+
+test('una run fallita tiene il suo errore anche col digest allegato', async () => {
+  // I fallimenti NON sono nel digest: una run fallita non produce un backtest, quindi in `moves`
+  // non compare. Se lo sfoltimento li toccasse, il motivo del fallimento sparirebbe.
+  const { deps } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 42 } }],
+    metricsSeq: [M()],
+  });
+  deps.captureScreenshot = async () => ({ file_path: null });
+  const out = await grindSession(opzioni(), deps);
+
+  assert.equal(out.rows[0].status, 'failed');
+  assert.equal(out.rows[0].error, 'no screenshot');
 });

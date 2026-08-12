@@ -732,5 +732,38 @@ export async function grindSession(opts, deps = {}) {
     catch { restored = false; }
   }
 
-  return { success: true, session_id, executed, failed, stopped_reason, rows, ...(restoreHidden && { visibility_restored: restored }) };
+  // Lo stato della sessione torna INSIEME al risultato del grind: l'operatore non deve ricordarsi
+  // di chiederlo, e quindi non puo' dimenticarsene. E' la differenza fra una regola e un
+  // meccanismo — vedi il difetto C1, dove una sessione fu chiusa a 10 run su 20 fidandosi di
+  // `executed`, che dice quante ne ha fatte QUESTA chiamata, non quante ne mancano.
+  //
+  // Non puo' far fallire il grind: a questo punto i backtest sono gia' finalizzati e validi, e
+  // perderli per un 500 sull'endpoint sarebbe assurdo.
+  let digest = null;
+  let digest_error = null;
+  if (typeof api.sessionDigest === 'function') {
+    try {
+      digest = (await api.sessionDigest(session_id))?.data ?? null;
+    } catch (err) {
+      digest_error = String(err.message).slice(0, 300);
+    }
+  }
+
+  // Con il digest allegato le metriche delle run riuscite arrivano da `moves`: ripeterle anche nei
+  // `rows` significherebbe pagarle due volte. La divisione diventa netta e senza sovrapposizione —
+  //   rows   = cosa e' successo alle RUN (ed e' l'unico posto dove vivono i fallimenti: una run
+  //            fallita non produce un backtest, quindi in `moves` NON c'e')
+  //   digest = lo stato della SESSIONE
+  // Lo sfoltimento avviene qui e non nel loop di proposito: prima di aver visto arrivare il digest
+  // non si sa se le metriche saranno altrove. Se non arriva, i rows restano completi — il grind non
+  // deve mai diventare muto.
+  const righe = digest
+    ? rows.map((r) => (r.status === 'done' ? { run_id: r.run_id, label: r.label, status: r.status } : r))
+    : rows;
+
+  return {
+    success: true, session_id, executed, failed, stopped_reason, rows: righe,
+    digest, ...(digest_error && { digest_error }),
+    ...(restoreHidden && { visibility_restored: restored }),
+  };
 }
