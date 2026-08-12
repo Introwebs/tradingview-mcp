@@ -28,30 +28,72 @@ export function resolveConfig({ env = process.env, fileConfig = readFileConfig()
   return { base, token };
 }
 
-export function makeApi({ base, token, fetchImpl = globalThis.fetch, timeoutMs = 30000 } = {}) {
+/**
+ * Quanto aspettare prima di ritentare una richiesta respinta col 429.
+ *
+ * Si preferisce SEMPRE il `Retry-After` del server: e' l'unico che sa quando la finestra si
+ * riapre davvero. Il backoff esponenziale e' solo la rete di sicurezza per quando non c'e'.
+ * Cap a 75 s perche' la finestra di Laravel e' al minuto: oltre, si sta aspettando per niente.
+ */
+export function attesaDopo429(res, tentativo) {
+  const raw = res?.headers?.get?.('retry-after');
+  const secondi = Number(raw);
+  if (Number.isFinite(secondi) && secondi > 0) return Math.min(secondi, 75) * 1000;
+  return Math.min(1000 * 2 ** tentativo, 30000);
+}
+
+export function makeApi({
+  base, token, fetchImpl = globalThis.fetch, timeoutMs = 30000,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), maxRetries429 = 4,
+} = {}) {
   const headers = (extra = {}) => ({ Authorization: `Bearer ${token}`, Accept: 'application/json', ...extra });
 
   async function req(method, path, { body, raw } = {}) {
-    let res;
-    try {
-      res = await fetchImpl(`${base}${path}`, {
-        method,
-        headers: raw ? headers() : headers(body ? { 'Content-Type': 'application/json' } : {}),
-        body: raw ? raw : body ? JSON.stringify(body) : undefined,
-        // Il grind gira dentro un processo MCP di lunga durata su decine di run: senza timeout,
-        // un server bloccato o una rete impallata appende la chiamata per sempre e ferma tutto.
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (err) {
-      // fetch stessa può rigettare (DNS, ECONNREFUSED, abort per timeout) senza passare dal ramo
-      // !res.ok: senza questo try/catch il messaggio arriva come "TypeError: fetch failed" nudo,
-      // impossibile da diagnosticare quando il grind fa decine di chiamate simili.
-      throw new Error(`${method} ${path} → ${err.message}`);
+    for (let tentativo = 0; ; tentativo++) {
+      let res;
+      try {
+        res = await fetchImpl(`${base}${path}`, {
+          method,
+          headers: raw ? headers() : headers(body ? { 'Content-Type': 'application/json' } : {}),
+          body: raw ? raw : body ? JSON.stringify(body) : undefined,
+          // Il grind gira dentro un processo MCP di lunga durata su decine di run: senza timeout,
+          // un server bloccato o una rete impallata appende la chiamata per sempre e ferma tutto.
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (err) {
+        // fetch stessa può rigettare (DNS, ECONNREFUSED, abort per timeout) senza passare dal ramo
+        // !res.ok: senza questo try/catch il messaggio arriva come "TypeError: fetch failed" nudo,
+        // impossibile da diagnosticare quando il grind fa decine di chiamate simili.
+        throw new Error(`${method} ${path} → ${err.message}`);
+      }
+
+      // ⛔ 429 = RESPINTA, non fallita. Ritentare e' sicuro su OGNI verbo, `finalize` compreso:
+      // il throttle rifiuta la richiesta PRIMA che il server la esegua, quindi non c'e' niente da
+      // duplicare. E' la differenza con un 422, che invece e' stato eseguito e respinto nel merito:
+      // quello non si ritenta mai, si ripeterebbe solo lo stesso errore rallentando la diagnosi.
+      //
+      // Perche' serve: Pine Algos throttla /api/v1 a 60 req/min per UTENTE, e il grind ne fa 5 per
+      // run — a ~7,7 s per run sono ~39 req/min, piu' ~9 del runner (heartbeat + long-poll) sullo
+      // stesso utente. Il 2026-08-12 il tetto e' stato superato: il grind e' morto a meta' run e la
+      // sessione 52 si e' fermata a 11 run su 34, con l'operatore che ha scambiato quel 429 per un
+      // rate limit di Anthropic.
+      //
+      // NB sul body `raw`: e' una FormData, cioe' un oggetto strutturato che fetch riserializza a
+      // ogni tentativo — non uno stream gia' consumato. Ritentarla e' sicuro.
+      if (res.status === 429 && tentativo < maxRetries429) {
+        await sleep(attesaDopo429(res, tentativo));
+        continue;
+      }
+
+      if (!res.ok) {
+        const text = typeof res.text === 'function' ? await res.text() : '';
+        throw new Error(`${method} ${path} → HTTP ${res.status}: ${text}`);
+      }
+      return await leggiCorpo(res);
     }
-    if (!res.ok) {
-      const text = typeof res.text === 'function' ? await res.text() : '';
-      throw new Error(`${method} ${path} → HTTP ${res.status}: ${text}`);
-    }
+  }
+
+  async function leggiCorpo(res) {
     if (typeof res.json !== 'function') return null;
     try {
       return await res.json();

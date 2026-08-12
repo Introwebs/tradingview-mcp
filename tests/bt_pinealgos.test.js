@@ -40,3 +40,65 @@ test('finalize solleva un errore che include il corpo 422', async () => {
   const api = makeApi({ base: 'https://a.test', token: 'T', fetchImpl: fakeFetch });
   await assert.rejects(() => api.finalize(7, {}), /422.*Incomplete inputs: got 3, expected 12/s);
 });
+
+// ── 429: respinta, non fallita ───────────────────────────────────────────────────────────────────
+// Pine Algos throttla /api/v1 a 60 req/min per UTENTE. `bt_grind` fa 5 chiamate per run e a ~7,7 s
+// per run sono ~39 req/min; il runner ne aggiunge ~9 (heartbeat + long-poll) sullo STESSO utente.
+// Il 2026-08-12 il tetto e' stato superato: 429 "Too Many Attempts.", il client l'ha trattato come
+// fatale, il grind e' morto a meta' run e la sessione 52 si e' fermata a 11 run su 34.
+//
+// Un 429 e' l'unico stato in cui ritentare e' sicuro anche su POST — finalize compreso — perche'
+// dice "respinta PRIMA di essere eseguita": il server non l'ha mai vista.
+
+test('un 429 viene ritentato invece di uccidere la chiamata', async () => {
+  let n = 0;
+  const attese = [];
+  const fakeFetch = async () => {
+    n += 1;
+    if (n <= 2) return { ok: false, status: 429, headers: new Map([['retry-after', '2']]), text: async () => 'Too Many Attempts.' };
+    return { ok: true, status: 200, json: async () => ({ data: { id: 9 } }) };
+  };
+  const api = makeApi({
+    base: 'https://a.test', token: 'T', fetchImpl: fakeFetch,
+    sleep: async (ms) => { attese.push(ms); },
+  });
+
+  const out = await api.finalize(7, { a: 1 });
+  assert.equal(out.data.id, 9);
+  assert.equal(n, 3, 'due 429 poi il successo');
+  assert.deepEqual(attese, [2000, 2000], 'rispetta Retry-After invece di indovinare');
+});
+
+test('senza Retry-After il backoff cresce', async () => {
+  let n = 0;
+  const attese = [];
+  const fakeFetch = async () => {
+    n += 1;
+    if (n <= 2) return { ok: false, status: 429, text: async () => 'Too Many Attempts.' };
+    return { ok: true, status: 200, json: async () => ({ data: null }) };
+  };
+  const api = makeApi({ base: 'https://a.test', token: 'T', fetchImpl: fakeFetch, sleep: async (ms) => { attese.push(ms); } });
+
+  await api.nextRun(1);
+  assert.equal(attese.length, 2);
+  assert.ok(attese[1] > attese[0], `backoff crescente, non fisso: ${attese}`);
+});
+
+test('un 429 che non passa mai finisce per fallire, dicendo che era un 429', async () => {
+  // Ritentare all'infinito bloccherebbe il grind in silenzio: meglio fermarsi con un motivo vero.
+  const fakeFetch = async () => ({ ok: false, status: 429, text: async () => 'Too Many Attempts.' });
+  const api = makeApi({ base: 'https://a.test', token: 'T', fetchImpl: fakeFetch, sleep: async () => {} });
+
+  await assert.rejects(() => api.nextRun(1), /429/);
+});
+
+test('un 422 NON viene ritentato: il server lo ha eseguito e rifiutato', async () => {
+  // Differenza che conta: 429 = mai vista, 422 = vista e respinta nel merito. Ritentare un 422
+  // significherebbe solo ripetere lo stesso errore N volte, rallentando la diagnosi.
+  let n = 0;
+  const fakeFetch = async () => { n += 1; return { ok: false, status: 422, text: async () => 'nope' }; };
+  const api = makeApi({ base: 'https://a.test', token: 'T', fetchImpl: fakeFetch, sleep: async () => {} });
+
+  await assert.rejects(() => api.finalize(7, {}), /422/);
+  assert.equal(n, 1);
+});
