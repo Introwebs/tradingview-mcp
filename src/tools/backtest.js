@@ -17,6 +17,8 @@ export function registerBacktestTools(server) {
       recalc_timeout_ms: z.number().int().optional().describe('Attesa massima del ricalcolo per run (default 45000)'),
       recalc_step_ms: z.number().int().optional().describe('Passo di campionamento di isLoading (default 250; la finestra di ricalcolo misurata dura ~1,1 s)'),
       recalc_start_grace_ms: z.number().int().optional().describe('Quanto attendere che il ricalcolo PARTA prima di dichiarare no-op (default 5000; misurato ~0,6 s)'),
+      verbose: z.boolean().optional().describe('Progress passo-passo in console per il debug (default false: si postano solo run conclusa, zero-trade e stop)'),
+      maximize_for_screenshot: z.boolean().optional().describe('Massimizza il pannello Strategy Tester per lo scatto dell\'equity e lo rimette com\'era (default true)'),
     },
     async (args) => {
       try {

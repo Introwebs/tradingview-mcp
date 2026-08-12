@@ -284,6 +284,68 @@ export async function ensureTesterPanel({
 }
 
 /**
+ * Porta il pannello a 'maximized' o a 'normal', e restituisce il modo che c'era PRIMA cosi' che il
+ * chiamante possa rimettere le cose com'erano.
+ *
+ * A cosa serve: a pannello 'normal' il tester occupa ~370px su 994 (misurato), quindi la curva
+ * equity dello screenshot e' una striscia di un centinaio di pixel. Massimizzato il pannello e' 994:
+ * lo stesso scatto diventa leggibile.
+ *
+ * ⚠️ Perche' NON si massimizza per tutto il grind ⚠️
+ * Massimizzato il chart va a zero e ogni coordinata della toolbar del tester si sposta. Il pulsante
+ * del periodo resta raggiungibile (verificato dal vivo il 2026-08-12: box 145,47 293x34), ma l'asse
+ * periodo e' quello che si e' rotto tre volte — voci di menu cliccate con eventi mouse veri su
+ * coordinate misurate a runtime. Non vale il rischio: l'unico passo che ha bisogno dello spazio e'
+ * lo scatto, quindi si massimizza li' e si torna subito indietro.
+ *
+ * Fallisce in silenzio di proposito: uno screenshot piccolo e' un fastidio, una run persa no.
+ *
+ * @param {boolean} massimizzato true -> 'maximized', false -> 'normal'
+ * @returns {Promise<{ok: boolean, prima: string|null, mode: string|null, error?: string}>}
+ */
+export async function setPanelMaximized(massimizzato, {
+  evaluate = realEvaluate, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), settleMs = 650,
+} = {}) {
+  const voluto = massimizzato ? 'maximized' : 'normal';
+  const esito = await evaluate(`
+    (function() {
+      function v(x) { try { return (x && typeof x.value === 'function') ? x.value() : x; } catch (e) { return null; } }
+      try {
+        var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+        if (!bwb) return { error: 'window.TradingView.bottomWidgetBar non disponibile' };
+        var prima = v(bwb.mode && bwb.mode());
+        if (prima === ${JSON.stringify(voluto)}) return { ok: true, prima: prima, cambiato: false };
+        // setMode() e' esplicito e non e' un toggle: dice DOVE andare, non "inverti".
+        // toggleMaximize()/turnOffMaximize() restano come rete se una build futura togliesse setMode.
+        if (typeof bwb.setMode === 'function') bwb.setMode(${JSON.stringify(voluto)});
+        else if (${massimizzato ? 'true' : 'false'}) { if (typeof bwb.toggleMaximize === 'function') bwb.toggleMaximize(); }
+        else if (typeof bwb.turnOffMaximize === 'function') bwb.turnOffMaximize();
+        return { ok: true, prima: prima, cambiato: true };
+      } catch (e) { return { error: e.message }; }
+    })()
+  `);
+  if (!esito || esito.error) return { ok: false, prima: null, mode: null, error: esito?.error || 'modo del pannello non impostabile' };
+  if (!esito.cambiato) return { ok: true, prima: esito.prima ?? null, mode: esito.prima ?? null };
+
+  // Il cambio di modo rilancia il layout E fa ridisegnare il canvas della curva equity alla nuova
+  // dimensione. Scattare prima del ridisegno darebbe un'immagine grande di un grafico piccolo.
+  await sleep(settleMs);
+
+  const dopo = await evaluate(`
+    (function() {
+      function v(x) { try { return (x && typeof x.value === 'function') ? x.value() : x; } catch (e) { return null; } }
+      try {
+        var bwb = window.TradingView && window.TradingView.bottomWidgetBar;
+        if (!bwb) return { error: 'bottomWidgetBar sparita' };
+        return { mode: v(bwb.mode && bwb.mode()), altezza: v(bwb.height && bwb.height()) };
+      } catch (e) { return { error: e.message }; }
+    })()
+  `);
+  if (!dopo || dopo.error) return { ok: false, prima: esito.prima ?? null, mode: null, error: dopo?.error || 'modo del pannello illeggibile' };
+  return { ok: dopo.mode === voluto, prima: esito.prima ?? null, mode: dopo.mode ?? null, altezza: dopo.altezza };
+}
+
+/**
  * Le metriche correnti del pannello, nella stessa forma di `readReportFor`
  * (`{success, metrics, source, error}`) cosi' che `toFinalizePayload` e `detectAnomaly` non
  * debbano sapere da dove arrivano.

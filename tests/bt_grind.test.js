@@ -5,7 +5,7 @@ import { grindSession } from '../src/core/backtest.js';
 function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
   const queue = [...runs];
   const finalized = [];
-  const seen = { reportIds: [], loadingIds: [], refreshChiamato: 0 };
+  const seen = { reportIds: [], loadingIds: [], refreshChiamato: 0, maximize: [], progress: [] };
   // `call` NON avanza piu' a ogni lettura: un motore non cambia risultato perche' lo guardi, e
   // quella finzione mascherava il difetto vero (il report obsoleto che non si ricalcola). Avanza
   // quando cambia qualcosa: input, symbol, timeframe, periodo. Chi vuole simulare metriche che si
@@ -37,7 +37,7 @@ function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
         markFailed: async () => ({}),
         stageEquity: async () => ({}),
         finalize: async (runId, payload) => { finalized.push({ runId, payload }); return { data: { id: runId * 10 } }; },
-        progress: async () => null,
+        progress: async (_cmd, msg) => { seen.progress.push(String(msg)); return null; },
       },
       setInputs: async ({ inputs }) => { applied = { ...applied, ...inputs }; loadingPending = true; call += 1; return { updated_inputs: inputs, missing: [] }; },
       readReportFor: async (id) => {
@@ -75,7 +75,14 @@ function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
       // due fonti concordano e i test restano leggibili. Chi vuole esercitare la divergenza
       // (periodo ristretto) sovrascrive questa dep.
       readPanelMetrics: async () => ({ success: true, source: 'panel', metrics: metricaCorrente() }),
-      captureScreenshot: async () => ({ file_path: '/tmp/shot.png' }),
+      captureScreenshot: async () => { seen.maximize.push('scatto'); return { file_path: '/tmp/shot.png' }; },
+      // Il pannello finto parte da 'normal', come dopo ensureTesterPanel. Si registra la SEQUENZA e
+      // non il conteggio: se lo scatto non cade FRA la massimizzazione e il ripristino, l'immagine
+      // e' comunque quella piccola — ed e' esattamente il difetto da cui nasce questo stub.
+      setPanelMaximized: async (m) => {
+        seen.maximize.push(m ? 'max' : 'normal');
+        return { ok: true, prima: m ? 'normal' : 'maximized', mode: m ? 'maximized' : 'normal' };
+      },
       readInputsInfo: async () => ([
         { id: 'in_0', name: 'Risk/Reward', type: 'float', group: 'Ingressi' },
         { id: 'in_40', name: 'Initial Capital', type: 'float', group: null },
@@ -868,4 +875,92 @@ test('report dichiarato ATTUALE + numeri identici = risultato legittimo, non ano
 
   assert.equal(out.stopped_reason, null, 'un risultato identico ma confermato non e un guasto');
   assert.equal(finalized.length, 1);
+});
+
+// ── Screenshot: il pannello si massimizza per lo scatto ─────────────────────────────────────────
+// Contesto: fino al 2026-08-12 lo scatto usciva col pannello a ~370px su 994 di finestra, e per di
+// piu' `captureScreenshot` non riusciva a ritagliarlo (selettori morti) e fotografava tutto lo
+// schermo. Risultato: la curva equity era una striscia in un angolo.
+
+const unaRun = () => ({
+  runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 42 } }],
+  metricsSeq: [M()],
+});
+const opzioni = (over = {}) => ({
+  session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+  recalc_timeout_ms: 60, recalc_stable_checks: 1, recalc_step_ms: 10, ...over,
+});
+
+test('lo scatto cade fra la massimizzazione e il ripristino', async () => {
+  const { deps, seen } = makeDeps(unaRun());
+  await grindSession(opzioni(), deps);
+  assert.deepEqual(seen.maximize, ['max', 'scatto', 'normal'],
+    'massimizzare DOPO lo scatto non serve a niente: l ordine e tutto');
+});
+
+test('un pannello gia massimizzato non viene rimesso a normale', async () => {
+  // Se l'utente lavora col tester a tutto schermo, il grind non deve restituirgli un layout diverso
+  // da quello che aveva: si ripristina solo cio' che si e' cambiato.
+  const { deps, seen } = makeDeps(unaRun());
+  deps.setPanelMaximized = async (m) => {
+    seen.maximize.push(m ? 'max' : 'normal');
+    return { ok: true, prima: 'maximized', mode: 'maximized' };
+  };
+  await grindSession(opzioni(), deps);
+  assert.deepEqual(seen.maximize, ['max', 'scatto']);
+});
+
+test('maximize_for_screenshot:false lascia il pannello dov e', async () => {
+  const { deps, seen } = makeDeps(unaRun());
+  await grindSession(opzioni({ maximize_for_screenshot: false }), deps);
+  assert.deepEqual(seen.maximize, ['scatto']);
+});
+
+test('il pannello torna normale anche se lo scatto esplode', async () => {
+  // Senza il `finally` un errore qui lascerebbe il tester a tutto schermo, coprendo il chart per
+  // tutte le run successive — e il pulsante del periodo con lui.
+  const { deps, seen } = makeDeps(unaRun());
+  deps.captureScreenshot = async () => { throw new Error('CDP giu'); };
+  const out = await grindSession(opzioni(), deps);
+  assert.deepEqual(seen.maximize, ['max', 'normal']);
+  assert.equal(out.stopped_reason?.kind, 'runtime_error');
+});
+
+// ── Console: solo gli eventi, non i passaggi ────────────────────────────────────────────────────
+// Tre righe per run x 20 run = 60 messaggi nella chat dell'operatore, dove restano per sempre.
+
+test('di default la console vede solo la run conclusa', async () => {
+  const { deps, seen } = makeDeps(unaRun());
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  await grindSession(opzioni(), deps);
+
+  assert.equal(seen.progress.length, 1, `una riga per run, non tre: ${JSON.stringify(seen.progress)}`);
+  assert.match(seen.progress[0], /^✔ run 1: /);
+  assert.ok(!seen.progress.some((m) => /applico gli input|report obsoleto/.test(m)));
+});
+
+test('verbose riaccende la diagnostica passo-passo', async () => {
+  // La diagnostica che serviva a inseguire i difetti del 2026-08-11 resta disponibile: e' spenta,
+  // non rimossa.
+  const { deps, seen } = makeDeps(unaRun());
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  await grindSession(opzioni({ verbose: true }), deps);
+
+  assert.ok(seen.progress.some((m) => /applico gli input/.test(m)));
+  assert.ok(seen.progress.some((m) => /report obsoleto/.test(m)));
+  assert.ok(seen.progress.some((m) => /^✔ run 1: /.test(m)));
+});
+
+test('gli stop restano visibili anche in modalita compatta', async () => {
+  // Silenziare i passaggi non deve silenziare i guasti: e' la differenza fra meno rumore e meno
+  // informazione.
+  const { deps, seen } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_999: 1 } }],
+    metricsSeq: [M()],
+  });
+  deps.setInputs = async () => ({ updated_inputs: {}, missing: ['in_999'] });
+  const out = await grindSession(opzioni(), deps);
+
+  assert.equal(out.stopped_reason?.kind, 'inputs_not_applied');
+  assert.ok(seen.progress.some((m) => /^⛔ run 1:/.test(m)), JSON.stringify(seen.progress));
 });

@@ -20,6 +20,7 @@ import {
   readPanelMetrics as realReadPanelMetrics, ensureTesterPanel as realEnsureTesterPanel,
   aggiornaReportSeObsoleto as realAggiornaReport,
   attendiReportAggiornato as realAttendiReport,
+  setPanelMaximized as realSetPanelMaximized,
 } from './btPanel.js';
 import {
   readInputsInfo as realReadInputsInfo,
@@ -315,6 +316,13 @@ export async function grindSession(opts, deps = {}) {
     period_start = null, period_end = null, recalc_timeout_ms = 45000, recalc_stable_checks = 3,
     recalc_step_ms = 250, recalc_start_grace_ms = 5000,
     max_consecutive_failures = 3,
+    // I progress finiscono nella chat dell'operatore, dove restano per tutta la sessione. Con tre
+    // righe per run una matrice da 20 ne produce 60 e il pannello diventa illeggibile. Di default
+    // parlano solo gli EVENTI — run conclusa, anomalia, stop — non i passaggi interni.
+    // `verbose: true` riaccende la diagnostica passo-passo per il debug.
+    verbose = false,
+    // Massimizzare il pannello per lo scatto e rimetterlo subito com'era. Costa ~1,3 s per run.
+    maximize_for_screenshot = true,
   } = opts;
 
   const {
@@ -336,8 +344,13 @@ export async function grindSession(opts, deps = {}) {
     ensureTesterPanel = realEnsureTesterPanel,
     aggiornaReportSeObsoleto = realAggiornaReport,
     attendiReportAggiornato = realAttendiReport,
+    setPanelMaximized = realSetPanelMaximized,
     sleep = realSleep,
   } = deps;
+
+  // Il dettaglio passo-passo passa da qui: si vede solo con `verbose`. Gli eventi (✔ ⛔ ○) chiamano
+  // `api.progress` direttamente, cosi' non c'e' modo di silenziarli per sbaglio.
+  const nota = async (msg) => { if (verbose) await api.progress(command_id, msg); };
 
   // Il lettore di metriche che sceglie la fonte da solo (API interna vs pannello): lo usano sia
   // l'attesa del ricalcolo sia il payload, cosi' non possono divergere.
@@ -408,7 +421,7 @@ export async function grindSession(opts, deps = {}) {
     if (!run) break;
 
     await api.markRunning(run.id);
-    await api.progress(command_id, `run ${run.id}${run.label ? ` (${run.label})` : ''}: applico gli input`);
+    await nota(`run ${run.id}${run.label ? ` (${run.label})` : ''}: applico gli input`);
 
     // Rete di sicurezza: QUALUNQUE eccezione qui dentro deve comunque togliere la run dallo
     // stato `running`. Senza questo catch, un throw dopo markRunning la lasciava appesa per
@@ -466,7 +479,7 @@ export async function grindSession(opts, deps = {}) {
       if (contestoCambiato) {
         const rinfresco = await aggiornaReportSeObsoleto();
         if (rinfresco.cliccato) {
-          await api.progress(command_id, `run ${run.id}: contesto cambiato, report aggiornato prima della baseline`);
+          await nota(`run ${run.id}: contesto cambiato, report aggiornato prima della baseline`);
         }
       }
       let baselineFp = prevFp;
@@ -518,7 +531,7 @@ export async function grindSession(opts, deps = {}) {
       // e' una prova di niente. Banner sparito = report attuale per QUESTI input.
       const report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
       if (report.click > 0) {
-        await api.progress(command_id, `run ${run.id}: report obsoleto → premuto "Aggiorna report"${report.click > 1 ? ` (${report.click}x)` : ''}`);
+        await nota(`run ${run.id}: report obsoleto → premuto "Aggiorna report"${report.click > 1 ? ` (${report.click}x)` : ''}`);
       }
 
       const { results: results0, recalcObserved } = await waitForRecalc(entity_id, baselineFp, {
@@ -538,6 +551,9 @@ export async function grindSession(opts, deps = {}) {
       // che e' esattamente la baseline.
       const cambiamentoChiesto = deltaReale;
       let staleConfermato = false;
+      // Un quasi-incidente recuperato: non merita una riga sua, ma non va perso. Finisce in coda
+      // alla riga della run conclusa, dove chi legge lo vede accanto al risultato che spiega.
+      let avviso = null;
       // `report.aggiornato` false = il banner non se n'e' andato: le metriche non sono affidabili
       // e l'identita' con la run precedente e' un sintomo vero, non una coincidenza.
       if (sameAsPrevious && cambiamentoChiesto && !report.aggiornato) {
@@ -545,7 +561,7 @@ export async function grindSession(opts, deps = {}) {
         if (ri.cambiato) {
           results = ri.results;
           sameAsPrevious = false;
-          await api.progress(command_id, `run ${run.id}: pannello in ritardo, metriche rilette al tentativo ${ri.tentativi}`);
+          avviso = `pannello in ritardo, metriche rilette al tentativo ${ri.tentativi}`;
         } else {
           staleConfermato = true;
         }
@@ -630,7 +646,28 @@ export async function grindSession(opts, deps = {}) {
         period_applied: periodoFinale.label || null,
       };
 
-      const shot = await captureScreenshot({ region: 'strategy_tester' });
+      // Lo screenshot si scatta col pannello MASSIMIZZATO e poi si rimette tutto com'era.
+      // A pannello normale il tester e' ~370px su 994: la curva equity esce alta un centinaio di
+      // pixel, illeggibile. Massimizzato occupa la finestra intera.
+      // Il ripristino sta in `finally` perche' un pannello lasciato massimizzato non rovinerebbe
+      // solo lo scatto: coprirebbe il chart per tutte le run successive.
+      // Nessuno dei due passi puo' far fallire la run — il backtest a questo punto e' gia' misurato
+      // e valido; se la massimizzazione non riesce si ottiene lo scatto piccolo di prima.
+      let shot = null;
+      let modoPrima = null;
+      try {
+        if (maximize_for_screenshot) {
+          try {
+            const max = await setPanelMaximized(true);
+            if (max?.ok) modoPrima = max.prima ?? null;
+          } catch { /* si scatta con il pannello com'e' */ }
+        }
+        shot = await captureScreenshot({ region: 'strategy_tester' });
+      } finally {
+        if (modoPrima && modoPrima !== 'maximized') {
+          try { await setPanelMaximized(false); } catch { /* il grind non si ferma per il layout */ }
+        }
+      }
       if (!shot?.file_path) {
         await api.markFailed(run.id, 'screenshot equity non prodotto');
         failed++;
@@ -649,7 +686,7 @@ export async function grindSession(opts, deps = {}) {
           net_profit_pct: payload.net_profit_pct, max_dd_pct: payload.max_drawdown_pct,
           win_rate: payload.win_rate, profit_factor: payload.profit_factor, trades: payload.total_trades,
         });
-        await api.progress(command_id, `✔ run ${run.id}: ${payload.total_trades} trade, PF ${payload.profit_factor}`);
+        await api.progress(command_id, `✔ run ${run.id}: ${payload.total_trades} trade, PF ${payload.profit_factor}${avviso ? ` — ${avviso}` : ''}`);
       } catch (err) {
         // Un 422 isolato non blocca la matrice (garanzia della piattaforma): la run resta
         // failed e si prosegue. Ma se il fallimento si ripete N volte DI FILA è un guasto
