@@ -116,6 +116,7 @@ export function fingerprint(tv = {}) {
 export function detectAnomaly({
   setResult, results, readbackOk = true, sameAsPrevious = false,
   staleConfermato = false, contestoCambiato = false, recalcObserved = null,
+  baselineAssente = false,
 } = {}) {
   const missing = setResult?.missing || [];
   if (missing.length) {
@@ -148,6 +149,22 @@ export function detectAnomaly({
   // metterlo prima, perche' `zero_trades` non finalizza nulla: marca la run failed e prosegue.
   if (Math.round(results.metrics?.total_trades ?? 0) === 0) {
     return { kind: 'zero_trades', detail: 'la strategia non ha prodotto alcun trade (verifica badge errore, pannello, leva e size nelle Proprietà)' };
+  }
+  // Il pannello non ha MAI avuto metriche con cui confrontarsi, nemmeno dopo l'attesa. Tutto il
+  // rilevamento dello stale poggia su una domanda sola — «i numeri si sono mossi rispetto a prima?»
+  // — e senza un "prima" quella domanda non ha risposta: rispetto al nulla ogni valore sembra nuovo,
+  // compreso quello che il pannello mostra della configurazione salvata sul chart.
+  // Fail-closed come il resto del file: fermarsi per sbaglio costa un rilancio del grind, accettare
+  // per sbaglio scrive un numero falso dentro una conclusione che poi si eredita per catena.
+  // Successo davvero: #999 (sessione 63) e #1006 (sessione 64), 553 trade e -14.049,87 identici al
+  // centesimo a settimane di distanza, da due configurazioni diverse. Nessuno dei due era storico
+  // troncato — erano due letture dello stesso stato di partenza, accettate perche' non c'era niente
+  // con cui smentirle.
+  if (baselineAssente) {
+    return {
+      kind: 'baseline_unavailable',
+      detail: 'il pannello non aveva metriche al momento della baseline e non ne ha avute nemmeno dopo l\'attesa: senza un termine di confronto questo risultato non e\' verificabile (chart ancora in caricamento? TradingView appena rilanciato?)',
+    };
   }
   // Il pannello non si e' mosso nemmeno dopo le riletture. Con un cambio di symbol/timeframe di
   // mezzo non e' nemmeno un dubbio: metriche identiche fra due contesti diversi sono impossibili.

@@ -800,6 +800,41 @@ test('la baseline viene fotografata DOPO l applicazione del contesto', async () 
   assert.ok(letturePrimaDegliInput > 0, 'la baseline va letta fra il cambio di contesto e il set degli input');
 });
 
+// --- Una baseline VUOTA non e' una baseline (incidenti #999 e #1006, 2026-08-23) --------------
+// Dopo un rilancio di TradingView il chart sta ancora caricando e il pannello non ha metriche. La
+// baseline usciva quindi vuota, e rispetto al nulla QUALUNQUE numero sembra "cambiato" — compreso
+// quello che il pannello mostra ancora della configurazione salvata sul chart. Da qui #999
+// (sessione 63) e #1006 (sessione 64): 553 trade e -14.049,87 identici al centesimo, prodotti a
+// settimane di distanza da due configurazioni DIVERSE. Nessuno dei due era storico troncato: erano
+// due letture dello stesso stato di partenza, accettate perche' non c'era niente con cui smentirle.
+
+test('baseline vuota: il primo numero che compare non e un risultato, e non va finalizzato', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 7 } }],
+    metricsSeq: [M()],
+  });
+  const stale = M({ total_trades: 553, net_profit: -14049.87 });
+  // Il pannello non ha metriche finche' il chart sta caricando — cioe' per tutta la fase in cui si
+  // fotografa la baseline. Poi compare lo stato salvato sul chart, che NON e' il risultato di questa
+  // run: e' quello che c'era prima. Modellato sul tempo del grind (prima/dopo il set), non sul numero
+  // di letture: il grind ne fa migliaia, e un contatore si esaurirebbe prima ancora della baseline.
+  let inputApplicati = false;
+  const setOrig = deps.setInputs;
+  deps.setInputs = async (a) => { inputApplicati = true; return setOrig(a); };
+  deps.readReportFor = async () => (inputApplicati ? { success: true, metrics: stale } : { success: true, metrics: {} });
+  deps.readPanelMetrics = async () => (inputApplicati
+    ? { success: true, source: 'panel', metrics: stale }
+    : { success: true, source: 'panel', metrics: {} });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1', period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 300, recalc_stable_checks: 1, recalc_step_ms: 10,
+  }, deps);
+
+  assert.equal(finalized.length, 0, 'una baseline vuota non autorizza a finalizzare il primo numero che compare');
+  assert.ok(out.stopped_reason, 'senza una baseline con cui confrontarsi il grind deve fermarsi, non accettare');
+});
+
 test('input gia uguali a quelli richiesti: nessun ricalcolo atteso, la run passa', async () => {
   // La prima run di una matrice e' quasi sempre la configurazione di default, cioe' quella gia'
   // sul chart. Nessun input cambia, quindi nessun ricalcolo e metriche identiche alla baseline:

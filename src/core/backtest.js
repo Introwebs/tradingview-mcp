@@ -37,6 +37,15 @@ import { toFinalizePayload, fingerprint, detectAnomaly } from './btMetrics.js';
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * Firma delle metriche solo se ci SONO metriche, altrimenti il fallback ricevuto.
+ * Un report senza metriche non e' una baseline: e' l'ASSENZA di una baseline, e le due cose vanno
+ * tenute distinguibili (vedi il commento su `prevFp` in grindSession).
+ */
+function fpNotoO(fallback, metrics) {
+  return metrics && Object.keys(metrics).length ? fingerprint(metrics) : fallback;
+}
+
+/**
  * Attende che il ricalcolo della strategia sia PARTITO e poi FINITO, sincronizzandosi sul
  * segnale autoritativo di TradingView (`isLoading()` della data source) invece di indovinarlo
  * dal movimento dei numeri.
@@ -404,7 +413,13 @@ export async function grindSession(opts, deps = {}) {
   let executed = 0;
   let failed = 0;
   let stopped_reason = null;
-  let prevFp = fingerprint((await readReportFor(entity_id))?.metrics || {});
+  // `null` = baseline ASSENTE, che non e' una baseline vuota. Il pannello puo' non avere ancora
+  // metriche (chart in caricamento, tipicamente subito dopo un rilancio di TradingView):
+  // fotografarlo lo stesso produce una firma di soli null, e rispetto al nulla QUALUNQUE numero
+  // sembra nuovo — compreso quello della configurazione salvata sul chart, che il pannello continua
+  // a mostrare finche' non ricalcola. Incidenti #999 (sessione 63) e #1006 (sessione 64): 553 trade
+  // e -14.049,87 registrati due volte a settimane di distanza, da configurazioni DIVERSE.
+  let prevFp = fpNotoO(null, (await readReportFor(entity_id))?.metrics);
   // Fallimenti CONSECUTIVI in finalize: un 422 isolato è un test storto e non deve fermare
   // la matrice, ma se la causa è sistemica (es. initialCapital sempre null perché "Initial
   // Capital" non viene riconosciuto tra gli input) ogni run fallisce allo stesso modo e senza
@@ -489,10 +504,24 @@ export async function grindSession(opts, deps = {}) {
           deadline: Date.now() + Math.min(recalc_timeout_ms, 30000),
           stepMs: recalc_step_ms, stableChecks: recalc_stable_checks,
         });
-        if (prima?.success !== false && Object.keys(prima?.metrics || {}).length) {
-          baselineFp = fingerprint(prima.metrics);
-        }
+        baselineFp = fpNotoO(baselineFp, prima?.success !== false ? prima?.metrics : null);
       } catch { /* si tiene prevFp */ }
+
+      // Il pannello puo' essere STABILE e VUOTO insieme: `waitByFingerprint` non lo distingue,
+      // perche' una firma di soli null e' immediatamente stabile e quindi "assestata". Qui si
+      // aspetta che le metriche compaiano davvero — senza una baseline non esiste il confronto su
+      // cui poggia tutto il rilevamento dello stale.
+      if (baselineFp === null) {
+        const scadenza = Date.now() + Math.min(recalc_timeout_ms, 30000);
+        while (baselineFp === null && Date.now() < scadenza) {
+          const r = await leggiMetriche(entity_id, periodoRistretto);
+          baselineFp = fpNotoO(null, r?.success !== false ? r?.metrics : null);
+          if (baselineFp === null) await sleep(recalc_step_ms);
+        }
+        if (baselineFp !== null) {
+          await nota(`run ${run.id}: pannello ancora senza metriche, baseline presa dopo l'attesa`);
+        }
+      }
 
       // Il contesto e' cambiato ma i numeri sono gli stessi di prima del cambio: impossibile.
       // Un altro symbol, un altro timeframe o un'altra finestra temporale non possono produrre lo
@@ -604,6 +633,7 @@ export async function grindSession(opts, deps = {}) {
       // comportamento giusto, non un no-op silenzioso.
       const anomaly = detectAnomaly({
         setResult, results, readbackOk, sameAsPrevious, staleConfermato, contestoCambiato,
+        baselineAssente: baselineFp === null,
         // Due casi in cui NON si accusa un no-op, per ragioni diverse ma entrambe autoritative:
         //  - gli input erano gia' quelli richiesti: non ricalcolare e' corretto;
         //  - TradingView dichiara il report ATTUALE (banner sparito): il calcolo e' avvenuto, e se
