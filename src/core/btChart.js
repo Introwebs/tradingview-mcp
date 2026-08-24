@@ -136,6 +136,42 @@ export async function readStrategyLoading(entityId, { evaluate = realEvaluate } 
 }
 
 /**
+ * Lo stato di salute dello studio, letto da TradingView invece che dedotto.
+ *
+ * `study.status()` ritorna `{type, errorDescription:{error, title}}`. `type: 3` è un errore di
+ * RUNTIME: il sorgente compila benissimo — l'editor non segnala nulla — ma il ricalcolo non parte
+ * e il report non esiste. Da fuori è indistinguibile da una strategia che semplicemente non fa
+ * trade, ed è per questo che va CHIESTO invece che dedotto dai numeri.
+ *
+ * Il caso che ha reso necessaria questa funzione (sessione 66, 2026-08-24): applicare una stringa
+ * vuota a un input di tipo `resolution` manda lo studio in `Can't parse pine`. Il grind ha macinato
+ * tre run a zero trade e ha concluso «non è il periodo, è la configurazione» — una diagnosi
+ * sbagliata, quindi peggiore del silenzio, perché manda a cercare dalla parte opposta.
+ *
+ * ⚠️ In dubbio si dichiara SANO (`ok: true`, `type: null`). Questa è una guardia, non un oracolo:
+ * se TradingView cambia le sue API interne deve degradare a nulla, non fermare una matrice sana.
+ *
+ * @returns {Promise<{ok: boolean, type: number|null, error: string|null}>}
+ */
+export async function readStudyStatus(entityId, { evaluate = realEvaluate } = {}) {
+  const out = await evaluate(`
+    (function() {
+      ${SRC_BY_ID_JS}
+      try {
+        var s = _paSourceById(${safeString(entityId)});
+        if (!s || typeof s.status !== 'function') return null;
+        var st = s.status();
+        if (!st || typeof st.type !== 'number') return null;
+        var d = st.errorDescription || null;
+        return { type: st.type, error: d ? (d.error || d.title || null) : null };
+      } catch (e) { return null; }
+    })()
+  `);
+  if (!out || typeof out.type !== 'number') return { ok: true, type: null, error: null };
+  return { ok: out.type !== 3, type: out.type, error: out.error || null };
+}
+
+/**
  * Le metriche della strategia con quell'id, nella stessa forma di `getStrategyResults()`
  * (`{success, metrics, currency, error}`) così che `toFinalizePayload` e `detectAnomaly`
  * non debbano sapere da dove arrivano.

@@ -27,6 +27,7 @@ import {
   readInputValues as realReadInputValues,
   readReportFor as realReadReportFor,
   readStrategyLoading as realReadStrategyLoading,
+  readStudyStatus as realReadStudyStatus,
   ensureVisibleFor as realEnsureVisibleFor,
   setStrategyVisibility as realSetStrategyVisibility,
   readbackMatches,
@@ -342,6 +343,7 @@ export async function grindSession(opts, deps = {}) {
     readInputValues = realReadInputValues,
     readReportFor = realReadReportFor,
     readStrategyLoading = realReadStrategyLoading,
+    readStudyStatus = realReadStudyStatus,
     ensureVisibleFor = realEnsureVisibleFor,
     setStrategyVisibility = realSetStrategyVisibility,
     setSymbol = realSetSymbol,
@@ -429,7 +431,29 @@ export async function grindSession(opts, deps = {}) {
   // configurazione rotta (vedi il ramo zero_trades nel loop).
   let consecutiveZeroTrades = 0;
 
+  // ⛔ LO STATO D'ERRORE SI CHIEDE, NON SI DEDUCE ⛔
+  // Una strategia in errore di runtime non produce report: da fuori e' indistinguibile da una che
+  // semplicemente non fa trade. Prima di questa guardia il grind macinava l'intera coda a zero
+  // trade e poi concludeva «non e' il periodo, e' la configurazione» — una diagnosi mai verificata,
+  // e sbagliata, che mandava a controllare leva e size mentre il problema era lo studio rotto.
+  // Sessione 66, 2026-08-24: tre run, controllo compreso, e diciotto minuti.
+  // Si guarda UNA volta, prima della run 1: se lo studio e' rotto lo e' per tutta la matrice. E
+  // nessuna run va marcata `failed` — non e' colpa loro: restano `pending` per quando si ripara.
+  try {
+    const stato = await readStudyStatus(entity_id);
+    if (stato && stato.ok === false) {
+      const err = stato.error || 'errore di runtime';
+      stopped_reason = {
+        kind: 'study_runtime_error',
+        detail: `la strategia ${entity_id} e' in errore di runtime su TradingView: "${err}". Nessuna run eseguita: riparala sul chart (ricaricala, oppure correggi l'input che la rompe) e rilancia — il grind riparte dalle pending.`,
+        entity_id, status_type: stato.type,
+      };
+      await api.progress(command_id, `⛔ strategia in errore di runtime ("${err}") — non eseguo nessuna run`);
+    }
+  } catch { /* guardia, non oracolo: se lo stato non e' leggibile si prosegue */ }
+
   for (;;) {
+    if (stopped_reason) break;
     if (max_runs && executed + failed >= max_runs) break;
 
     const run = await api.nextRun(session_id);

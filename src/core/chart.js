@@ -23,7 +23,19 @@ export async function getState({ _deps } = {}) {
       try {
         var allStudies = chart.getAllStudies();
         studies = allStudies.map(function(s) {
-          return { id: s.id, name: s.name || s.title || 'unknown' };
+          var row = { id: s.id, name: s.name || s.title || 'unknown' };
+          // Lo stato d'errore: l'unico fatto che conta davvero, e che questa lista taceva.
+          // Si aggiunge SOLO quando c'e' un errore — sul caso sano la risposta resta terse,
+          // perche' finisce in contesto a ogni apertura di sessione.
+          try {
+            var st = chart.getStudyById(s.id);
+            var q = (st && typeof st.status === 'function') ? st.status() : null;
+            if (q && q.type === 3) {
+              var d = q.errorDescription || null;
+              row.error = (d && (d.error || d.title)) || 'runtime error';
+            }
+          } catch(e2) {}
+          return row;
         });
       } catch(e) {}
       return {

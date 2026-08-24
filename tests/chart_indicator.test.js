@@ -60,3 +60,52 @@ describe('manageIndicator add — input application (#249)', () => {
     assert.equal(r.inputs, undefined);
   });
 });
+
+/**
+ * chart_get_state e' il "guarda il chart" canonico: e' la prima cosa che si chiama aprendo una
+ * sessione. Fino al 2026-08-24 restituiva `{id, name}` e basta — cieco sull'unico fatto che conta
+ * davvero, cioe' se uno studio e' rotto. Nella sessione 66 la strategia era in `Can't parse pine`
+ * e chi ha guardato il chart ha visto dieci studies tutte uguali; l'errore era a una chiamata di
+ * distanza. Il campo compare SOLO quando c'e' un errore: sul caso sano la risposta resta terse,
+ * perche' questa e' una lista che finisce in contesto a ogni sessione.
+ */
+describe('chart_get_state e lo stato degli studi', () => {
+  const evalWith = (studies) => async (expr) => {
+    if (/getAllStudies/.test(expr)) {
+      return { symbol: 'TVC:NDQ', resolution: '5', chartType: 1, studies };
+    }
+    return null;
+  };
+
+  it('CHIEDE lo stato di ogni studio, invece di fermarsi a id e nome', async () => {
+    // La mappatura vera gira dentro la pagina, quindi da qui non e' eseguibile: quello che si puo'
+    // verificare — ed e' quello che conta — e' che la DOMANDA venga posta, e solo per `type === 3`
+    // (errore di runtime). Che la risposta sia quella giusta lo dice la sonda dal vivo, non questo
+    // test: distinguere le due cose e' la lezione del 2026-08-11 sui test sintetici.
+    const { getState } = await import('../src/core/chart.js');
+    let expr = '';
+    await getState({ _deps: { evaluate: async (e) => { expr = e; return { studies: [] }; } } });
+
+    assert.ok(expr.includes("typeof st.status === 'function'"), 'deve chiedere status()');
+    assert.ok(expr.includes('q.type === 3'), 'solo type 3 e\' un errore di runtime');
+    assert.ok(expr.includes('errorDescription'), 'deve portare il messaggio vero');
+  });
+
+  it('passa attraverso l\'errore che la pagina riporta', async () => {
+    const { getState } = await import('../src/core/chart.js');
+    const out = await getState({ _deps: { evaluate: evalWith([
+      { id: 'a', name: 'Sano' },
+      { id: 'b', name: 'Index Grow Test Claude', error: "Can't parse pine" },
+    ]) } });
+
+    assert.equal(out.success, true);
+    assert.equal(out.studies[1].error, "Can't parse pine");
+  });
+
+  it('non aggiunge rumore quando tutto e\' sano', async () => {
+    const { getState } = await import('../src/core/chart.js');
+    const out = await getState({ _deps: { evaluate: evalWith([{ id: 'a', name: 'Sano' }]) } });
+
+    assert.deepEqual(out.studies, [{ id: 'a', name: 'Sano' }]);
+  });
+});

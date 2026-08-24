@@ -60,6 +60,10 @@ function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
       // cosi' i test descrivono il caso sano; chi vuole il banner che non se ne va lo sovrascrive.
       attendiReportAggiornato: async () => { seen.refreshChiamato = (seen.refreshChiamato || 0) + 1; return { aggiornato: true, click: 0 }; },
       ensureVisibleFor: async () => ({ found: true, wasHidden: false, visible: true }),
+      // Lo stato dello studio: sano per default, come ogni altra dep di questo harness.
+      // Senza questo stub la guardia di grindSession chiamerebbe la dep VERA e ogni test
+      // proverebbe a connettersi a TradingView. Chi vuole lo studio rotto lo sovrascrive.
+      readStudyStatus: async () => ({ ok: true, type: 0, error: null }),
       setStrategyVisibility: async () => true,
       // Chart finto: tiene davvero symbol/timeframe/periodo, cosi' le verifiche di
       // applicaContestoRun esercitano il comportamento vero invece di passare a vuoto.
@@ -1114,5 +1118,65 @@ test('identita che resiste alla rilettura resta un dato, non un guasto', async (
   const out = await grindSession(opzioni(), deps);
 
   assert.equal(out.stopped_reason, null, 'un risultato identico ma confermato non e un guasto');
+  assert.equal(finalized.length, 1);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lo stato d'errore della strategia: guardarlo, invece di consigliare a un umano
+// di guardarlo.
+//
+// Sessione 66, 2026-08-24. La strategia era in `Can't parse pine` — errore di
+// RUNTIME, non di compilazione: il sorgente compila, ma il ricalcolo non parte e
+// il report non esiste. Il grind ha macinato tre run, tutte a zero trade, e si e'
+// fermato col motivo `zero_trades_systemic`: «non e' il periodo, e' la
+// configurazione». Falso. Non era ne' l'uno ne' l'altra, e quella frase ha mandato
+// a diagnosticare leva e size — dalla parte opposta.
+//
+// Lo stato era leggibile per tutto il tempo: `study.status()` ritorna `type: 3`
+// con `errorDescription.error`. Costava una chiamata, prima della run 1.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('una strategia in errore di runtime ferma il grind PRIMA della prima run', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [
+      { id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, label: 'controllo' },
+      { id: 2, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 }, label: 'b' },
+    ],
+    metricsSeq: [M(), M({ net_profit: 200 })],
+  });
+  deps.readStudyStatus = async () => ({ ok: false, type: 3, error: "Can't parse pine" });
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1',
+    period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.executed, 0);
+  assert.equal(out.failed, 0, 'nessuna run va marcata failed: non e\' colpa loro');
+  assert.equal(finalized.length, 0);
+  assert.equal(out.stopped_reason.kind, 'study_runtime_error');
+  // Il motivo deve riportare l'errore VERO, non una supposizione sulla configurazione.
+  assert.match(out.stopped_reason.detail, /Can't parse pine/);
+  assert.doesNotMatch(out.stopped_reason.detail, /e' la configurazione/);
+});
+
+test('lo stato illeggibile non blocca il grind: in dubbio si prosegue', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 200 })],
+  });
+  // TradingView cambia le sue API interne senza avvisare: se un giorno `status()` non
+  // c'e' piu', questa guardia deve degradare a nulla — non fermare una matrice sana.
+  deps.readStudyStatus = async () => { throw new Error('no such method'); };
+
+  const out = await grindSession({
+    session_id: 7, entity_id: 'ent1',
+    period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  assert.equal(out.executed, 1);
+  assert.equal(out.stopped_reason, null);
   assert.equal(finalized.length, 1);
 });
