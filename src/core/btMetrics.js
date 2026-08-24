@@ -26,7 +26,7 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 /**
  * @param {Object} tv  metrics di getStrategyResults()
- * @param {Object} ctx {symbol, timeframe, period_start, period_end, initial_capital, inputs, properties}
+ * @param {Object} ctx {symbol, timeframe, period_start, period_end, initial_capital, inputs, properties, applied_inputs}
  */
 export function toFinalizePayload(tv = {}, ctx = {}) {
   const extra = {};
@@ -63,6 +63,9 @@ export function toFinalizePayload(tv = {}, ctx = {}) {
     period_end: ctx.period_end,
     initial_capital: ctx.initial_capital,
     inputs: ctx.inputs || {},
+    // `null` e non `{}` quando manca: un archivio vuoto direbbe "misurato, non c'era niente",
+    // mentre qui il caso vero e' "non l'ho misurato". Il server lo accetta nullable apposta.
+    applied_inputs: ctx.applied_inputs || null,
     net_profit: num(tv.net_profit) ?? 0,
     // Già ratio 0-1 lato TradingView: passano così come sono (vedi il commento in testa).
     net_profit_pct: num(tv.net_profit_percent) ?? 0,

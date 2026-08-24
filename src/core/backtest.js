@@ -706,7 +706,7 @@ export async function grindSession(opts, deps = {}) {
       // richiesto: api.md lo dice da sempre ("popola SEMPRE col range REALE"), e scriverlo a fiducia
       // e' esattamente ciò che ha prodotto dieci backtest identici con dieci etichette diverse.
       const periodoFinale = await readTestPeriod();
-      const { inputs, properties, initialCapital } = buildInputsPayload(info, actual);
+      const { inputs, properties, initialCapital, appliedInputs } = buildInputsPayload(info, actual);
       const payload = toFinalizePayload(results.metrics, {
         symbol: run.symbol,
         timeframe: run.timeframe,
@@ -715,6 +715,10 @@ export async function grindSession(opts, deps = {}) {
         initial_capital: initialCapital,
         inputs,
         properties,
+        // L'archivio per id e col tipo, accanto al dizionario per nome. Chi congela la
+        // configurazione di una madre legge QUESTO: dal nome non si risale ne' al tipo ne'
+        // all'id, e ricostruirla per nome e' cio' che ha rotto la sessione 66 (btInputs.js).
+        applied_inputs: appliedInputs,
       });
       // Tracciabilita': da dove vengono i numeri, e se il range ottenuto e' quello chiesto.
       payload.extra_metrics = {

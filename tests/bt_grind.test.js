@@ -1180,3 +1180,25 @@ test('lo stato illeggibile non blocca il grind: in dubbio si prosegue', async ()
   assert.equal(out.stopped_reason, null);
   assert.equal(finalized.length, 1);
 });
+
+test('il finalize porta applied_inputs: id, tipo e valore di TUTTO cio che era sul chart', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, label: 'a' }],
+    metricsSeq: [M(), M({ net_profit: 200 })],
+  });
+  await grindSession({
+    session_id: 7, entity_id: 'ent1',
+    period_start: '2023-01-01', period_end: '2025-01-01',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1,
+  }, deps);
+
+  const applied = finalized[0].payload.applied_inputs;
+  // Per ID, non per nome: e' la chiave con cui si riapplica una configurazione.
+  assert.deepEqual(applied['in_0'], { name: 'Risk/Reward', type: 'float', value: 2, block: 'logic' });
+  // E le Proprieta' sono nell'archivio, dove `inputs` non le ha mai avute.
+  assert.equal(applied['in_40'].block, 'property');
+  assert.equal(applied['in_40'].value, 10000);
+  // I valori sono quelli RILETTI dal chart dopo il set, come per `inputs`: l'archivio e' una
+  // misura, non una copia di cio' che era stato chiesto.
+  assert.equal(finalized[0].payload.inputs['Risk/Reward'], 2);
+});

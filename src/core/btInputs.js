@@ -75,10 +75,25 @@ export function classifyInputs(info) {
   return { system, logic, properties };
 }
 
+
+/**
+ * Una voce dell'archivio. `value` c'e' SEMPRE, anche quando vale null: la chiave presente col
+ * valore nullo dice "questo input esiste e non l'ho letto", che non e' la stessa cosa di una
+ * chiave assente ne' di una stringa vuota.
+ */
+function archiveEntry(item, values, block) {
+  return {
+    name: String(item.name ?? ''),
+    type: item.type ?? null,
+    value: Object.prototype.hasOwnProperty.call(values, item.id) ? values[item.id] : null,
+    block,
+  };
+}
+
 /**
  * @param {Array} info  output (trimmato) di getInputsInfo(): {id, name, type}
  * @param {Object} values  mappa id → valore corrente (da getInputValues)
- * @returns {{inputs: Object, properties: Object, initialCapital: number|null}}
+ * @returns {{inputs: Object, properties: Object, initialCapital: number|null, appliedInputs: Object}}
  */
 export function buildInputsPayload(info, values = {}) {
   const { logic, properties: propItems } = classifyInputs(info);
@@ -96,8 +111,31 @@ export function buildInputsPayload(info, values = {}) {
   const properties = {};
   for (const item of propItems) properties[String(item.name || item.id)] = values[item.id];
 
+  // L'ARCHIVIO: id -> {name, type, value, block}. Completo, tipizzato, senza omonimi.
+  //
+  // `inputs` qui sopra e' per chi LEGGE la piattaforma; questo e' per chi deve RIPRODURRE la
+  // configurazione. La differenza non e' cosmetica: chi doveva congelare la configurazione di una
+  // madre in una catena aveva solo il dizionario per nome, e da li' l'unica strada era rimappare
+  // sulla mappa viva. Nella sessione 66 quella rimappatura e' riuscita al 100% (76 nomi su 76) e
+  // ha prodotto una configurazione DIVERSA: nove input scritti dove la madre non scriveva nulla e
+  // ventidue Proprieta' mancanti. Su un input di tipo `resolution` scrivere "" dove la madre non
+  // scriveva niente e' bastato a rompere il ricalcolo ("Can't parse pine", tre run a zero trade).
+  //
+  // Tre cose che il dizionario per nome perdeva, e che qui ci sono:
+  //   - il TIPO: nessuno poteva sapere che `TF:` e' un `resolution`
+  //   - l'ID: tornava solo come ripiego quando il nome era vuoto
+  //   - l'UNICITA': gli omonimi finivano disambiguati incollando l'id dentro l'etichetta
+  // E le Proprieta' stanno QUI DENTRO, marcate `block: 'property'`: fuori dall'archivio erano
+  // meta' della differenza fra le due configurazioni, e nessuno la vedeva.
+  //
+  // ⚠️ Un id assente da `values` si archivia con `value: null` e la chiave PRESENTE: un'assenza e'
+  // un dato, e va distinta da una stringa vuota — che su un `resolution` e' un valore vero.
+  const appliedInputs = {};
+  for (const item of logic) appliedInputs[item.id] = archiveEntry(item, values, 'logic');
+  for (const item of propItems) appliedInputs[item.id] = archiveEntry(item, values, 'property');
+
   const cap = properties['Initial Capital'];
   const initialCapital = typeof cap === 'number' ? cap : cap != null && !Number.isNaN(Number(cap)) ? Number(cap) : null;
 
-  return { inputs, properties, initialCapital };
+  return { inputs, properties, initialCapital, appliedInputs };
 }

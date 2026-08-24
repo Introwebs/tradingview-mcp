@@ -95,3 +95,55 @@ test('la coda reale delle Proprietà finisce tutta fuori da inputs', () => {
     assert.ok(!(n in inputs), `${n} non doveva finire in inputs`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// appliedInputs: l'archivio per ID e col TIPO (sessione 66, 2026-08-24)
+// ---------------------------------------------------------------------------
+
+test('buildInputsPayload archivia appliedInputs per id, con nome e tipo', () => {
+  const values = { in_0: 2.5, in_1: '1530-1550', in_2: 14, in_3: 21, in_40: 10000, in_41: 100 };
+  const { appliedInputs } = buildInputsPayload(INFO, values);
+  assert.deepEqual(appliedInputs['in_0'], { name: 'Risk/Reward', type: 'float', value: 2.5, block: 'logic' });
+  // Il tipo e' l'informazione che la chiave-per-nome perdeva, ed e' quella che conta:
+  // nessuno, guardando `inputs`, poteva sapere che un input e' un `resolution`.
+  assert.equal(appliedInputs['in_1'].type, 'text');
+});
+
+test('appliedInputs tiene DENTRO anche le Proprieta, marcate come tali', () => {
+  const values = { in_0: 2.5, in_1: 'x', in_2: 14, in_3: 21, in_40: 10000, in_41: 100 };
+  const { appliedInputs, inputs } = buildInputsPayload(INFO, values);
+  // `inputs` resta la sola logica: e' cio' che il server conta al finalize.
+  assert.equal(Object.keys(inputs).length, 4);
+  // L'archivio invece e' COMPLETO: le 22 Proprieta' che la madre pinnava e la figlia no erano
+  // meta' della differenza fra le due configurazioni della sessione 66.
+  assert.equal(appliedInputs['in_40'].block, 'property');
+  assert.equal(appliedInputs['in_40'].value, 10000);
+  assert.equal(Object.keys(appliedInputs).length, 6);
+});
+
+test('appliedInputs non contiene MAI i campi di sistema (il sorgente compilato sta li dentro)', () => {
+  const { appliedInputs } = buildInputsPayload(INFO, { text: 'strategy(...)', in_0: 1 });
+  assert.equal(appliedInputs['text'], undefined);
+  assert.equal(appliedInputs['pineId'], undefined);
+});
+
+test('appliedInputs distingue una stringa vuota da un input mai letto', () => {
+  // Un `resolution` vuoto significa "timeframe del chart" ed e' un valore vero; un id assente
+  // dalla mappa dei valori e' un'altra cosa. Confonderli e' costato tre run a zero trade.
+  const info = [
+    { id: 'in_54', name: 'TF:', type: 'resolution' },
+    { id: 'in_55', name: 'Mai letto', type: 'float' },
+  ];
+  const { appliedInputs } = buildInputsPayload(info, { in_54: '' });
+  assert.equal(appliedInputs['in_54'].value, '');
+  assert.equal(appliedInputs['in_55'].value, null);
+  assert.ok('value' in appliedInputs['in_55']);
+});
+
+test('appliedInputs sopravvive a un nome vuoto o mancante senza perdere l id', () => {
+  const info = [{ id: 'in_9', name: '', type: 'bool' }];
+  const { appliedInputs } = buildInputsPayload(info, { in_9: true });
+  assert.equal(appliedInputs['in_9'].name, '');
+  assert.equal(appliedInputs['in_9'].type, 'bool');
+  assert.equal(appliedInputs['in_9'].value, true);
+});
