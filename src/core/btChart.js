@@ -234,9 +234,13 @@ export async function readReportFor(entityId, { evaluate = realEvaluate } = {}) 
  * Quanto la strategia ha pagato di commissioni e su quante unita' (somma delle qty di ogni fill).
  *
  * Serve alla verifica del rate implicito delle varianti di costo: `commission_paid / filled_qty_sum`
- * deve coincidere col valore scritto in "Commission Value". E' un RAPPORTO, quindi non risente del
- * periodo di test a cui `reportData()` e' cieco: vale anche a periodo ristretto.
+ * deve coincidere col valore scritto in "Commission Value". E' un RAPPORTO, quindi e' indipendente
+ * dal periodo di test SOLO se il report e' stato ricalcolato DOPO l'impostazione del Commission
+ * Value — sta al chiamante aspettare il ricalcolo prima di leggere qui (il grind lo fa gia').
  * Si proiettano solo tre numeri: `reportData()` porta `marginUsage` (~270k caratteri).
+ *
+ * Stesso contratto di `readReportFor`: report non ancora calcolato è `success: false`, MAI
+ * `commission_paid: 0` — uno zero apparente e uno zero vero sarebbero indistinguibili a valle.
  */
 export async function readCommissionFor(entityId, { evaluate = realEvaluate } = {}) {
   const out = await evaluate(`
@@ -246,13 +250,18 @@ export async function readCommissionFor(entityId, { evaluate = realEvaluate } = 
         var s = _paSourceById(${safeString(entityId)});
         if (!s) return { success: false, error: 'strategia ' + ${safeString(entityId)} + ' non trovata fra le data source del chart' };
         var rd = _paUnwrap(s.reportData());
-        if (!rd) return { success: false, error: 'reportData null per ' + ${safeString(entityId)} + ' (strategia nascosta, o ricalcolo in corso)' };
-        var fills = rd.filledOrders || [];
+        if (!rd || !rd.performance) {
+          return { success: false, error: 'report non ancora calcolato per ' + ${safeString(entityId)} + ' (strategia nascosta, o ricalcolo in corso)' };
+        }
+        var all = rd.performance.all || {};
+        if (typeof all.commissionPaid !== 'number') {
+          return { success: false, error: 'commissionPaid assente nel report' };
+        }
+        var fills = _paUnwrap(rd.filledOrders);
+        if (!Array.isArray(fills)) fills = [];
         var q = 0;
         for (var i = 0; i < fills.length; i++) q += Math.abs(Number(fills[i].q) || 0);
-        var perf = rd.performance || {};
-        var all = perf.all || {};
-        return { success: true, commission_paid: Number(all.commissionPaid) || 0, filled_qty_sum: q, fills: fills.length };
+        return { success: true, commission_paid: all.commissionPaid, filled_qty_sum: q, fills: fills.length, entity_id: ${safeString(entityId)} };
       } catch (e) { return { success: false, error: e.message }; }
     })()
   `);

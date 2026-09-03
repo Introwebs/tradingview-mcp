@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import {
   readInputsInfo, readInputValues, readbackMatches,
   readStrategyLoading, readReportFor, readCommissionFor, ensureVisibleFor, setStrategyVisibility,
@@ -116,9 +117,9 @@ test('setStrategyVisibility riporta indietro la visibilità di una sola strategi
 
 test('readCommissionFor legge commissionPaid e la somma delle qty dei fill, senza trasportare il report intero', async () => {
   let js = '';
-  const evaluate = async (code) => { js = code; return { success: true, commission_paid: 40, filled_qty_sum: 20, fills: 4 }; };
+  const evaluate = async (code) => { js = code; return { success: true, commission_paid: 40, filled_qty_sum: 20, fills: 4, entity_id: 'ent1' }; };
   const out = await readCommissionFor('ent1', { evaluate });
-  assert.deepEqual(out, { success: true, commission_paid: 40, filled_qty_sum: 20, fills: 4 });
+  assert.deepEqual(out, { success: true, commission_paid: 40, filled_qty_sum: 20, fills: 4, entity_id: 'ent1' });
   assert.match(js, /filledOrders/);
   assert.match(js, /commissionPaid/);
   // marginUsage e' ~270k caratteri: il JS non deve mai ritornare `rd` intero
@@ -130,4 +131,52 @@ test('readCommissionFor: reportData null non e un crash ma un esito leggibile', 
   const out = await readCommissionFor('ent1', { evaluate });
   assert.equal(out.success, false);
   assert.match(out.error, /reportData/);
+});
+
+/**
+ * Costruisce il sandbox `window.TradingViewApi...dataSources()` minimo che soddisfa
+ * `_paSourceById`/CHART_API, con UNA sola data source (id 'ent1') il cui reportData()
+ * ritorna `rd` cosi' com'e' (o wrappato in `{ value: () => rd }`, a scelta del chiamante).
+ */
+function makeSandbox(rd) {
+  const source = { id: () => 'ent1', reportData: () => rd };
+  return vm.createContext({
+    window: {
+      TradingViewApi: {
+        _activeChartWidgetWV: { value: () => ({
+          _chartWidget: { model: () => ({ model: () => ({ dataSources: () => [source] }) }) },
+        }) },
+      },
+    },
+  });
+}
+
+/** evaluate() vero: esegue davvero il JS iniettato da readCommissionFor contro il sandbox. */
+function vmEvaluate(rd) {
+  return async (code) => vm.runInContext(code, makeSandbox(rd));
+}
+
+test('readCommissionFor (esecuzione reale): somma le qty assolute e legge commissionPaid', async () => {
+  const rd = { performance: { all: { commissionPaid: 50 } }, filledOrders: [{ q: 10 }, { q: 10 }, { q: -5 }] };
+  const out = await readCommissionFor('ent1', { evaluate: vmEvaluate(rd) });
+  // Confronto per campo, non deepEqual: `out` viene dal realm del vm (Object.prototype diverso
+  // da quello del test), e deepStrictEqual su node:assert/strict fallisce sul prototipo pur a
+  // struttura identica.
+  assert.equal(out.success, true);
+  assert.equal(out.commission_paid, 50);
+  assert.equal(out.filled_qty_sum, 25);
+  assert.equal(out.fills, 3);
+  assert.equal(out.entity_id, 'ent1');
+});
+
+test('readCommissionFor (esecuzione reale): report senza performance e success:false, non commissione 0', async () => {
+  const out = await readCommissionFor('ent1', { evaluate: vmEvaluate({}) });
+  assert.equal(out.success, false);
+  assert.match(out.error, /non ancora calcolato/);
+});
+
+test('readCommissionFor (esecuzione reale): filledOrders wrappato in un accessor .value()', async () => {
+  const rd = { performance: { all: { commissionPaid: 12 } }, filledOrders: { value: () => [{ q: 4 }] } };
+  const out = await readCommissionFor('ent1', { evaluate: vmEvaluate(rd) });
+  assert.equal(out.filled_qty_sum, 4);
 });
