@@ -1202,3 +1202,149 @@ test('il finalize porta applied_inputs: id, tipo e valore di TUTTO cio che era s
   // misura, non una copia di cio' che era stato chiesto.
   assert.equal(finalized[0].payload.inputs['Risk/Reward'], 2);
 });
+
+// ── Varianti di costo: run per id, commissione per id, verifica del rate, controllo 0 ──────────
+
+const INFO_COSTI = [
+  { id: 'in_0', name: 'Risk/Reward', type: 'float', group: 'Ingressi' },
+  { id: 'in_40', name: 'Initial Capital', type: 'float', group: null },
+  { id: 'in_43', name: 'Commission Type', type: 'text', group: null },
+  { id: 'in_44', name: 'Commission Value', type: 'float', group: null },
+];
+
+function makeCostDeps({ runsById, parent, commissione, metricsSeq }) {
+  const base = makeDeps({ runs: [], metricsSeq });
+  const seen = base.seen;
+  seen.setInputs = [];
+  seen.failed = [];
+  let applied = { in_0: 1, in_40: 10000, in_43: 'percent', in_44: 0.5 };
+  const deps = {
+    ...base.deps,
+    api: {
+      ...base.deps.api,
+      nextRun: async () => { throw new Error('nextRun NON va chiamato con run_ids'); },
+      getRun: async (id) => runsById[id] ?? null,
+      getBacktest: async (id) => (id === parent.id ? parent : null),
+      markFailed: async (id, err) => { seen.failed.push({ id, err }); return {}; },
+    },
+    readInputsInfo: async () => INFO_COSTI,
+    readInputValues: async () => ({ ...applied }),
+    setInputs: async ({ inputs }) => { seen.setInputs.push(inputs); applied = { ...applied, ...inputs }; return base.deps.setInputs({ inputs }); },
+    readCommissionFor: async () => commissione(applied),
+    getChartState: async () => ({ symbol: 'NDQ', resolution: '15', studies: [{ id: 'ent-1', name: 'Index Grow Test Claude' }] }),
+  };
+  return { deps, seen, finalized: base.finalized, applied: () => applied };
+}
+
+const RUN_0 = { id: 1703, status: 'pending', symbol: 'NDQ', timeframe: '15', input_set: { in_0: 2 }, label: 'Controllo — commissione 0', parent_backtest_id: 1056,
+  cost_params: { commission_type: 'cash_per_contract', commission_per_lot: 0, commission_per_contract: 0, contract_size: 1, market_preset: 'index_cfd' } };
+const RUN_2 = { id: 1704, status: 'pending', symbol: 'NDQ', timeframe: '15', input_set: { in_0: 2 }, label: 'Commissioni 2 $/lotto', parent_backtest_id: 1056,
+  cost_params: { commission_type: 'cash_per_contract', commission_per_lot: 2, commission_per_contract: 2, contract_size: 1, market_preset: 'index_cfd' } };
+const PADRE = { id: 1056, total_trades: 20, net_profit: 100, strategy_name: 'Index Grow Test Claude' };
+
+test('run_ids: esegue le run per id, imposta Commission Type/Value per id e ripristina alla fine', async () => {
+  const { deps, seen, finalized, applied } = makeCostDeps({
+    runsById: { 1703: RUN_0, 1704: RUN_2 }, parent: PADRE,
+    commissione: (a) => ({ success: true, commission_paid: a.in_44 * 20 * 2, filled_qty_sum: 40, fills: 40 }),
+    // Il fake avanza di un valore a ogni set: baseline (50) → controllo (100 = il padre) → 2 $/lotto (20).
+    // La baseline DEVE differire dal padre, altrimenti il grind vede metriche ferme e rilegge a vuoto.
+    metricsSeq: [M({ total_trades: 20, net_profit: 50 }), M({ total_trades: 20, net_profit: 100 }), M({ total_trades: 20, net_profit: 20 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1703, 1704], strategy_name: 'Index Grow Test Claude', command_id: 1 }, deps);
+  assert.equal(out.executed, 2, JSON.stringify(out));
+  assert.equal(finalized.length, 2);
+  // la commissione entra nel set insieme agli input di logica, per id
+  const primo = seen.setInputs.find((s) => 'in_43' in s);
+  assert.equal(primo.in_43, 'cash_per_contract');
+  assert.equal(primo.in_44, 0);
+  assert.equal(seen.setInputs.find((s) => s.in_44 === 2).in_0, 2);
+  // extra_metrics della variante porta la commissione applicata e misurata
+  const em = finalized[1].payload.extra_metrics;
+  assert.equal(em.commission_per_lot, 2);
+  assert.equal(em.commission_per_contract, 2);
+  assert.equal(em.commission_paid, 80);
+  assert.equal(em.implied_rate, 2);
+  // ripristino dallo snapshot: com'era prima, non "0"
+  assert.equal(applied().in_43, 'percent');
+  assert.equal(applied().in_44, 0.5);
+  assert.equal(out.commission_restored, true);
+  // i rows delle varianti restano completi (non stanno nel digest)
+  const riga = out.rows.find((r) => r.run_id === 1704);
+  assert.equal(riga.commission_per_lot, 2);
+  assert.equal(riga.net_profit, 20);
+});
+
+test('run_ids: rate implicito che non torna → quella variante failed, il giro prosegue', async () => {
+  const RUN_3 = { ...RUN_2, id: 1705, label: 'Commissioni 3 $/lotto', cost_params: { ...RUN_2.cost_params, commission_per_lot: 3, commission_per_contract: 3 } };
+  const { deps, seen } = makeCostDeps({
+    runsById: { 1704: RUN_2, 1705: RUN_3 }, parent: PADRE,
+    // TV "non applica" la 2 (paga 0) ma applica la 3
+    commissione: (a) => ({ success: true, commission_paid: a.in_44 === 2 ? 0 : a.in_44 * 40, filled_qty_sum: 40, fills: 40 }),
+    metricsSeq: [M(), M({ net_profit: 90 }), M({ net_profit: 80 }), M({ net_profit: 70 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1704, 1705], entity_id: 'ent-1' }, deps);
+  assert.equal(out.failed, 1);
+  assert.equal(out.executed, 1);
+  assert.equal(out.stopped_reason, null);
+  assert.match(seen.failed.find((f) => f.id === 1704).err, /commission_rate_mismatch: rate implicito 0 invece di 2/);
+});
+
+test('run_ids: controllo 0 che non riproduce il padre → tutta la batch failed e stop', async () => {
+  const { deps, seen } = makeCostDeps({
+    runsById: { 1703: RUN_0, 1704: RUN_2 }, parent: { ...PADRE, total_trades: 25 },
+    commissione: () => ({ success: true, commission_paid: 0, filled_qty_sum: 40, fills: 40 }),
+    metricsSeq: [M({ total_trades: 20 }), M({ total_trades: 20, net_profit: 101 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1703, 1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.executed, 0);
+  assert.equal(out.stopped_reason.kind, 'control_run_mismatch');
+  assert.match(out.stopped_reason.detail, /20 trade contro 25/);
+  assert.deepEqual(seen.failed.map((f) => f.id).sort(), [1703, 1704]);
+  assert.match(seen.failed.find((f) => f.id === 1704).err, /control_run_mismatch/);
+});
+
+test('run_ids: controllo 0 con padre non leggibile → solo quella run failed (unverifiable), la batch prosegue', async () => {
+  const { deps, seen } = makeCostDeps({
+    runsById: { 1703: RUN_0, 1704: RUN_2 }, parent: { id: 1056, strategy_name: 'Index Grow Test Claude' },
+    commissione: (a) => ({ success: true, commission_paid: a.in_44 * 40, filled_qty_sum: 40, fills: 40 }),
+    metricsSeq: [M({ net_profit: 50 }), M({ net_profit: 100 }), M({ net_profit: 20 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1703, 1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.stopped_reason, null);
+  assert.equal(out.executed, 1);
+  assert.equal(out.failed, 1);
+  assert.match(seen.failed.find((f) => f.id === 1703).err, /control_run_unverifiable/);
+  assert.equal(seen.failed.some((f) => f.id === 1704), false);
+});
+
+test('run_ids: una run non pending si salta con nota, senza toccare il chart', async () => {
+  const { deps, seen, finalized } = makeCostDeps({
+    runsById: { 1704: { ...RUN_2, status: 'done' } }, parent: PADRE,
+    commissione: () => ({ success: true, commission_paid: 0, filled_qty_sum: 0, fills: 0 }),
+    metricsSeq: [M()],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1704], entity_id: 'ent-1' }, deps);
+  assert.equal(finalized.length, 0);
+  assert.equal(out.executed, 0);
+  assert.ok(seen.progress.some((p) => /1704.*done.*salto/.test(p)), seen.progress.join('|'));
+});
+
+test('strategy_name risolve entity_id dal chart quando entity_id manca; nome assente → errore tipizzato', async () => {
+  const { deps } = makeCostDeps({ runsById: {}, parent: PADRE, commissione: () => ({}), metricsSeq: [M()] });
+  await assert.rejects(
+    () => grindSession({ session_id: 68, run_ids: [], strategy_name: 'Altra' }, deps),
+    /strategy_not_on_chart/
+  );
+  const out = await grindSession({ session_id: 68, run_ids: [], strategy_name: 'index grow test claude' }, deps);
+  assert.equal(out.entity_id, 'ent-1');
+});
+
+test('senza cost_params una run per id si esegue come una run ordinaria (nessun set di commissione)', async () => {
+  const ORD = { id: 9, status: 'pending', symbol: 'NDQ', timeframe: '15', input_set: { in_0: 3 }, label: 'x' };
+  const { deps, seen, finalized } = makeCostDeps({ runsById: { 9: ORD }, parent: PADRE, commissione: () => { throw new Error('non va letta'); }, metricsSeq: [M(), M({ net_profit: 5 })] });
+  const out = await grindSession({ session_id: 68, run_ids: [9], entity_id: 'ent-1' }, deps);
+  assert.equal(out.executed, 1);
+  assert.equal(finalized.length, 1);
+  assert.ok(seen.setInputs.every((s) => !('in_43' in s)));
+  assert.equal(out.commission_restored, undefined);
+});

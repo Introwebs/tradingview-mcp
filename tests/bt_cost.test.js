@@ -20,9 +20,11 @@ test('resolveCommissionIds trova i due id per NOME, mai per posizione', () => {
 
 test('checkImpliedRate accetta il rate entro 1e-4 relativo e rifiuta il resto con i due numeri', () => {
   assert.equal(checkImpliedRate({ commission_paid: 40, filled_qty_sum: 20, expected: 2 }).ok, true);
+  assert.equal(checkImpliedRate({ commission_paid: 40, filled_qty_sum: 20, expected: 2 }).kind, null);
   assert.equal(checkImpliedRate({ commission_paid: 40.002, filled_qty_sum: 20, expected: 2 }).ok, true);
   const ko = checkImpliedRate({ commission_paid: 0, filled_qty_sum: 20, expected: 2 });
   assert.equal(ko.ok, false);
+  assert.equal(ko.kind, 'mismatch');
   assert.match(ko.detail, /rate implicito 0 invece di 2/);
   assert.equal(ko.implied_rate, 0);
 });
@@ -30,12 +32,14 @@ test('checkImpliedRate accetta il rate entro 1e-4 relativo e rifiuta il resto co
 test('checkImpliedRate senza fill non puo verificare niente e lo dice', () => {
   const r = checkImpliedRate({ commission_paid: 0, filled_qty_sum: 0, expected: 2 });
   assert.equal(r.ok, false);
+  assert.equal(r.kind, 'unverifiable');
   assert.match(r.detail, /nessun fill/);
 });
 
 test('checkImpliedRate con commission_paid non numerico e non verificabile, non un mismatch', () => {
   const r = checkImpliedRate({ commission_paid: null, filled_qty_sum: 20, expected: 2 });
   assert.equal(r.ok, false);
+  assert.equal(r.kind, 'unverifiable');
   assert.match(r.detail, /non verificabile/);
   assert.equal(r.implied_rate, null);
 });
@@ -43,6 +47,7 @@ test('checkImpliedRate con commission_paid non numerico e non verificabile, non 
 test('checkImpliedRate: al limite della tolleranza 1e-4 relativo', () => {
   const ko = checkImpliedRate({ commission_paid: 40.01, filled_qty_sum: 20, expected: 2 });
   assert.equal(ko.ok, false);
+  assert.equal(ko.kind, 'mismatch');
   const ko2 = checkImpliedRate({ commission_paid: 0.5, filled_qty_sum: 20, expected: 0 });
   assert.equal(ko2.ok, false);
 });

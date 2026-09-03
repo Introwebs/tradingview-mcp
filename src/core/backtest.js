@@ -30,9 +30,11 @@ import {
   readStudyStatus as realReadStudyStatus,
   ensureVisibleFor as realEnsureVisibleFor,
   setStrategyVisibility as realSetStrategyVisibility,
+  readCommissionFor as realReadCommissionFor,
   readbackMatches,
 } from './btChart.js';
 import { buildInputsPayload } from './btInputs.js';
+import { resolveCommissionIds, checkImpliedRate, checkControlRun, resolveStrategyEntity } from './btCost.js';
 import { toFinalizePayload, fingerprint, detectAnomaly } from './btMetrics.js';
 
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -75,7 +77,7 @@ function fpNotoO(fallback, metrics) {
  *          `recalcObserved` è null quando `isLoading()` non è leggibile: in quel caso si degrada
  *          all'euristica sulle firme e NON si accusa un no-op che non si è in grado di vedere.
  */
-async function waitForRecalc(entityId, prevFp, {
+export async function waitForRecalc(entityId, prevFp, {
   readReport, readLoading, sleep,
   timeoutMs = 45000, stepMs = 250, stableChecks = 3, startGraceMs = 5000,
 }) {
@@ -174,7 +176,7 @@ function stessoSymbol(a, b) {
  * Ogni asse che non si verifica torna come problema: il chiamante NON finalizza. Meglio una run
  * fallita con un motivo vero che un backtest plausibile e sbagliato.
  */
-async function applicaContestoRun(run, ctx) {
+export async function applicaContestoRun(run, ctx) {
   const { getChartState, setSymbol, setTimeframe, setCustomPeriod, readTestPeriod, ensureTesterPanel, sleep } = ctx;
   const problemi = [];
   let contestoRicaricato = false;
@@ -286,7 +288,7 @@ async function rileggiFinoACambio(entityId, prevFp, {
  * l'API, che porta 19 metriche fra cui Sharpe e Sortino; se differisce il filtro c'e', e si usa il
  * pannello. Il confronto vale anche da controllo di coerenza.
  */
-async function leggiMetricheEffettive(entityId, { readReportFor, readPanelMetrics, periodoRistretto = false }) {
+export async function leggiMetricheEffettive(entityId, { readReportFor, readPanelMetrics, periodoRistretto = false }) {
   // Con un periodo di test ristretto il pannello e' l'UNICA fonte valida: l'API interna risponde
   // sull'intero storico. Se il pannello non e' leggibile si segnala "riprova", non si ripiega --
   // un fallback verso una sorgente che si SA sbagliata per questa configurazione produce numeri
@@ -318,7 +320,7 @@ async function leggiMetricheEffettive(entityId, { readReportFor, readPanelMetric
 }
 
 export async function grindSession(opts, deps = {}) {
-  const {
+  let {
     session_id, entity_id, command_id = null, max_runs = 0,
     // 45s: un ricalcolo su un anno di dati intraday impiega diversi secondi, e a questi va
     // sommato il tempo di stabilizzazione. Meglio abbondare: il costo di aspettare troppo e'
@@ -333,6 +335,10 @@ export async function grindSession(opts, deps = {}) {
     verbose = false,
     // Massimizzare il pannello per lo scatto e rimetterlo subito com'era. Costa ~1,3 s per run.
     maximize_for_screenshot = true,
+    // Varianti di costo: le run si eseguono PER ID (il `?next=1` le filtra apposta) e l'entity_id
+    // puo' arrivare come nome della strategia, risolto qui sul chart.
+    run_ids = null,
+    strategy_name = null,
   } = opts;
 
   const {
@@ -344,6 +350,7 @@ export async function grindSession(opts, deps = {}) {
     readReportFor = realReadReportFor,
     readStrategyLoading = realReadStrategyLoading,
     readStudyStatus = realReadStudyStatus,
+    readCommissionFor = realReadCommissionFor,
     ensureVisibleFor = realEnsureVisibleFor,
     setStrategyVisibility = realSetStrategyVisibility,
     setSymbol = realSetSymbol,
@@ -369,11 +376,37 @@ export async function grindSession(opts, deps = {}) {
   const ctxRun = { getChartState, setSymbol, setTimeframe, setCustomPeriod, readTestPeriod, ensureTesterPanel, sleep };
 
   if (!session_id) throw new Error('session_id è obbligatorio');
-  if (!entity_id) throw new Error('entity_id è obbligatorio (prendilo da chart_get_state)');
+  if (!entity_id && strategy_name) {
+    const ris = resolveStrategyEntity(await getChartState(), strategy_name);
+    if (ris.error) throw new Error(`${ris.error.kind}: ${ris.error.detail}`);
+    entity_id = ris.entity_id;
+  }
+  if (!entity_id) throw new Error('entity_id è obbligatorio (prendilo da chart_get_state, o passa strategy_name)');
 
   // La mappa id→nome→tipo si legge UNA volta: non cambia tra le run della stessa strategia.
   const info = await readInputsInfo(entity_id);
   if (!info.length) throw new Error(`nessun input leggibile per entity_id=${entity_id}: la strategia è sul chart?`);
+
+  // Le due Proprieta' della commissione, trovate PER NOME: si usano solo per le run con
+  // `cost_params`. Sulle altre run questa riga non ha effetti.
+  const idsCommissione = resolveCommissionIds(info);
+  // Snapshot delle Proprieta' PRIMA della prima variante: a fine giro si rimettono com'erano.
+  // Non "0": il chart puo' avere una sua commissione, e cancellarla falserebbe il prossimo backtest.
+  let snapshotCommissione = null;
+
+  // Con `run_ids` le run si leggono per id nell'ordine dato; senza, dalla coda `?next=1` come sempre.
+  const codaPerId = Array.isArray(run_ids) ? [...run_ids] : null;
+  const prossimaRun = async () => {
+    if (!codaPerId) return api.nextRun(session_id);
+    while (codaPerId.length) {
+      const id = codaPerId.shift();
+      const r = await api.getRun(id);
+      if (!r) { await api.progress(command_id, `run ${id}: non trovata, salto`); continue; }
+      if (r.status !== 'pending') { await api.progress(command_id, `run ${id}: stato ${r.status}, salto`); continue; }
+      return r;
+    }
+    return null;
+  };
 
   // TradingView non calcola il report di una strategia invisibile. Serve quindi che la NOSTRA
   // sia visibile — e solo la nostra: l'unhide indiscriminato di ensureStrategyTesterReady()
@@ -456,7 +489,7 @@ export async function grindSession(opts, deps = {}) {
     if (stopped_reason) break;
     if (max_runs && executed + failed >= max_runs) break;
 
-    const run = await api.nextRun(session_id);
+    const run = await prossimaRun();
     if (!run) break;
 
     await api.markRunning(run.id);
@@ -555,21 +588,45 @@ export async function grindSession(opts, deps = {}) {
 
       const requested = run.input_set || {};
 
+      // Variante di costo: le due Proprieta' della commissione entrano nel set INSIEME agli input
+      // di logica, per id esatto. `commission_per_contract` arriva gia' convertito dal server.
+      const costo = run.cost_params && run.parent_backtest_id ? run.cost_params : null;
+      let inputsCosto = {};
+      if (costo) {
+        if (!idsCommissione) {
+          await api.markFailed(run.id, 'commission_ids_not_found: "Commission Type"/"Commission Value" non trovati fra gli input della strategia');
+          failed++;
+          rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: 'commission_ids_not_found' });
+          stopped_reason = { kind: 'commission_ids_not_found', detail: 'le Proprieta della commissione non sono nella mappa degli input', run_id: run.id, label: run.label ?? null };
+          await api.progress(command_id, `⛔ run ${run.id}: Proprieta commissione non trovate — mi fermo`);
+          break;
+        }
+        if (snapshotCommissione === null) {
+          const v = await readInputValues(entity_id);
+          snapshotCommissione = { [idsCommissione.typeId]: v[idsCommissione.typeId], [idsCommissione.valueId]: v[idsCommissione.valueId] };
+        }
+        inputsCosto = {
+          [idsCommissione.typeId]: costo.commission_type || 'cash_per_contract',
+          [idsCommissione.valueId]: Number(costo.commission_per_contract) || 0,
+        };
+      }
+      const richiesti = { ...requested, ...inputsCosto };
+
       // Gli input erano GIA' quelli richiesti? Succede regolarmente: la prima run di una matrice e'
       // quasi sempre la configurazione di default, cioe' quella gia' sul chart. In quel caso non
       // c'e' nessun ricalcolo da attendere e le metriche restano — legittimamente — identiche alla
       // baseline. Senza questa distinzione la run 1 di ogni sessione moriva di `silent_noop`.
-      let deltaReale = Object.keys(requested).length > 0;
+      let deltaReale = Object.keys(richiesti).length > 0;
       if (deltaReale) {
         try {
           const valoriPrima = await readInputValues(entity_id);
-          if (readbackMatches(requested, valoriPrima)) deltaReale = false;
+          if (readbackMatches(richiesti, valoriPrima)) deltaReale = false;
         } catch { /* in dubbio si assume che un cambiamento ci sia */ }
       }
 
       let setResult = { updated_inputs: {}, missing: [] };
-      if (Object.keys(requested).length) {
-        setResult = await setInputs({ entity_id, inputs: requested });
+      if (Object.keys(richiesti).length) {
+        setResult = await setInputs({ entity_id, inputs: richiesti });
       }
 
       // ⛔ IL PASSO SENZA IL QUALE NIENTE FUNZIONA ⛔
@@ -650,7 +707,7 @@ export async function grindSession(opts, deps = {}) {
       if (staleContesto && !report.aggiornato) staleConfermato = true;
 
       const actual = await readInputValues(entity_id);
-      const readbackOk = readbackMatches(requested, actual);
+      const readbackOk = readbackMatches(richiesti, actual);
 
       // "il motore non ha ricalcolato" è un'accusa sensata solo se qualcosa È stato chiesto:
       // una run con input_set vuoto gira sugli input correnti, e non ricalcolare è il
@@ -702,6 +759,54 @@ export async function grindSession(opts, deps = {}) {
         break;
       }
 
+      // Variante di costo: NON ci si fida del ritorno del set. Il rate implicito
+      // `commission_paid / Σqty` deve coincidere col valore scritto; la variante 0 (controllo)
+      // deve riprodurre il padre. Se il controllo fallisce, l'identita' del re-run non e' preservata
+      // e NESSUNA variante della batch e' attendibile: si marcano failed anche quelle in coda.
+      // "Non verificabile" (padre non letto, nessun fill) marca la sola run, non annulla la batch.
+      let verificaCosto = null;
+      if (costo) {
+        const c = await readCommissionFor(entity_id);
+        const perContratto = Number(costo.commission_per_contract) || 0;
+        let esito;
+        if (!c?.success) {
+          esito = { ok: false, kind: 'commission_unreadable', detail: c?.error || 'commissioni non leggibili dal report' };
+        } else if (perContratto === 0) {
+          const padre = await api.getBacktest(run.parent_backtest_id);
+          const ctrl = checkControlRun({
+            variant: { total_trades: results.metrics.total_trades, net_profit: results.metrics.net_profit, commission_paid: c.commission_paid },
+            parent: padre || {},
+          });
+          esito = ctrl.ok ? { ok: true }
+            : { ok: false, kind: ctrl.kind === 'unverifiable' ? 'control_run_unverifiable' : 'control_run_mismatch', detail: ctrl.detail };
+        } else {
+          const rate = checkImpliedRate({ commission_paid: c.commission_paid, filled_qty_sum: c.filled_qty_sum, expected: perContratto });
+          esito = rate.ok ? { ok: true, implied_rate: rate.implied_rate }
+            : { ok: false, kind: rate.kind === 'unverifiable' ? 'commission_rate_unverifiable' : 'commission_rate_mismatch', detail: rate.detail };
+        }
+
+        if (!esito.ok) {
+          const msg = `${esito.kind}: ${esito.detail}`;
+          await api.markFailed(run.id, msg);
+          failed++;
+          rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: msg.slice(0, 300), commission_per_lot: Number(costo.commission_per_lot ?? 0) });
+          if (esito.kind === 'control_run_mismatch') {
+            for (const id of (codaPerId || []).splice(0)) {
+              await api.markFailed(id, `control_run_mismatch: il run di controllo non ha riprodotto il padre (${esito.detail})`);
+              failed++;
+              rows.push({ run_id: id, label: null, status: 'failed', error: 'control_run_mismatch' });
+            }
+            stopped_reason = { kind: esito.kind, detail: esito.detail, run_id: run.id, label: run.label ?? null };
+            await api.progress(command_id, `⛔ run ${run.id}: il controllo a commissione 0 non riproduce il padre (${esito.detail}) — batch annullata`);
+            break;
+          }
+          await api.progress(command_id, `○ run ${run.id}: ${msg} — proseguo`);
+          prevFp = fingerprint(results.metrics);
+          continue;
+        }
+        verificaCosto = { ...c, implied_rate: esito.implied_rate ?? 0 };
+      }
+
       // Il periodo si rilegge dal tester DOPO il ricalcolo, e si registra QUELLO. Mai quello
       // richiesto: api.md lo dice da sempre ("popola SEMPRE col range REALE"), e scriverlo a fiducia
       // e' esattamente ciò che ha prodotto dieci backtest identici con dieci etichette diverse.
@@ -729,6 +834,18 @@ export async function grindSession(opts, deps = {}) {
           : null,
         period_applied: periodoFinale.label || null,
       };
+      if (costo) {
+        payload.extra_metrics = {
+          ...payload.extra_metrics,
+          commission_type: costo.commission_type || 'cash_per_contract',
+          commission_per_contract: Number(costo.commission_per_contract) || 0,
+          commission_per_lot: Number(costo.commission_per_lot ?? 0),
+          contract_size: Number(costo.contract_size) || 1,
+          commission_paid: verificaCosto.commission_paid,
+          filled_qty_sum: verificaCosto.filled_qty_sum,
+          implied_rate: verificaCosto.implied_rate,
+        };
+      }
 
       // Lo screenshot si scatta col pannello MASSIMIZZATO e poi si rimette tutto com'era.
       // A pannello normale il tester e' ~370px su 994: la curva equity esce alta un centinaio di
@@ -769,6 +886,7 @@ export async function grindSession(opts, deps = {}) {
           symbol: run.symbol, timeframe: run.timeframe, period_label: run.period_label ?? null,
           net_profit_pct: payload.net_profit_pct, max_dd_pct: payload.max_drawdown_pct,
           win_rate: payload.win_rate, profit_factor: payload.profit_factor, trades: payload.total_trades,
+          ...(costo && { commission_per_lot: Number(costo.commission_per_lot ?? 0), net_profit: payload.net_profit }),
         });
         await api.progress(command_id, `✔ run ${run.id}: ${payload.total_trades} trade, PF ${payload.profit_factor}${avviso ? ` — ${avviso}` : ''}`);
       } catch (err) {
@@ -807,6 +925,14 @@ export async function grindSession(opts, deps = {}) {
     }
   }
 
+  // Le Proprieta' della commissione tornano com'erano PRIMA della prima variante. Un chart lasciato
+  // con una commissione appiccicata falserebbe il prossimo backtest ordinario.
+  let commissionRestored;
+  if (snapshotCommissione) {
+    try { await setInputs({ entity_id, inputs: snapshotCommissione }); commissionRestored = true; }
+    catch { commissionRestored = false; }
+  }
+
   // Il chart va restituito com'era: se la strategia era nascosta e l'abbiamo accesa noi per
   // farle calcolare il report, la si rimette nascosta. Un fallimento qui non deve invalidare
   // un grind riuscito, quindi non propaga.
@@ -842,12 +968,13 @@ export async function grindSession(opts, deps = {}) {
   // non si sa se le metriche saranno altrove. Se non arriva, i rows restano completi — il grind non
   // deve mai diventare muto.
   const righe = digest
-    ? rows.map((r) => (r.status === 'done' ? { run_id: r.run_id, label: r.label, status: r.status } : r))
+    ? rows.map((r) => (r.status === 'done' && r.commission_per_lot == null ? { run_id: r.run_id, label: r.label, status: r.status } : r))
     : rows;
 
   return {
-    success: true, session_id, executed, failed, stopped_reason, rows: righe,
+    success: true, session_id, entity_id, executed, failed, stopped_reason, rows: righe,
     digest, ...(digest_error && { digest_error }),
     ...(restoreHidden && { visibility_restored: restored }),
+    ...(commissionRestored !== undefined && { commission_restored: commissionRestored }),
   };
 }

@@ -18,22 +18,23 @@ export function resolveCommissionIds(info) {
  * TV applica `commissione = qty × rate` per ordine, quindi sull'intero report
  * `commission_paid / Σ qty(fill) == rate`. Un rapporto: non risente del periodo di test.
  * `commission_paid` non numerico = report non letto: NON e' un mismatch, e' "non verificabile".
+ * `kind` distingue i due esiti negativi come in checkControlRun: 'mismatch' | 'unverifiable' | null.
  * Valida SOLO per commissioni di tipo `cash_per_contract` (qty × rate) — l'unico tipo che
  * la piattaforma crea; altri tipi (percent, cash_per_order) non seguono questa proporzionalita'.
  */
 export function checkImpliedRate({ commission_paid, filled_qty_sum, expected, tolerance = 1e-4 }) {
   if (typeof commission_paid !== 'number' || !Number.isFinite(commission_paid)) {
-    return { ok: false, implied_rate: null, detail: 'commissione pagata non letta dal report: rate implicito non verificabile' };
+    return { ok: false, kind: 'unverifiable', implied_rate: null, detail: 'commissione pagata non letta dal report: rate implicito non verificabile' };
   }
   if (typeof expected !== 'number' || !Number.isFinite(expected)) {
-    return { ok: false, implied_rate: null, detail: 'commissione attesa non numerica: non verificabile' };
+    return { ok: false, kind: 'unverifiable', implied_rate: null, detail: 'commissione attesa non numerica: non verificabile' };
   }
   const q = Number(filled_qty_sum) || 0;
-  if (q <= 0) return { ok: false, implied_rate: null, detail: 'nessun fill nel report: rate implicito non verificabile' };
+  if (q <= 0) return { ok: false, kind: 'unverifiable', implied_rate: null, detail: 'nessun fill nel report: rate implicito non verificabile' };
   const implied = commission_paid / q;
   const rel = expected === 0 ? Math.abs(implied) : Math.abs(implied - expected) / Math.abs(expected);
-  if (rel <= tolerance) return { ok: true, implied_rate: implied, detail: null };
-  return { ok: false, implied_rate: implied, detail: `rate implicito ${fmtNum(implied)} invece di ${fmtNum(expected)}` };
+  if (rel <= tolerance) return { ok: true, kind: null, implied_rate: implied, detail: null };
+  return { ok: false, kind: 'mismatch', implied_rate: implied, detail: `rate implicito ${fmtNum(implied)} invece di ${fmtNum(expected)}` };
 }
 
 /**
