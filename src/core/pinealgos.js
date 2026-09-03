@@ -110,6 +110,19 @@ export function makeApi({
       const out = await req('GET', `/api/v1/backtest-sessions/${sessionId}/runs?next=1`);
       return out?.data ?? null;
     },
+    /**
+     * Una run per id. Serve alle varianti di costo: `nextRun` (?next=1) le filtra apposta,
+     * quindi si leggono per id dal payload del comando `simulate_commission`.
+     */
+    async getRun(runId) {
+      const out = await req('GET', `/api/v1/backtest-runs/${runId}`);
+      return out?.data ?? null;
+    },
+    /** Un backtest per id: il padre di una variante (identita' + metriche di controllo), o il backtest da replicare (bt_apply). */
+    async getBacktest(backtestId) {
+      const out = await req('GET', `/api/v1/backtests/${backtestId}`);
+      return out?.data ?? null;
+    },
     markRunning(runId) {
       return req('PATCH', `/api/v1/backtest-runs/${runId}`, { body: { status: 'running', increment_attempts: true } });
     },

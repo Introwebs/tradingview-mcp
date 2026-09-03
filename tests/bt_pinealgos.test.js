@@ -102,3 +102,21 @@ test('un 422 NON viene ritentato: il server lo ha eseguito e rifiutato', async (
   await assert.rejects(() => api.finalize(7, {}), /422/);
   assert.equal(n, 1);
 });
+
+test('getRun legge una run per id e ritorna data', async () => {
+  const calls = [];
+  const fakeFetch = async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({ data: { id: 1704, status: 'pending', cost_params: { commission_per_lot: 2 } } }) }; };
+  const api = makeApi({ base: 'https://a.test', token: 'T', fetchImpl: fakeFetch });
+  const run = await api.getRun(1704);
+  assert.equal(run.id, 1704);
+  assert.equal(calls[0], 'https://a.test/api/v1/backtest-runs/1704');
+});
+
+test('getBacktest legge un backtest per id e ritorna data', async () => {
+  const calls = [];
+  const fakeFetch = async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({ data: { id: 1056, total_trades: 10, strategy_name: 'Index Grow Test Claude' } }) }; };
+  const api = makeApi({ base: 'https://a.test', token: 'T', fetchImpl: fakeFetch });
+  const bt = await api.getBacktest(1056);
+  assert.equal(bt.strategy_name, 'Index Grow Test Claude');
+  assert.equal(calls[0], 'https://a.test/api/v1/backtests/1056');
+});
