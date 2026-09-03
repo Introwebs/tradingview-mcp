@@ -231,6 +231,36 @@ export async function readReportFor(entityId, { evaluate = realEvaluate } = {}) 
 }
 
 /**
+ * Quanto la strategia ha pagato di commissioni e su quante unita' (somma delle qty di ogni fill).
+ *
+ * Serve alla verifica del rate implicito delle varianti di costo: `commission_paid / filled_qty_sum`
+ * deve coincidere col valore scritto in "Commission Value". E' un RAPPORTO, quindi non risente del
+ * periodo di test a cui `reportData()` e' cieco: vale anche a periodo ristretto.
+ * Si proiettano solo tre numeri: `reportData()` porta `marginUsage` (~270k caratteri).
+ */
+export async function readCommissionFor(entityId, { evaluate = realEvaluate } = {}) {
+  const out = await evaluate(`
+    (function() {
+      ${SRC_BY_ID_JS}
+      try {
+        var s = _paSourceById(${safeString(entityId)});
+        if (!s) return { success: false, error: 'strategia ' + ${safeString(entityId)} + ' non trovata fra le data source del chart' };
+        var rd = _paUnwrap(s.reportData());
+        if (!rd) return { success: false, error: 'reportData null per ' + ${safeString(entityId)} + ' (strategia nascosta, o ricalcolo in corso)' };
+        var fills = rd.filledOrders || [];
+        var q = 0;
+        for (var i = 0; i < fills.length; i++) q += Math.abs(Number(fills[i].q) || 0);
+        var perf = rd.performance || {};
+        var all = perf.all || {};
+        return { success: true, commission_paid: Number(all.commissionPaid) || 0, filled_qty_sum: q, fills: fills.length };
+      } catch (e) { return { success: false, error: e.message }; }
+    })()
+  `);
+  if (!out || typeof out !== 'object') return { success: false, error: 'lettura commissioni non riuscita (nessuna risposta dalla pagina)' };
+  return out;
+}
+
+/**
  * Rende visibile SOLO la strategia bersaglio, e dice se era nascosta (per poterla rimettere
  * com'era a fine grind). TradingView non calcola il report di una strategia invisibile, quindi
  * un minimo di unhide serve — ma va limitato a una sola strategia.

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   readInputsInfo, readInputValues, readbackMatches,
-  readStrategyLoading, readReportFor, ensureVisibleFor, setStrategyVisibility,
+  readStrategyLoading, readReportFor, readCommissionFor, ensureVisibleFor, setStrategyVisibility,
 } from '../src/core/btChart.js';
 
 test('readInputsInfo proietta solo id/name/type/group e non trasporta mai il blob del source', async () => {
@@ -112,4 +112,22 @@ test('setStrategyVisibility riporta indietro la visibilità di una sola strategi
   assert.equal(await setStrategyVisibility('w3zjt7', false, { evaluate }), true);
   assert.match(js, /"w3zjt7"/);
   assert.match(js, /setValue\(false\)/);
+});
+
+test('readCommissionFor legge commissionPaid e la somma delle qty dei fill, senza trasportare il report intero', async () => {
+  let js = '';
+  const evaluate = async (code) => { js = code; return { success: true, commission_paid: 40, filled_qty_sum: 20, fills: 4 }; };
+  const out = await readCommissionFor('ent1', { evaluate });
+  assert.deepEqual(out, { success: true, commission_paid: 40, filled_qty_sum: 20, fills: 4 });
+  assert.match(js, /filledOrders/);
+  assert.match(js, /commissionPaid/);
+  // marginUsage e' ~270k caratteri: il JS non deve mai ritornare `rd` intero
+  assert.doesNotMatch(js, /return\s+rd\s*;/);
+});
+
+test('readCommissionFor: reportData null non e un crash ma un esito leggibile', async () => {
+  const evaluate = async () => ({ success: false, error: 'reportData null' });
+  const out = await readCommissionFor('ent1', { evaluate });
+  assert.equal(out.success, false);
+  assert.match(out.error, /reportData/);
 });
