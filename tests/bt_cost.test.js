@@ -40,23 +40,49 @@ test('checkImpliedRate con commission_paid non numerico e non verificabile, non 
   assert.equal(r.implied_rate, null);
 });
 
+test('checkImpliedRate: al limite della tolleranza 1e-4 relativo', () => {
+  const ko = checkImpliedRate({ commission_paid: 40.01, filled_qty_sum: 20, expected: 2 });
+  assert.equal(ko.ok, false);
+  const ko2 = checkImpliedRate({ commission_paid: 0.5, filled_qty_sum: 20, expected: 0 });
+  assert.equal(ko2.ok, false);
+});
+
 test('checkControlRun: la variante 0 deve riprodurre il padre (trade uguali, net entro 0,1%)', () => {
   const parent = { total_trades: 10, net_profit: 1234.5 };
   assert.equal(checkControlRun({ variant: { total_trades: 10, net_profit: 1234.5, commission_paid: 0 }, parent }).ok, true);
   assert.equal(checkControlRun({ variant: { total_trades: 10, net_profit: 1235.0, commission_paid: 0 }, parent }).ok, true);
   const trade = checkControlRun({ variant: { total_trades: 12, net_profit: 1234.5, commission_paid: 0 }, parent });
   assert.equal(trade.ok, false);
+  assert.equal(trade.kind, 'mismatch');
   assert.match(trade.detail, /12 trade contro 10/);
   const net = checkControlRun({ variant: { total_trades: 10, net_profit: 1300, commission_paid: 0 }, parent });
   assert.equal(net.ok, false);
+  assert.equal(net.kind, 'mismatch');
   assert.match(net.detail, /net 1300 contro 1234.5/);
+  assert.match(net.detail, /oltre lo 0,1%/);
   const comm = checkControlRun({ variant: { total_trades: 10, net_profit: 1234.5, commission_paid: 3 }, parent });
   assert.equal(comm.ok, false);
+  assert.equal(comm.kind, 'mismatch');
   assert.match(comm.detail, /commissioni pagate 3/);
 });
 
 test('checkControlRun con padre a net 0 confronta in assoluto', () => {
-  assert.equal(checkControlRun({ variant: { total_trades: 0, net_profit: 0, commission_paid: 0 }, parent: { total_trades: 0, net_profit: 0 } }).ok, true);
+  const ok = checkControlRun({ variant: { total_trades: 0, net_profit: 0, commission_paid: 0 }, parent: { total_trades: 0, net_profit: 0 } });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.kind, null);
+});
+
+test('checkControlRun: padre non leggibile o commissione non letta sono unverifiable, non "0 trade"', () => {
+  const noParent = checkControlRun({ variant: { total_trades: 10, net_profit: 1234.5, commission_paid: 0 }, parent: {} });
+  assert.equal(noParent.ok, false);
+  assert.equal(noParent.kind, 'unverifiable');
+  assert.match(noParent.detail, /non verificabile/);
+  assert.doesNotMatch(noParent.detail, /contro 0/);
+
+  const noPaid = checkControlRun({ variant: { total_trades: 10, net_profit: 1234.5, commission_paid: undefined }, parent: { total_trades: 10, net_profit: 1234.5 } });
+  assert.equal(noPaid.ok, false);
+  assert.equal(noPaid.kind, 'unverifiable');
+  assert.match(noPaid.detail, /non verificabile/);
 });
 
 test('resolveStrategyEntity: titolo esatto, poi case-insensitive, poi errori tipizzati', () => {
@@ -71,11 +97,29 @@ test('resolveStrategyEntity: titolo esatto, poi case-insensitive, poi errori tip
   assert.equal(resolveStrategyEntity(state, '').error.kind, 'strategy_not_on_chart');
 });
 
+test('resolveStrategyEntity: strategia trovata ma in errore di runtime', () => {
+  const state = { studies: [{ id: 'A', name: 'Volume' }, { id: 'B', name: 'X', error: 'RE10041' }] };
+  const r = resolveStrategyEntity(state, 'X');
+  assert.equal(r.error.kind, 'strategy_in_error');
+  assert.match(r.error.detail, /X/);
+  assert.match(r.error.detail, /RE10041/);
+});
+
 test('resolveInputKeys: per id se la chiave e un id della mappa, altrimenti per nome; irrisolti a parte', () => {
   const r = resolveInputKeys(INFO, { 'Risk/Reward': 2, in_1: '60', 'Non esiste': 1, text: 'blob' });
   assert.deepEqual(r.resolved, { in_0: 2, in_1: '60' });
   assert.deepEqual(r.unresolved, ['Non esiste']);
   assert.deepEqual(r.ignored, ['text']);
+});
+
+test('resolveInputKeys: chiavi omonime "Nome (in_K)" si risolvono per id, non per nome', () => {
+  const info = [
+    { id: 'in_6', name: 'Lunghezza', type: 'integer', group: 'Ingressi' },
+    { id: 'in_7', name: 'Lunghezza', type: 'integer', group: 'Ingressi' },
+  ];
+  const r = resolveInputKeys(info, { Lunghezza: 1, 'Lunghezza (in_7)': 2 });
+  assert.deepEqual(r.resolved, { in_6: 1, in_7: 2 });
+  assert.deepEqual(r.unresolved, []);
 });
 
 test('resolveInputKeys da applied_inputs (id -> {value, block}) salta i value null', () => {
