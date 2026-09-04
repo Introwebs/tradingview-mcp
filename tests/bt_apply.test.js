@@ -196,6 +196,16 @@ test('chart gia sui valori del backtest e metriche ferme → ok, nessuna accusa 
   assert.deepEqual(out.mismatches, []);
 });
 
+test('chart quasi sui valori del backtest (un input diverso) e pannello che non si muove mai, banner sparito → ok con warning "identiche"', async () => {
+  const h = makeDeps();
+  const quasi = { in_0: 2, in_1: '60', in_40: 100000, in_44: 0.5 }; // in_44 resta diverso dal richiesto (0)
+  h.deps.readInputValues = async () => ({ ...quasi });
+  pannelloInRitardo(h, { lag: Infinity });
+  const out = await applyBacktest({ backtest_id: 1056 }, h.deps);
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.match(out.warning, /identiche/);
+});
+
 test('periodo ristretto e pannello illeggibile → metrics_unreadable con applied_so_far', async () => {
   const h = makeDeps();
   h.deps.readPanelMetrics = async () => ({ success: false, retryable: true, error: 'pannello illeggibile' });

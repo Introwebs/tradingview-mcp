@@ -22,7 +22,6 @@ import {
 import {
   readInputsInfo as realReadInputsInfo, readInputValues as realReadInputValues,
   readReportFor as realReadReportFor, readStrategyLoading as realReadStrategyLoading,
-  readbackMatches,
 } from './btChart.js';
 import {
   waitForRecalc, applicaContestoRun, leggiMetricheEffettive, giornoISO, rileggiFinoACambio, fpNotoO,
@@ -142,7 +141,7 @@ export async function applyBacktest(opts, deps = {}) {
   // Se il chart e' GIA' sui valori richiesti, non ricalcolare e' corretto e l'identita' con la
   // baseline non e' un sintomo.
   const valoriPrima = await readInputValues(entity_id);
-  const deltaReale = !readbackMatches(piano.resolved, valoriPrima);
+  const deltaReale = !Object.entries(piano.resolved).every(([id, v]) => stessoValore(v, valoriPrima[id]));
 
   const setResult = await setInputs({ entity_id, inputs: piano.resolved });
   inputsSet = true;
@@ -176,6 +175,8 @@ export async function applyBacktest(opts, deps = {}) {
       avviso = `pannello in ritardo, metriche rilette al tentativo ${ri.tentativi}`;
     } else if (!report.aggiornato) {
       return fail('stale_metrics', 'TradingView dichiara ancora il report obsoleto e le metriche sono quelle della configurazione precedente', appliedSoFar());
+    } else {
+      avviso = 'metriche identiche alla configurazione precedente (report dichiarato attuale)';
     }
   }
   if (!results || results.success === false) {
