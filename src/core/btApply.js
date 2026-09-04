@@ -139,6 +139,18 @@ export async function applyBacktest(opts, deps = {}) {
   });
 
   await nota(`Imposto sul chart il backtest #${bt.id}: ${bt.symbol} ${bt.timeframe}, ${piano.inputs} input + ${piano.properties} Proprietà`);
+
+  // Il pannello Strategy Tester si apre SEMPRE, non solo quando cambia il contesto.
+  // Il pulsante del periodo di test vive li' dentro, e con periodo ristretto il pannello e' anche
+  // l'unica fonte valida di metriche (l'API interna e' cieca al periodo). `applicaContestoRun` lo
+  // apre solo dopo un cambio di symbol/timeframe: se il backtest e' gia' sul contesto del chart —
+  // il caso piu' comune, e quello del #1009 il 2026-09-04 — non lo apriva nessuno e il periodo
+  // falliva con "pulsante non presente". Il grind lo fa da sempre a inizio giro; qui mancava.
+  const pannello = await ensureTesterPanel();
+  if (!pannello?.ok) {
+    return fail('panel_not_open', `${pannello?.error || 'pannello Strategy Tester non pronto'}. Aprilo su TradingView (Strategy Tester, in basso) e rilancia: senza quel pannello il periodo di test non e' impostabile ne' leggibile.`);
+  }
+
   const contesto = await applicaContestoRun(
     { symbol: bt.symbol, timeframe: bt.timeframe, period_start: bt.period_start, period_end: bt.period_end },
     { getChartState, setSymbol, setTimeframe, setCustomPeriod, readTestPeriod, ensureTesterPanel, sleep },

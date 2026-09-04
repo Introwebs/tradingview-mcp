@@ -272,3 +272,28 @@ test('un valore null del backtest non si scrive, si segnala', async () => {
   assert.deepEqual(out.null_skipped, ['TF:']);
   assert.equal(out.applied.inputs, 1);
 });
+
+// Il pulsante del periodo vive nel pannello Strategy Tester. Se il backtest e' gia' sul contesto
+// del chart, `applicaContestoRun` non lo apre (apre solo dopo un cambio di symbol/TF) — e senza
+// pannello il periodo non si imposta. #1009, 2026-09-04: "pulsante del periodo non presente".
+test('il pannello Strategy Tester si apre sempre, anche quando il contesto non cambia', async () => {
+  const { deps, seen, chart } = makeDeps();
+  chart.symbol = 'TVC:NDQ';
+  chart.resolution = '15';
+  let aperture = 0;
+  deps.ensureTesterPanel = async () => { aperture += 1; return { ok: true }; };
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.ok(aperture >= 1, 'il pannello va garantito anche senza cambio di contesto');
+  assert.deepEqual(seen.periodi, [['2025-09-03', '2026-09-03']], 'e il periodo si imposta lo stesso');
+});
+
+test('pannello non apribile: si ferma con panel_not_open, senza toccare gli input', async () => {
+  const { deps, seen } = makeDeps();
+  deps.ensureTesterPanel = async () => ({ ok: false, error: 'pannello Strategy Tester non pronto' });
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.ok, false);
+  assert.equal(out.error.kind, 'panel_not_open');
+  assert.match(out.error.detail, /Aprilo su TradingView/);
+  assert.equal(seen.setInputs.length, 0);
+});
