@@ -1290,7 +1290,7 @@ test('run_ids: rate implicito che non torna → quella variante failed, il giro 
 });
 
 test('run_ids: controllo 0 che non riproduce il padre → tutta la batch failed e stop', async () => {
-  const { deps, seen } = makeCostDeps({
+  const { deps, seen, applied } = makeCostDeps({
     runsById: { 1703: RUN_0, 1704: RUN_2 }, parent: { ...PADRE, total_trades: 25 },
     commissione: () => ({ success: true, commission_paid: 0, filled_qty_sum: 40, fills: 40 }),
     metricsSeq: [M({ total_trades: 20 }), M({ total_trades: 20, net_profit: 101 })],
@@ -1301,6 +1301,9 @@ test('run_ids: controllo 0 che non riproduce il padre → tutta la batch failed 
   assert.match(out.stopped_reason.detail, /20 trade contro 25/);
   assert.deepEqual(seen.failed.map((f) => f.id).sort(), [1703, 1704]);
   assert.match(seen.failed.find((f) => f.id === 1704).err, /control_run_mismatch/);
+  // anche dopo l'abort della batch le Proprieta tornano com'erano
+  assert.equal(applied().in_44, 0.5);
+  assert.equal(applied().in_43, 'percent');
 });
 
 test('run_ids: controllo 0 con padre non leggibile → solo quella run failed (unverifiable), la batch prosegue', async () => {
@@ -1347,4 +1350,74 @@ test('senza cost_params una run per id si esegue come una run ordinaria (nessun 
   assert.equal(finalized.length, 1);
   assert.ok(seen.setInputs.every((s) => !('in_43' in s)));
   assert.equal(out.commission_restored, undefined);
+});
+
+test('run_ids: senza "Commission Type"/"Commission Value" fra gli input la variante si ferma PRIMA di toccare il chart', async () => {
+  const { deps, seen, finalized } = makeCostDeps({
+    runsById: { 1704: RUN_2 }, parent: PADRE,
+    commissione: () => { throw new Error('non va letta'); },
+    metricsSeq: [M()],
+  });
+  deps.readInputsInfo = async () => INFO_COSTI.filter((i) => i.id !== 'in_43' && i.id !== 'in_44');
+  const out = await grindSession({ session_id: 68, run_ids: [1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.stopped_reason.kind, 'commission_ids_not_found');
+  assert.equal(out.executed, 0);
+  assert.equal(finalized.length, 0);
+  assert.equal(seen.setInputs.length, 0);
+  assert.match(seen.failed.find((f) => f.id === 1704).err, /commission_ids_not_found/);
+  assert.equal(out.commission_restored, undefined);
+});
+
+test('run_ids: commissioni non leggibili dal report → quella variante failed, il giro prosegue e le Proprieta tornano', async () => {
+  const { deps, seen, applied } = makeCostDeps({
+    runsById: { 1704: RUN_2 }, parent: PADRE,
+    commissione: () => ({ success: false, error: 'reportData null' }),
+    metricsSeq: [M(), M({ net_profit: 90 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.stopped_reason, null);
+  assert.equal(out.executed, 0);
+  assert.equal(out.failed, 1);
+  assert.match(seen.failed.find((f) => f.id === 1704).err, /commission_unreadable: reportData null/);
+  assert.equal(out.commission_restored, true);
+  assert.equal(applied().in_43, 'percent');
+  assert.equal(applied().in_44, 0.5);
+});
+
+test('run_ids: getRun che lancia su un id non esce dal grind: si salta con nota e le Proprieta tornano comunque', async () => {
+  const { deps, seen, applied } = makeCostDeps({
+    runsById: { 1703: RUN_0 }, parent: PADRE,
+    commissione: () => ({ success: true, commission_paid: 0, filled_qty_sum: 40, fills: 40 }),
+    metricsSeq: [M({ net_profit: 50 }), M({ net_profit: 100 })],
+  });
+  const getRunOk = deps.api.getRun;
+  deps.api.getRun = async (id) => { if (id === 1704) throw new Error('HTTP 404'); return getRunOk(id); };
+  const out = await grindSession({ session_id: 68, run_ids: [1703, 1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.executed, 1);
+  assert.equal(out.stopped_reason, null);
+  assert.ok(seen.progress.some((p) => /1704.*non leggibile.*HTTP 404.*salto/.test(p)), seen.progress.join('|'));
+  assert.equal(out.commission_restored, true);
+  assert.equal(applied().in_43, 'percent');
+  assert.equal(applied().in_44, 0.5);
+});
+
+test('run_ids: cost_params con commission_per_contract non numerico → solo quella run failed, chart intatto', async () => {
+  const ROTTA = { ...RUN_2, id: 1706, cost_params: { ...RUN_2.cost_params, commission_per_contract: 'abc' } };
+  const { deps, seen, finalized } = makeCostDeps({
+    runsById: { 1706: ROTTA, 1704: RUN_2 }, parent: PADRE,
+    commissione: (a) => ({ success: true, commission_paid: a.in_44 * 40, filled_qty_sum: 40, fills: 40 }),
+    metricsSeq: [M(), M({ net_profit: 90 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1706, 1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.stopped_reason, null);
+  assert.equal(out.failed, 1);
+  assert.equal(out.executed, 1);
+  assert.equal(finalized.length, 1);
+  assert.equal(finalized[0].runId, 1704);
+  assert.match(seen.failed.find((f) => f.id === 1706).err, /cost_params_invalid: commission_per_contract non numerico/);
+  // la run rotta non ha toccato il chart: l'unico set di commissione e' quello della 1704
+  // (il secondo set con in_43 e' il ripristino dello snapshot, a 'percent')
+  assert.equal(seen.setInputs.filter((s) => s.in_43 === 'cash_per_contract').length, 1);
+  assert.equal(seen.setInputs.find((s) => s.in_43 === 'cash_per_contract').in_44, 2);
+  assert.equal(out.commission_restored, true);
 });

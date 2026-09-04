@@ -400,7 +400,9 @@ export async function grindSession(opts, deps = {}) {
     if (!codaPerId) return api.nextRun(session_id);
     while (codaPerId.length) {
       const id = codaPerId.shift();
-      const r = await api.getRun(id);
+      let r;
+      try { r = await api.getRun(id); }
+      catch (e) { await api.progress(command_id, `run ${id}: non leggibile (${e.message}), salto`); continue; }
       if (!r) { await api.progress(command_id, `run ${id}: non trovata, salto`); continue; }
       if (r.status !== 'pending') { await api.progress(command_id, `run ${id}: stato ${r.status}, salto`); continue; }
       return r;
@@ -485,6 +487,13 @@ export async function grindSession(opts, deps = {}) {
     }
   } catch { /* guardia, non oracolo: se lo stato non e' leggibile si prosegue */ }
 
+  // Le Proprieta' della commissione devono tornare com'erano su OGNI uscita dal ciclo, anche per
+  // un'eccezione fuori dal try per-run (es. `prossimaRun`): un chart lasciato con una commissione
+  // appiccicata falserebbe il prossimo backtest ordinario. Da qui il `finally` intorno al ciclo.
+  // Il corpo del ciclo NON e' rientrato apposta: sul percorso ordinario (nessuno snapshot) il
+  // finally e' un no-op e il diff resta leggibile.
+  let commissionRestored;
+  try {
   for (;;) {
     if (stopped_reason) break;
     if (max_runs && executed + failed >= max_runs) break;
@@ -593,6 +602,17 @@ export async function grindSession(opts, deps = {}) {
       const costo = run.cost_params && run.parent_backtest_id ? run.cost_params : null;
       let inputsCosto = {};
       if (costo) {
+        // Un `commission_per_contract` non numerico non si "corregge" a 0: diventerebbe un run di
+        // controllo per sbaglio. Si scarta la sola run, prima di toccare il chart.
+        if (!Number.isFinite(Number(costo.commission_per_contract))) {
+          const msg = 'cost_params_invalid: commission_per_contract non numerico';
+          await api.markFailed(run.id, msg);
+          failed++;
+          rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: msg, commission_per_lot: Number(costo.commission_per_lot ?? 0) });
+          await api.progress(command_id, `○ run ${run.id}: ${msg} — proseguo`);
+          prevFp = baselineFp ?? prevFp;
+          continue;
+        }
         if (!idsCommissione) {
           await api.markFailed(run.id, 'commission_ids_not_found: "Commission Type"/"Commission Value" non trovati fra gli input della strategia');
           failed++;
@@ -791,10 +811,19 @@ export async function grindSession(opts, deps = {}) {
           failed++;
           rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: msg.slice(0, 300), commission_per_lot: Number(costo.commission_per_lot ?? 0) });
           if (esito.kind === 'control_run_mismatch') {
+            // Le run in coda si marcano failed una per una, e ogni passo e' guardato: un getRun o un
+            // markFailed che lancia qui non deve mai sostituire la diagnosi vera (control_run_mismatch)
+            // con un runtime_error. Si toccano solo le `pending`: le altre non sono di questa batch.
             for (const id of (codaPerId || []).splice(0)) {
-              await api.markFailed(id, `control_run_mismatch: il run di controllo non ha riprodotto il padre (${esito.detail})`);
-              failed++;
-              rows.push({ run_id: id, label: null, status: 'failed', error: 'control_run_mismatch' });
+              const r = await api.getRun(id).catch(() => null);
+              if (r?.status !== 'pending') continue;
+              try {
+                await api.markFailed(id, `control_run_mismatch: il run di controllo non ha riprodotto il padre (${esito.detail})`);
+                failed++;
+                rows.push({ run_id: id, label: r.label ?? null, status: 'failed', error: 'control_run_mismatch', commission_per_lot: Number(r.cost_params?.commission_per_lot ?? 0) });
+              } catch (e) {
+                rows.push({ run_id: id, label: r.label ?? null, status: 'failed', error: `control_run_mismatch (mark failed: ${e.message})` });
+              }
             }
             stopped_reason = { kind: esito.kind, detail: esito.detail, run_id: run.id, label: run.label ?? null };
             await api.progress(command_id, `⛔ run ${run.id}: il controllo a commissione 0 non riproduce il padre (${esito.detail}) — batch annullata`);
@@ -924,13 +953,15 @@ export async function grindSession(opts, deps = {}) {
       break;
     }
   }
-
-  // Le Proprieta' della commissione tornano com'erano PRIMA della prima variante. Un chart lasciato
-  // con una commissione appiccicata falserebbe il prossimo backtest ordinario.
-  let commissionRestored;
-  if (snapshotCommissione) {
-    try { await setInputs({ entity_id, inputs: snapshotCommissione }); commissionRestored = true; }
-    catch { commissionRestored = false; }
+  } finally {
+    // Ripristino dallo snapshot, e `commission_restored` e' il READBACK — non "il set non ha
+    // lanciato": un set accettato e non applicato e' esattamente il difetto da cui nasce tutto.
+    if (snapshotCommissione) {
+      try {
+        await setInputs({ entity_id, inputs: snapshotCommissione });
+        commissionRestored = readbackMatches(snapshotCommissione, await readInputValues(entity_id));
+      } catch { commissionRestored = false; }
+    }
   }
 
   // Il chart va restituito com'era: se la strategia era nascosta e l'abbiamo accesa noi per
