@@ -22,6 +22,7 @@ import {
 import {
   readInputsInfo as realReadInputsInfo, readInputValues as realReadInputValues,
   readReportFor as realReadReportFor, readStrategyLoading as realReadStrategyLoading,
+  readStudyStatus as realReadStudyStatus,
 } from './btChart.js';
 import {
   waitForRecalc, applicaContestoRun, leggiMetricheEffettive, giornoISO, rileggiFinoACambio, fpNotoO,
@@ -85,6 +86,19 @@ function stessoValore(expected, got) {
   return Number.isFinite(a) && Number.isFinite(b) && a === b;
 }
 
+/**
+ * Il messaggio d'errore di runtime dello studio, o null se sta bene. Guardia, non oracolo: se lo
+ * stato non e' leggibile si prosegue invece di inventarsi un guasto.
+ */
+async function statoStudio(entityId, readStudyStatus) {
+  try {
+    const st = await readStudyStatus(entityId);
+    return st && st.ok === false ? (st.error || 'errore di runtime') : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function applyBacktest(opts, deps = {}) {
   const { backtest_id, command_id = null, recalc_timeout_ms = 45000 } = opts;
   const {
@@ -94,7 +108,8 @@ export async function applyBacktest(opts, deps = {}) {
     setCustomPeriod = realSetCustomPeriod, readTestPeriod = realReadTestPeriod, ensureTesterPanel = realEnsureTesterPanel,
     attendiReportAggiornato = realAttendiReport, aggiornaReportSeObsoleto = realAggiornaReportSeObsoleto,
     readStrategyLoading = realReadStrategyLoading,
-    readReportFor = realReadReportFor, readPanelMetrics = realReadPanelMetrics, sleep = realSleep,
+    readReportFor = realReadReportFor, readPanelMetrics = realReadPanelMetrics,
+    readStudyStatus = realReadStudyStatus, sleep = realSleep,
   } = deps;
   if (!backtest_id) throw new Error('backtest_id è obbligatorio');
   if (!api || typeof api.getBacktest !== 'function') throw new Error('deps.api.getBacktest è obbligatorio');
@@ -151,6 +166,18 @@ export async function applyBacktest(opts, deps = {}) {
 
   // Si aspetta che TradingView dichiari il report ATTUALE (banner sparito), poi la fine del
   // ricalcolo. Vedi backtest.js per le misure dal vivo.
+  // ⛔ LO STATO DELLA STRATEGIA SI CHIEDE, NON SI DEDUCE ⛔
+  // Scrivere un input puo' ROMPERE lo studio (tipo sbagliato su una versione diversa, modello degli
+  // input collassato: TradingView dice "Can't parse pine"). Uno studio rotto non produce report, e
+  // da fuori e' identico a una strategia che semplicemente non fa trade: senza questa domanda si
+  // registra "0 trade" come risultato e si dichiara riuscito.
+  // Successo il 2026-09-04 sul #1050: comando COMPLETATO, badge rosso sul chart, tester a 0 trade
+  // contro i 124 del backtest, e nessun errore da nessuna parte.
+  const statoDopoSet = await statoStudio(entity_id, readStudyStatus);
+  if (statoDopoSet) {
+    return fail('strategy_in_error', `dopo aver applicato gli input la strategia e' in errore di runtime su TradingView: "${statoDopoSet}". Il chart e' rimasto con questi input: ricarica la strategia (o rimetti la versione con cui il backtest e' stato misurato) prima di rileggerne le metriche.`, appliedSoFar());
+  }
+
   const report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
   if (report.click > 0) await nota('report obsoleto → premuto "Aggiorna report"');
   const { results: results0 } = await waitForRecalc(entity_id, baselineFp, {

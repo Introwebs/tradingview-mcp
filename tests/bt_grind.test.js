@@ -1449,3 +1449,35 @@ test('run_ids: un nome che la strategia viva non ha ferma il giro con version_mi
   assert.equal(out.stopped_reason.kind, 'version_mismatch');
   assert.match(seen.failed.find((f) => f.id === 1704).err, /Filtro che non esiste/);
 });
+
+// Zero trade e strategia rotta sono indistinguibili da fuori: la differenza si chiede.
+// Applicare un input PUO' rompere lo studio a meta' matrice, quindi il controllo di inizio giro
+// non basta (#1050, 2026-09-04: "Can't parse pine" dopo il set).
+test('zero trade con la strategia rotta: si ferma col motivo vero, non con "e la configurazione"', async () => {
+  const { deps, seen } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, label: 'a' }],
+    metricsSeq: [M(), M({ total_trades: 0, net_profit: 0 })],
+  });
+  let scritto = false;
+  const setOrig = deps.setInputs;
+  deps.setInputs = async (a) => { scritto = true; return setOrig(a); };
+  deps.readStudyStatus = async () => (scritto ? { ok: false, type: 3, error: "Can't parse pine" } : { ok: true, type: 0 });
+  const out = await grindSession({ session_id: 1, entity_id: 'ent-1', period_start: '2025-01-01', period_end: '2025-12-31' }, deps);
+  assert.equal(out.stopped_reason.kind, 'study_runtime_error');
+  assert.match(out.stopped_reason.detail, /Can't parse pine/);
+  assert.ok(seen.progress.some((p) => /errore di runtime/.test(p)), seen.progress.join('|'));
+});
+
+test('zero trade con la strategia sana resta zero_trades e la matrice prosegue', async () => {
+  const { deps } = makeDeps({
+    runs: [
+      { id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, label: 'a' },
+      { id: 2, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 }, label: 'b' },
+    ],
+    metricsSeq: [M(), M({ total_trades: 0, net_profit: 0 }), M({ net_profit: 300 }), M({ net_profit: 400 })],
+  });
+  const out = await grindSession({ session_id: 1, entity_id: 'ent-1', period_start: '2025-01-01', period_end: '2025-12-31' }, deps);
+  assert.equal(out.stopped_reason, null, JSON.stringify(out.rows));
+  assert.equal(out.rows.find((r) => r.run_id === 1).error, 'zero_trades');
+  assert.equal(out.executed, 1);
+});

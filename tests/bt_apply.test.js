@@ -38,6 +38,10 @@ function makeDeps({ bt = BT, studies = [{ id: 'ent-1', name: 'Index Grow Test Cl
       attendiReportAggiornato: async () => ({ aggiornato: true, click: 1 }),
       aggiornaReportSeObsoleto: async () => ({ cliccato: false }),
       readStrategyLoading: async () => { const l = loading; loading = false; return l; },
+      // Lo stato dello studio: sano per default, come ogni altra dep di questo harness. Senza
+      // questo stub la guardia chiamerebbe la dep VERA e il test proverebbe a connettersi a
+      // TradingView. Chi vuole lo studio rotto lo sovrascrive.
+      readStudyStatus: async () => ({ ok: true, type: 0, error: null }),
       readReportFor: async () => ({ success: true, metrics }),
       readPanelMetrics: async () => ({ success: true, metrics }),
       sleep: async () => {},
@@ -231,4 +235,29 @@ test('applied_inputs: la Proprieta saltata si riporta per nome, non per id', asy
   const out = await applyBacktest({ backtest_id: 1056 }, deps);
   assert.equal(out.ok, true);
   assert.deepEqual(out.properties_skipped, ['Use Bar Magnifier']);
+});
+
+// ⛔ Un comando che dichiara riuscito un chart rotto e' peggio di un comando fallito ⛔
+// Successo il 2026-09-04 sul #1050: "COMPLETATO", badge rosso su TradingView ("Can't parse pine"),
+// tester a 0 trade contro i 124 del backtest. Scrivere un input PUO' rompere lo studio, e uno
+// studio rotto non si distingue da una strategia che non fa trade se non glielo si chiede.
+test('se applicare gli input rompe la strategia, il comando FALLISCE e lo dice', async () => {
+  const { deps } = makeDeps();
+  let scritto = false;
+  const setOrig = deps.setInputs;
+  deps.setInputs = async (a) => { scritto = true; return setOrig(a); };
+  deps.readStudyStatus = async () => (scritto ? { ok: false, type: 3, error: "Can't parse pine" } : { ok: true });
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.ok, false);
+  assert.equal(out.error.kind, 'strategy_in_error');
+  assert.match(out.error.detail, /Can't parse pine/);
+  assert.match(out.error.detail, /ricarica la strategia/);
+  assert.equal(out.applied_so_far.inputs_set, true, 'il chart e stato toccato e va detto');
+});
+
+test('lo stato illeggibile non inventa un guasto: si prosegue', async () => {
+  const { deps } = makeDeps();
+  deps.readStudyStatus = async () => { throw new Error('CDP non risponde'); };
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.ok, true);
 });

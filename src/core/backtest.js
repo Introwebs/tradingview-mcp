@@ -770,6 +770,30 @@ export async function grindSession(opts, deps = {}) {
       // originale — "0 trade = di solito leva/size/errore di runtime" — resta, ma scatta solo se il
       // sintomo si ripete: se sono TUTTE a zero il problema e' di configurazione, non di periodo.
       if (anomaly?.kind === 'zero_trades') {
+        // Zero trade puo' voler dire due cose opposte: la finestra non ha segnali, oppure lo studio
+        // e' ROTTO e non produce report. Da fuori sono identiche. Lo stato si chiede una volta,
+        // qui — costa una lettura solo quando i trade sono zero, e trasforma una diagnosi
+        // fuorviante ("non e' il periodo, e' la configurazione") nel motivo vero.
+        // Applicare gli input puo' rompere lo studio a meta' matrice: il controllo di inizio giro
+        // non basta.
+        let rottaOra = null;
+        try {
+          const st = await readStudyStatus(entity_id);
+          if (st && st.ok === false) rottaOra = st.error || 'errore di runtime';
+        } catch { /* guardia, non oracolo */ }
+        if (rottaOra) {
+          await api.markFailed(run.id, `study_runtime_error: ${rottaOra}`);
+          failed++;
+          rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: `study_runtime_error: ${rottaOra}`.slice(0, 300) });
+          stopped_reason = {
+            kind: 'study_runtime_error',
+            detail: `la strategia e' andata in errore di runtime su TradingView ("${rottaOra}") mentre la matrice girava: da qui in poi ogni run darebbe zero trade. Riparala sul chart (ricaricala, o togli l'input che la rompe) e rilancia: il grind riparte dalle pending.`,
+            run_id: run.id, label: run.label ?? null,
+          };
+          await api.progress(command_id, `⛔ run ${run.id}: strategia in errore di runtime ("${rottaOra}") — mi fermo`);
+          break;
+        }
+
         await api.markFailed(run.id, `${anomaly.kind}: ${anomaly.detail}`);
         failed++;
         consecutiveZeroTrades++;
