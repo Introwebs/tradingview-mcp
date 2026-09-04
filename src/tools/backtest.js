@@ -11,8 +11,12 @@ export function registerBacktestTools(server) {
     {
       session_id: z.number().int().describe('Id della BacktestSession Pine Algos'),
       entity_id: z.string().optional().describe('entity_id della strategia bersaglio (da chart_get_state). Opzionale se passi strategy_name'),
-      period_start: z.string().describe('Inizio periodo ISO (YYYY-MM-DD) usato quando la run non ne ha uno proprio'),
-      period_end: z.string().describe('Fine periodo ISO (YYYY-MM-DD) usata quando la run non ne ha una propria'),
+      // OPZIONALI: sono solo il RIPIEGO per una run che non dichiara un periodo suo. Le run-variante
+      // di costo lo portano sempre (copiato dal padre lato server), quindi il runner non li passa —
+      // e finche' erano obbligatori il tool rifiutava la chiamata prima ancora di partire (misurato
+      // il 2026-09-04 sul #1050: MCP error -32602 in un secondo).
+      period_start: z.string().optional().describe('Inizio periodo ISO (YYYY-MM-DD), ripiego quando la run non ne ha uno proprio'),
+      period_end: z.string().optional().describe('Fine periodo ISO (YYYY-MM-DD), ripiego quando la run non ne ha una propria'),
       command_id: z.number().int().optional().describe('Id del comando operatore, per postare i progress in console'),
       max_runs: z.number().int().optional().describe('Massimo di run da eseguire in questa chiamata (0 = tutte le pending)'),
       recalc_timeout_ms: z.number().int().optional().describe('Attesa massima del ricalcolo per run (default 45000)'),
