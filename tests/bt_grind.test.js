@@ -1421,3 +1421,31 @@ test('run_ids: cost_params con commission_per_contract non numerico → solo que
   assert.equal(seen.setInputs.find((s) => s.in_43 === 'cash_per_contract').in_44, 2);
   assert.equal(out.commission_restored, true);
 });
+
+test('run_ids: un input_set per NOME (com e copiato dal padre) viene tradotto in id, non rifiutato', async () => {
+  const PER_NOME = { ...RUN_2, input_set: { 'Risk/Reward': 4 } };
+  const { deps, seen, finalized } = makeCostDeps({
+    runsById: { 1704: PER_NOME }, parent: PADRE,
+    commissione: (a) => ({ success: true, commission_paid: a.in_44 * 40, filled_qty_sum: 40, fills: 40 }),
+    metricsSeq: [M({ net_profit: 50 }), M({ net_profit: 20 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.executed, 1, JSON.stringify(out.rows));
+  assert.equal(finalized.length, 1);
+  const set = seen.setInputs.find((x) => 'in_44' in x);
+  assert.equal(set.in_0, 4, 'il nome "Risk/Reward" deve diventare in_0');
+  assert.equal('Risk/Reward' in set, false, 'nessun nome deve arrivare a setInputs');
+});
+
+test('run_ids: un nome che la strategia viva non ha ferma il giro con version_mismatch', async () => {
+  const IGNOTO = { ...RUN_2, input_set: { 'Filtro che non esiste': 1 } };
+  const { deps, seen } = makeCostDeps({
+    runsById: { 1704: IGNOTO }, parent: PADRE,
+    commissione: () => { throw new Error('non si deve arrivare a leggere la commissione'); },
+    metricsSeq: [M(), M({ net_profit: 9 })],
+  });
+  const out = await grindSession({ session_id: 68, run_ids: [1704], entity_id: 'ent-1' }, deps);
+  assert.equal(out.executed, 0);
+  assert.equal(out.stopped_reason.kind, 'version_mismatch');
+  assert.match(seen.failed.find((f) => f.id === 1704).err, /Filtro che non esiste/);
+});

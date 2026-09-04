@@ -34,7 +34,7 @@ import {
   readbackMatches,
 } from './btChart.js';
 import { buildInputsPayload } from './btInputs.js';
-import { resolveCommissionIds, checkImpliedRate, checkControlRun, resolveStrategyEntity } from './btCost.js';
+import { resolveCommissionIds, checkImpliedRate, checkControlRun, resolveStrategyEntity, resolveInputKeys } from './btCost.js';
 import { toFinalizePayload, fingerprint, detectAnomaly } from './btMetrics.js';
 
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -630,7 +630,27 @@ export async function grindSession(opts, deps = {}) {
           [idsCommissione.valueId]: Number(costo.commission_per_contract) || 0,
         };
       }
-      const richiesti = { ...requested, ...inputsCosto };
+      // ⛔ L'input_set di una variante e' per NOME, non per id ⛔
+      // Il server lo copia dagli `inputs` del padre, che sono il dizionario per nome che si legge in
+      // piattaforma; `setInputs` invece indirizza per id esatto. Senza questa traduzione li rifiuta
+      // TUTTI: misurato il 2026-09-04 sul #1056, 76 nomi in `inputs_not_applied` e zero varianti.
+      // E' lo stesso inciampo che ha rotto la sessione 66 (btInputs.js): la configurazione si
+      // TRADUCE sulla mappa viva, non si spedisce com'e'. Le run ordinarie non passano di qui.
+      let requestedRisolti = requested;
+      if (costo && Object.keys(requested).length) {
+        const tradotti = resolveInputKeys(info, requested);
+        if (tradotti.unresolved.length) {
+          const detail = `input del padre assenti sulla strategia viva: ${tradotti.unresolved.slice(0, 12).join(', ')}${tradotti.unresolved.length > 12 ? ` (+${tradotti.unresolved.length - 12})` : ''} — versione diversa?`;
+          await api.markFailed(run.id, `version_mismatch: ${detail}`);
+          failed++;
+          rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: `version_mismatch: ${detail}`.slice(0, 300), commission_per_lot: Number(costo.commission_per_lot ?? 0) });
+          stopped_reason = { kind: 'version_mismatch', detail, run_id: run.id, label: run.label ?? null };
+          await api.progress(command_id, `⛔ run ${run.id}: version_mismatch — mi fermo`);
+          break;
+        }
+        requestedRisolti = tradotti.resolved;
+      }
+      const richiesti = { ...requestedRisolti, ...inputsCosto };
 
       // Gli input erano GIA' quelli richiesti? Succede regolarmente: la prima run di una matrice e'
       // quasi sempre la configurazione di default, cioe' quella gia' sul chart. In quel caso non
