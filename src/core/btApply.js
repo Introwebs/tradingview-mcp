@@ -219,6 +219,30 @@ export async function applyBacktest(opts, deps = {}) {
       avviso = 'metriche identiche alla configurazione precedente (report dichiarato attuale)';
     }
   }
+  // ⛔ IL REPORT DEVE ESSERE ATTUALE QUANDO LO LEGGO, NON PRIMA ⛔
+  // Il banner «Il report e' obsoleto» compare ~200 ms dopo il cambio, ma non e' un istante preciso:
+  // con un periodo di test personalizzato puo' arrivare DOPO che il ricalcolo sembrava finito. La
+  // prima attesa lo ha gia' cercato una volta e, non trovandolo ancora, ha dichiarato il report
+  // attuale in buona fede. Si guarda un'ultima volta, qui, con le metriche in mano: se il banner
+  // c'e' si preme e si rilegge, altrimenti si consegnerebbero i numeri di prima con l'etichetta di
+  // adesso — e all'utente resta il pannello che dice "obsoleto" su un comando riuscito.
+  // Misurato il 2026-09-04 sul #1009: periodo e input applicati, banner mai premuto.
+  const ultimoGiro = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+  if (ultimoGiro.click > 0) {
+    await nota(`report tornato obsoleto → premuto "Aggiorna report"${ultimoGiro.click > 1 ? ` (${ultimoGiro.click}x)` : ''}`);
+    const fpPrima = results?.metrics ? fingerprint(results.metrics) : null;
+    const { results: dopoClick } = await waitForRecalc(entity_id, fpPrima, {
+      readReport: leggi, readLoading: readStrategyLoading, sleep, timeoutMs: recalc_timeout_ms,
+    });
+    if (dopoClick?.success !== false && Object.keys(dopoClick?.metrics || {}).length) {
+      // Se i numeri si sono mossi, qualunque conclusione tratta prima del click era prematura:
+      // l'avviso lo dice, e sostituisce quello precedente invece di accodarsi.
+      const cambiato = fingerprint(dopoClick.metrics) !== fpPrima;
+      results = dopoClick;
+      if (cambiato) avviso = 'report aggiornato al secondo giro: il banner e comparso dopo il primo ricalcolo';
+    }
+  }
+
   if (!results || results.success === false) {
     return fail('metrics_unreadable', results?.error || 'metriche non leggibili', appliedSoFar());
   }

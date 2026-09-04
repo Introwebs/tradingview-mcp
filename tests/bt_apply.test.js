@@ -22,6 +22,7 @@ function makeDeps({ bt = BT, studies = [{ id: 'ent-1', name: 'Index Grow Test Cl
   let applied = { in_0: 1, in_1: '', in_40: 10000, in_44: 0.5 };
   const seen = { setInputs: [], progress: [], periodi: [] };
   let loading = false;
+  let bannerVisto = 0;
   return {
     seen, chart, applied: () => applied,
     deps: {
@@ -35,7 +36,9 @@ function makeDeps({ bt = BT, studies = [{ id: 'ent-1', name: 'Index Grow Test Cl
       ensureTesterPanel: async () => ({ ok: true }),
       readTestPeriod: async () => ({ ...chart.periodo }),
       setCustomPeriod: async (from, to) => { seen.periodi.push([from, to]); chart.periodo = { label: `${from} — ${to}`, from, to }; return { applied: true, ...chart.periodo }; },
-      attendiReportAggiornato: async () => ({ aggiornato: true, click: 1 }),
+      // Il banner si preme UNA volta e poi non c'e' piu': e' cosi' che si comporta TradingView.
+      // Un finto che lo dichiara presente a ogni chiamata farebbe credere a un ricalcolo infinito.
+      attendiReportAggiornato: async () => { bannerVisto += 1; return { aggiornato: true, click: bannerVisto === 1 ? 1 : 0 }; },
       aggiornaReportSeObsoleto: async () => ({ cliccato: false }),
       readStrategyLoading: async () => { const l = loading; loading = false; return l; },
       // Lo stato dello studio: sano per default, come ogni altra dep di questo harness. Senza
@@ -296,4 +299,27 @@ test('pannello non apribile: si ferma con panel_not_open, senza toccare gli inpu
   assert.equal(out.error.kind, 'panel_not_open');
   assert.match(out.error.detail, /Aprilo su TradingView/);
   assert.equal(seen.setInputs.length, 0);
+});
+
+// Il banner puo' comparire DOPO che il ricalcolo sembrava finito: con un periodo personalizzato
+// e' quello che succede. Se non lo si guarda un'ultima volta, il comando consegna i numeri di
+// prima e all'utente resta il pannello che dice "obsoleto". #1009, 2026-09-04.
+test('se il report torna obsoleto a ricalcolo finito, si preme e si rilegge', async () => {
+  const { deps, seen } = makeDeps();
+  let giro = 0;
+  let vecchie = true;
+  deps.attendiReportAggiornato = async () => {
+    giro += 1;
+    if (giro === 1) return { aggiornato: true, click: 0 };   // il banner non e' ancora comparso
+    vecchie = false;                                          // premuto al secondo giro
+    return { aggiornato: true, click: 1 };
+  };
+  deps.readReportFor = async () => ({ success: true, metrics: vecchie ? { total_trades: 3, net_profit: 1 } : { total_trades: 10, net_profit: 1234.5 } });
+  deps.readPanelMetrics = deps.readReportFor;
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.metrics.total_trades, 10, 'devono essere le metriche DOPO il click, non quelle prima');
+  assert.equal(out.vs_backtest.total_trades_delta, 0);
+  assert.match(out.warning, /secondo giro/);
+  assert.ok(seen.progress.some((p) => /Aggiorna report/.test(p)), seen.progress.join('|'));
 });
