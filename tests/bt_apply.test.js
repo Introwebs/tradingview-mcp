@@ -261,3 +261,14 @@ test('lo stato illeggibile non inventa un guasto: si prosegue', async () => {
   const out = await applyBacktest({ backtest_id: 1056 }, deps);
   assert.equal(out.ok, true);
 });
+
+// Il caso del #1050: il dizionario per nome porta `TF:` a null. Scriverlo rompeva la strategia.
+test('un valore null del backtest non si scrive, si segnala', async () => {
+  const bt = { ...BT, inputs: { 'Risk/Reward': 2, 'TF:': null } };
+  const { deps, seen } = makeDeps({ bt });
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal('in_1' in seen.setInputs[0], false, 'il null non deve arrivare al chart');
+  assert.deepEqual(out.null_skipped, ['TF:']);
+  assert.equal(out.applied.inputs, 1);
+});

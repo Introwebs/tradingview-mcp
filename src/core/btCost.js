@@ -108,16 +108,23 @@ export function resolveInputKeys(info, inputs) {
   const resolved = {};
   const unresolved = [];
   const ignored = [];
+  const skippedNull = [];
   for (const [key, raw] of Object.entries(inputs || {})) {
     const value = raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
     if (SYSTEM_IDS.has(key)) { ignored.push(key); continue; }
-    if (raw && typeof raw === 'object' && 'value' in raw && value === null) continue;
+    // ⛔ UN NULL NON SI SCRIVE MAI ⛔
+    // `null` vuol dire "non misurato", non "mettilo a niente". Su un input `resolution` scrivere
+    // null ROMPE lo studio: TradingView dice "Can't parse pine" e da quel momento non produce piu'
+    // report. Misurato il 2026-09-04 sul #1050 (`TF:` = null nel dizionario per nome) e gia' visto
+    // nella sessione 66. Il caso wrapped (`{value: null}` dell'archivio) era gia' saltato; quello
+    // nudo del dizionario per nome no, ed e' esattamente quello che e' arrivato al chart.
+    if (value === null || value === undefined) { skippedNull.push(key); continue; }
     const homonym = HOMONYM_RE.exec(key);
     const item = byId.get(key) || (homonym && byId.get(homonym[2])) || byName.get(String(key).trim());
     if (!item) { unresolved.push(key); continue; }
     resolved[item.id] = value;
   }
-  return { resolved, unresolved, ignored };
+  return { resolved, unresolved, ignored, skippedNull };
 }
 
 /**

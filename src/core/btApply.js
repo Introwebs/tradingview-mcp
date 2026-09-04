@@ -65,6 +65,7 @@ function inputsDaReplicare(bt, info) {
     resolved: { ...logica.resolved, ...props.resolved },
     unresolved: logica.unresolved,
     properties_skipped: props.unresolved,
+    null_skipped: [...logica.skippedNull, ...props.skippedNull],
     inputs: Object.keys(logica.resolved).length,
     properties: Object.keys(props.resolved).length,
   };
@@ -243,6 +244,8 @@ export async function applyBacktest(opts, deps = {}) {
       inputs: piano.inputs, properties: piano.properties,
     },
     ...(piano.properties_skipped.length && { properties_skipped: piano.properties_skipped }),
+    // Un valore mai misurato non si scrive, ma va detto: e' una differenza fra il chart e il backtest.
+    ...(piano.null_skipped?.length && { null_skipped: piano.null_skipped }),
     ...(avviso && { warning: avviso }),
     mismatches, metrics, vs_backtest,
     metrics_source: results.source || null,

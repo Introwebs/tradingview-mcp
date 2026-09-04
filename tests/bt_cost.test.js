@@ -154,3 +154,21 @@ test('checkControlRun distingue ancora un padre davvero assente da uno a zero', 
   const zero = checkControlRun({ variant: { total_trades: 0, net_profit: 0, commission_paid: 0 }, parent: { total_trades: '0', net_profit: '0.0000' } });
   assert.equal(zero.ok, true, 'un padre a zero e un dato, non un dato mancante');
 });
+
+// ⛔ Un null non si scrive mai: vuol dire "non misurato", non "mettilo a niente".
+// Su un input `resolution` scriverlo rompe lo studio ("Can't parse pine") — #1050, 2026-09-04.
+test('resolveInputKeys non scrive mai un null, ne nudo ne incartato, e li elenca', () => {
+  const r = resolveInputKeys(INFO, { 'TF:': null, 'Risk/Reward': 2, 'Initial Capital': undefined });
+  assert.deepEqual(r.resolved, { in_0: 2 });
+  assert.deepEqual(r.skippedNull.sort(), ['Initial Capital', 'TF:']);
+  assert.deepEqual(r.unresolved, []);
+  const arch = resolveInputKeys(INFO, { in_1: { value: null, block: 'logic' }, in_0: { value: 3, block: 'logic' } });
+  assert.deepEqual(arch.resolved, { in_0: 3 });
+  assert.deepEqual(arch.skippedNull, ['in_1']);
+});
+
+test('la stringa vuota invece si scrive: e un valore, non un assenza', () => {
+  const r = resolveInputKeys(INFO, { 'TF:': '' });
+  assert.deepEqual(r.resolved, { in_1: '' });
+  assert.deepEqual(r.skippedNull, []);
+});
