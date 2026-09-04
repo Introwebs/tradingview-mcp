@@ -50,18 +50,22 @@ export function checkControlRun({ variant, parent, tolerance = 0.001 }) {
   }
   if (paid !== 0) return { ok: false, kind: 'mismatch', detail: `commissioni pagate ${fmtNum(paid)} sul run di controllo (attese 0)` };
 
-  const tpRaw = parent?.total_trades;
-  const npRaw = parent?.net_profit;
-  if (typeof tpRaw !== 'number' || !Number.isFinite(tpRaw) || typeof npRaw !== 'number' || !Number.isFinite(npRaw)) {
-    return { ok: false, kind: 'unverifiable', detail: 'padre non leggibile (total_trades/net_profit assenti): controllo non verificabile' };
+  // ⚠️ Il padre arriva dall'API, e li' i decimali sono STRINGHE: `net_profit` e' "4061.6300", non
+  // 4061.63 (cast decimal di Laravel). Un `typeof === 'number'` secco su questi campi legge come
+  // "padre assente" un padre perfettamente leggibile — misurato il 2026-09-04 sul #1056, il run di
+  // controllo dichiarato non verificabile con tutti i dati sotto il naso. Si converte, e si chiama
+  // assente solo cio' che non e' un numero nemmeno dopo la conversione.
+  const tp = numeroLeggibile(parent?.total_trades);
+  const np = numeroLeggibile(parent?.net_profit);
+  if (tp === null || np === null) {
+    const mancanti = [tp === null ? 'total_trades' : null, np === null ? 'net_profit' : null].filter(Boolean).join(' e ');
+    return { ok: false, kind: 'unverifiable', detail: `padre non leggibile (${mancanti} non numerici): controllo non verificabile` };
   }
 
   const tv = Math.round(Number(variant?.total_trades) || 0);
-  const tp = Math.round(tpRaw);
-  if (tv !== tp) return { ok: false, kind: 'mismatch', detail: `${tv} trade contro ${tp} del padre` };
+  if (tv !== Math.round(tp)) return { ok: false, kind: 'mismatch', detail: `${tv} trade contro ${Math.round(tp)} del padre` };
 
   const nv = Number(variant?.net_profit) || 0;
-  const np = npRaw;
   const diff = np === 0 ? Math.abs(nv - np) : Math.abs(nv - np) / Math.abs(np);
   if (diff > tolerance) {
     return { ok: false, kind: 'mismatch', detail: `net ${fmtNum(nv)} contro ${fmtNum(np)} del padre (oltre lo ${fmtPct(tolerance)}%)` };
@@ -114,6 +118,17 @@ export function resolveInputKeys(info, inputs) {
     resolved[item.id] = value;
   }
   return { resolved, unresolved, ignored };
+}
+
+/**
+ * Il numero che c'e' davvero, o null. Accetta le stringhe numeriche dell'API (i decimali di Laravel
+ * viaggiano come "4061.6300"); rifiuta null, undefined, stringa vuota, booleani e qualunque cosa non
+ * si converta. "Assente" e "zero" restano distinguibili, che e' tutto il punto.
+ */
+function numeroLeggibile(v) {
+  if (v === null || v === undefined || v === '' || typeof v === 'boolean') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 function fmtNum(n) {

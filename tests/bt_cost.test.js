@@ -132,3 +132,25 @@ test('resolveInputKeys da applied_inputs (id -> {value, block}) salta i value nu
   assert.deepEqual(r.resolved, { in_0: 3 });
   assert.deepEqual(r.unresolved, []);
 });
+
+// ⚠️ I decimali dell'API Pine Algos viaggiano come STRINGHE (cast decimal di Laravel):
+// `net_profit` e' "4061.6300". Un padre cosi' e' leggibilissimo e va confrontato, non scartato.
+test('checkControlRun accetta il padre come arriva dall API, coi decimali in stringa', () => {
+  const parent = { total_trades: 10, net_profit: '4061.6300' };
+  const ok = checkControlRun({ variant: { total_trades: 10, net_profit: 4061.63, commission_paid: 0 }, parent });
+  assert.equal(ok.ok, true, ok.detail);
+  const ko = checkControlRun({ variant: { total_trades: 10, net_profit: 4500, commission_paid: 0 }, parent });
+  assert.equal(ko.ok, false);
+  assert.equal(ko.kind, 'mismatch');
+  assert.match(ko.detail, /contro 4061.63 del padre/);
+});
+
+test('checkControlRun distingue ancora un padre davvero assente da uno a zero', () => {
+  const assente = checkControlRun({ variant: { total_trades: 0, net_profit: 0, commission_paid: 0 }, parent: { total_trades: 10 } });
+  assert.equal(assente.kind, 'unverifiable');
+  assert.match(assente.detail, /net_profit/);
+  const vuoto = checkControlRun({ variant: { total_trades: 0, net_profit: 0, commission_paid: 0 }, parent: { total_trades: 10, net_profit: '' } });
+  assert.equal(vuoto.kind, 'unverifiable');
+  const zero = checkControlRun({ variant: { total_trades: 0, net_profit: 0, commission_paid: 0 }, parent: { total_trades: '0', net_profit: '0.0000' } });
+  assert.equal(zero.ok, true, 'un padre a zero e un dato, non un dato mancante');
+});
