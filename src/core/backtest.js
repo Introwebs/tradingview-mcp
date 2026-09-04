@@ -44,7 +44,7 @@ const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * Un report senza metriche non e' una baseline: e' l'ASSENZA di una baseline, e le due cose vanno
  * tenute distinguibili (vedi il commento su `prevFp` in grindSession).
  */
-function fpNotoO(fallback, metrics) {
+export function fpNotoO(fallback, metrics) {
   return metrics && Object.keys(metrics).length ? fingerprint(metrics) : fallback;
 }
 
@@ -253,7 +253,7 @@ export async function applicaContestoRun(run, ctx) {
 // 15 x 1,5 s = 22 s di margine. Il ricalcolo del report, una volta innescato con "Aggiorna report",
 // ha impiegato 10,6 s su un anno di M5 con 200 trade (misurato). I 4,8 s della prima stesura erano
 // una scommessa, non una misura.
-async function rileggiFinoACambio(entityId, prevFp, {
+export async function rileggiFinoACambio(entityId, prevFp, {
   leggiMetriche, periodoRistretto, sleep, aggiornaReport = null, tentativi = 15, attesaMs = 1500,
 }) {
   let ultimo = null;

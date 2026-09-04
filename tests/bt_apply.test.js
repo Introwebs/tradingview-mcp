@@ -36,6 +36,7 @@ function makeDeps({ bt = BT, studies = [{ id: 'ent-1', name: 'Index Grow Test Cl
       readTestPeriod: async () => ({ ...chart.periodo }),
       setCustomPeriod: async (from, to) => { seen.periodi.push([from, to]); chart.periodo = { label: `${from} — ${to}`, from, to }; return { applied: true, ...chart.periodo }; },
       attendiReportAggiornato: async () => ({ aggiornato: true, click: 1 }),
+      aggiornaReportSeObsoleto: async () => ({ cliccato: false }),
       readStrategyLoading: async () => { const l = loading; loading = false; return l; },
       readReportFor: async () => ({ success: true, metrics }),
       readPanelMetrics: async () => ({ success: true, metrics }),
@@ -141,4 +142,83 @@ test('backtest inesistente → backtest_not_found', async () => {
   const out = await applyBacktest({ backtest_id: 1 }, deps);
   assert.equal(out.ok, false);
   assert.equal(out.error.kind, 'backtest_not_found');
+});
+
+// ---- Pannello in ritardo: la difesa e' la baseline prima del set + la rilettura su identita' ----
+
+const OLD = { total_trades: 10, net_profit: 100 };
+const NEW = { total_trades: 50, net_profit: 500 };
+
+/** Pannello che mostra i numeri VECCHI per le prime `lag` letture dopo il set, poi i nuovi (mai, se lag=Infinity). */
+function pannelloInRitardo(h, { lag }) {
+  let dopoSet = false;
+  let letture = 0;
+  const leggi = async () => {
+    if (!dopoSet) return { success: true, metrics: OLD };
+    letture += 1;
+    return { success: true, metrics: letture > lag ? NEW : OLD };
+  };
+  const setInputsOrig = h.deps.setInputs;
+  h.deps.setInputs = async (a) => { const r = await setInputsOrig(a); dopoSet = true; return r; };
+  h.deps.readReportFor = leggi;
+  h.deps.readPanelMetrics = leggi;
+  return { letture: () => letture };
+}
+
+test('pannello in ritardo di 6 letture, banner sparito → la rilettura aggancia le metriche nuove', async () => {
+  const h = makeDeps();
+  pannelloInRitardo(h, { lag: 6 });
+  const out = await applyBacktest({ backtest_id: 1056 }, h.deps);
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.metrics.total_trades, 50);
+  assert.match(out.warning, /pannello in ritardo/);
+});
+
+test('pannello fermo sui numeri vecchi e banner ancora su → stale_metrics con applied_so_far', async () => {
+  const h = makeDeps();
+  pannelloInRitardo(h, { lag: Infinity });
+  h.deps.attendiReportAggiornato = async () => ({ aggiornato: false, click: 2 });
+  const out = await applyBacktest({ backtest_id: 1056 }, h.deps);
+  assert.equal(out.ok, false);
+  assert.equal(out.error.kind, 'stale_metrics');
+  assert.equal(out.applied_so_far.inputs_set, true);
+  assert.equal(out.applied_so_far.symbol, 'TVC:NDQ');
+  assert.equal(out.applied_so_far.period, '2025-09-03 — 2026-09-03');
+});
+
+test('chart gia sui valori del backtest e metriche ferme → ok, nessuna accusa di stale', async () => {
+  const h = makeDeps();
+  const gia = { in_0: 2, in_1: '60', in_40: 100000, in_44: 0 };
+  h.deps.readInputValues = async () => ({ ...gia });
+  const out = await applyBacktest({ backtest_id: 1056 }, h.deps);
+  assert.equal(out.ok, true, JSON.stringify(out));
+  assert.equal(out.warning, undefined);
+  assert.deepEqual(out.mismatches, []);
+});
+
+test('periodo ristretto e pannello illeggibile → metrics_unreadable con applied_so_far', async () => {
+  const h = makeDeps();
+  h.deps.readPanelMetrics = async () => ({ success: false, retryable: true, error: 'pannello illeggibile' });
+  // sleep e' stub: il timeout va tenuto corto, altrimenti la fase di stabilita' gira a vuoto 45 s.
+  const out = await applyBacktest({ backtest_id: 1056, recalc_timeout_ms: 50 }, h.deps);
+  assert.equal(out.ok, false);
+  assert.equal(out.error.kind, 'metrics_unreadable');
+  assert.match(out.error.detail, /pannello illeggibile/);
+  assert.equal(out.applied_so_far.inputs_set, true);
+});
+
+test('fallimento di contesto dopo aver toccato il chart → applied_so_far con inputs_set:false', async () => {
+  const { deps } = makeDeps();
+  deps.setCustomPeriod = async () => ({ applied: false, error: 'voce non trovata', from: null, to: null, label: null });
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.error.kind, 'period_not_applied');
+  assert.deepEqual(out.applied_so_far, { symbol: 'TVC:NDQ', timeframe: '15', period: null, inputs_set: false });
+});
+
+test('applied_inputs: la Proprieta saltata si riporta per nome, non per id', async () => {
+  const bt = { ...BT, applied_inputs: { in_0: { name: 'Risk/Reward', value: 3, type: 'float', block: 'logic' }, in_99: { name: 'Use Bar Magnifier', value: false, type: 'bool', block: 'property' } } };
+  const { deps } = makeDeps({ bt });
+  const out = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(out.ok, true);
+  assert.deepEqual(out.properties_skipped, ['Use Bar Magnifier']);
 });
