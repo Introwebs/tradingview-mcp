@@ -109,6 +109,7 @@ export function resolveInputKeys(info, inputs) {
   const unresolved = [];
   const ignored = [];
   const skippedNull = [];
+  const skippedColor = [];
   for (const [key, raw] of Object.entries(inputs || {})) {
     const value = raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
     if (SYSTEM_IDS.has(key)) { ignored.push(key); continue; }
@@ -122,9 +123,16 @@ export function resolveInputKeys(info, inputs) {
     const homonym = HOMONYM_RE.exec(key);
     const item = byId.get(key) || (homonym && byId.get(homonym[2])) || byName.get(String(key).trim());
     if (!item) { unresolved.push(key); continue; }
+    // ⛔ UN COLORE NON SI RISCRIVE MAI ⛔
+    // getInputValues() li esporta come numeri impacchettati (0xAABBGGRR), l'input li vuole come
+    // "#RRGGBB". Il numero archiviato, riscritto com'e', rompe la preparazione degli input di
+    // TradingView (`e.toLowerCase is not a function`): getInputValues() torna vuoto e la strategia
+    // finisce in «Calculation failed». Misurato dal vivo il 2026-09-21 sulla VWAP New York 1m
+    // Reversal (#1306): sei comandi falliti di fila. Un colore non sposta un trade: si salta.
+    if (item.type === 'color') { skippedColor.push(key); continue; }
     resolved[item.id] = value;
   }
-  return { resolved, unresolved, ignored, skippedNull };
+  return { resolved, unresolved, ignored, skippedNull, skippedColor };
 }
 
 /**

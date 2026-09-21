@@ -22,7 +22,7 @@ import {
 import {
   readInputsInfo as realReadInputsInfo, readInputValues as realReadInputValues,
   readReportFor as realReadReportFor, readStrategyLoading as realReadStrategyLoading,
-  readStudyStatus as realReadStudyStatus,
+  readStudyStatus as realReadStudyStatus, ensureVisibleFor as realEnsureVisibleFor,
 } from './btChart.js';
 import {
   waitForRecalc, applicaContestoRun, leggiMetricheEffettive, giornoISO, rileggiFinoACambio, fpNotoO,
@@ -33,6 +33,10 @@ import { fingerprint } from './btMetrics.js';
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const fail = (kind, detail, extra = {}) => ({ ok: false, error: { kind, detail }, ...extra });
+
+const INPUT_ILLEGGIBILI = "TradingView non riesce piu' a leggere gli input della strategia: lo studio e' compromesso "
+  + "(di solito da un valore di tipo sbagliato, es. un colore scritto come numero) e i suoi numeri non valgono. "
+  + 'Rimuovi la strategia dal chart e rimettila, poi rilancia.';
 
 /**
  * Cosa scrivere sulla strategia viva. Preferisce l'archivio per id (`applied_inputs`, dal
@@ -51,6 +55,7 @@ function inputsDaReplicare(bt, info) {
     const rl = resolveInputKeys(info, logica);
     const rp = resolveInputKeys(info, proprieta);
     return {
+      colors_skipped: [...rl.skippedColor, ...rp.skippedColor].map((id) => archivio[id]?.name || id),
       resolved: { ...rl.resolved, ...rp.resolved },
       unresolved: rl.unresolved,
       // Per nome, come nel ramo per nome: un id `in_K` orfano non dice niente a chi legge.
@@ -62,6 +67,7 @@ function inputsDaReplicare(bt, info) {
   const logica = resolveInputKeys(info, bt.inputs || {});
   const props = resolveInputKeys(info, bt.extra_metrics?.properties || {});
   return {
+    colors_skipped: [...logica.skippedColor, ...props.skippedColor],
     resolved: { ...logica.resolved, ...props.resolved },
     unresolved: logica.unresolved,
     properties_skipped: props.unresolved,
@@ -110,7 +116,7 @@ export async function applyBacktest(opts, deps = {}) {
     attendiReportAggiornato = realAttendiReport, aggiornaReportSeObsoleto = realAggiornaReportSeObsoleto,
     readStrategyLoading = realReadStrategyLoading,
     readReportFor = realReadReportFor, readPanelMetrics = realReadPanelMetrics,
-    readStudyStatus = realReadStudyStatus, sleep = realSleep,
+    readStudyStatus = realReadStudyStatus, ensureVisibleFor = realEnsureVisibleFor, sleep = realSleep,
   } = deps;
   if (!backtest_id) throw new Error('backtest_id è obbligatorio');
   if (!api || typeof api.getBacktest !== 'function') throw new Error('deps.api.getBacktest è obbligatorio');
@@ -130,6 +136,26 @@ export async function applyBacktest(opts, deps = {}) {
   if (piano.unresolved.length) {
     return fail('version_mismatch', `input del backtest assenti sulla strategia viva: ${piano.unresolved.join(', ')} — versione diversa?`);
   }
+
+  // ⛔ INPUT ILLEGGIBILI = STRATEGIA GIA' ROTTA ⛔
+  // getInputsInfo() elenca gli input anche quando TradingView non riesce piu' a prepararne i
+  // valori; getInputValues() allora torna vuoto e ogni rilettura darebbe `null`. Non e' "input non
+  // applicati": e' uno studio compromesso (sul #1306 da un colore scritto come numero), e scriverci
+  // sopra non lo ripara. Ci si ferma prima di toccare il chart.
+  if (!Object.keys(await readInputValues(entity_id)).length) {
+    return fail('inputs_unreadable', INPUT_ILLEGGIBILI);
+  }
+
+  // ⛔ UNA STRATEGIA NASCOSTA NON HA REPORT ⛔
+  // TradingView non calcola il report di una strategia invisibile: il pannello mostra «Aggiungi
+  // la strategia a questo grafico», il pulsante del periodo non c'e' e le metriche sono vuote. Il
+  // grind la accende da sempre (ensureVisibleFor); qui mancava, ed e' stato scambiato per un
+  // pannello chiuso (2026-09-21, #1306). Resta accesa: il chart ora mostra quel backtest.
+  const vis = await ensureVisibleFor(entity_id);
+  if (vis && vis.visible === false) {
+    return fail('strategy_hidden', `la strategia "${bt.strategy_name}" e' nascosta sul chart e non si riesce a renderla visibile: accendila (icona dell'occhio) e rilancia.`);
+  }
+  if (vis?.wasHidden) await nota('strategia nascosta sul chart → resa visibile (senza, TradingView non calcola il report)');
 
   // Da qui in poi il chart viene toccato: ogni fallimento riporta cosa e' gia' stato applicato.
   let periodo = null;
@@ -248,6 +274,7 @@ export async function applyBacktest(opts, deps = {}) {
   }
 
   const actual = await readInputValues(entity_id);
+  if (!Object.keys(actual).length) return fail('inputs_unreadable', INPUT_ILLEGGIBILI, appliedSoFar());
   const byId = new Map(info.map((i) => [i.id, i]));
   const mismatches = [];
   for (const [id, expected] of Object.entries(piano.resolved)) {
@@ -282,6 +309,10 @@ export async function applyBacktest(opts, deps = {}) {
     ...(piano.properties_skipped.length && { properties_skipped: piano.properties_skipped }),
     // Un valore mai misurato non si scrive, ma va detto: e' una differenza fra il chart e il backtest.
     ...(piano.null_skipped?.length && { null_skipped: piano.null_skipped }),
+    // I colori non si scrivono (vedi resolveInputKeys): si dice quali, perche' il chart li mostra
+    // con i propri, ma non sono una differenza di risultato.
+    ...(piano.colors_skipped?.length && { colors_skipped: piano.colors_skipped }),
+    ...(vis?.wasHidden && { made_visible: true }),
     ...(avviso && { warning: avviso }),
     mismatches, metrics, vs_backtest,
     metrics_source: results.source || null,

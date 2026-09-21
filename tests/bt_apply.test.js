@@ -45,6 +45,8 @@ function makeDeps({ bt = BT, studies = [{ id: 'ent-1', name: 'Index Grow Test Cl
       // questo stub la guardia chiamerebbe la dep VERA e il test proverebbe a connettersi a
       // TradingView. Chi vuole lo studio rotto lo sovrascrive.
       readStudyStatus: async () => ({ ok: true, type: 0, error: null }),
+      // Strategia gia' visibile per default: la dep vera si collegherebbe a TradingView.
+      ensureVisibleFor: async () => ({ found: true, wasHidden: false, visible: true }),
       readReportFor: async () => ({ success: true, metrics }),
       readPanelMetrics: async () => ({ success: true, metrics }),
       sleep: async () => {},
@@ -322,4 +324,68 @@ test('se il report torna obsoleto a ricalcolo finito, si preme e si rilegge', as
   assert.equal(out.vs_backtest.total_trades_delta, 0);
   assert.match(out.warning, /secondo giro/);
   assert.ok(seen.progress.some((p) => /Aggiorna report/.test(p)), seen.progress.join('|'));
+});
+
+// ── colori, input illeggibili, strategia nascosta (2026-09-21, VWAP Reversal #1306) ──────────
+
+test('gli input colore del backtest non si scrivono mai sul chart', async () => {
+  const bt = {
+    ...BT,
+    applied_inputs: {
+      in_0: { value: 2, type: 'float', block: 'logic', name: 'Risk/Reward' },
+      in_9: { value: 4285267791, type: 'color', block: 'logic', name: 'VWAP con prezzo sopra' },
+    },
+  };
+  const { deps, seen } = makeDeps({ bt });
+  deps.readInputsInfo = async () => [...INFO, { id: 'in_9', name: 'VWAP con prezzo sopra', type: 'color', group: 'Grafica' }];
+  const r = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(r.ok, true);
+  assert.ok(seen.setInputs.every((s) => !('in_9' in s)), 'un colore e arrivato a setInputs');
+  assert.deepEqual(r.colors_skipped, ['VWAP con prezzo sopra']);
+  assert.deepEqual(r.mismatches, []);
+});
+
+test('strategia con input gia illeggibili prima di toccarla → inputs_unreadable, e NON si scrive niente', async () => {
+  const { deps, seen } = makeDeps();
+  deps.readInputValues = async () => ({});
+  const r = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.kind, 'inputs_unreadable');
+  assert.match(r.error.detail, /rimuovi/i);
+  assert.equal(seen.setInputs.length, 0);
+});
+
+test('input illeggibili DOPO il set → inputs_unreadable, non "N input non confermati"', async () => {
+  const { deps } = makeDeps();
+  let dopoIlSet = false;
+  const set = deps.setInputs;
+  deps.setInputs = async (a) => { dopoIlSet = true; return set(a); };
+  const leggi = deps.readInputValues;
+  deps.readInputValues = async () => (dopoIlSet ? {} : leggi());
+  const r = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.kind, 'inputs_unreadable');
+  assert.equal(r.applied_so_far.inputs_set, true);
+});
+
+test('strategia nascosta: si rende visibile prima di tutto, come fa il grind', async () => {
+  const { deps, seen } = makeDeps();
+  const ordine = [];
+  deps.ensureVisibleFor = async (id) => { ordine.push(`visible:${id}`); return { found: true, wasHidden: true, visible: true }; };
+  const pannello = deps.ensureTesterPanel;
+  deps.ensureTesterPanel = async () => { ordine.push('panel'); return pannello(); };
+  const r = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(r.ok, true);
+  assert.deepEqual(ordine.slice(0, 2), ['visible:ent-1', 'panel']);
+  assert.equal(r.made_visible, true);
+  assert.ok(seen.progress.some((m) => /nascosta/.test(m)));
+});
+
+test('strategia che non si riesce a rendere visibile → strategy_hidden, senza toccare niente', async () => {
+  const { deps, seen } = makeDeps();
+  deps.ensureVisibleFor = async () => ({ found: true, wasHidden: true, visible: false });
+  const r = await applyBacktest({ backtest_id: 1056 }, deps);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.kind, 'strategy_hidden');
+  assert.equal(seen.setInputs.length, 0);
 });

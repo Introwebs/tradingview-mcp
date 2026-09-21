@@ -172,3 +172,23 @@ test('la stringa vuota invece si scrive: e un valore, non un assenza', () => {
   assert.deepEqual(r.resolved, { in_1: '' });
   assert.deepEqual(r.skippedNull, []);
 });
+
+// ⛔ Un colore non si riscrive mai. getInputValues() li esporta come numeri impacchettati
+// (0xAABBGGRR), ma l'input li vuole come "#RRGGBB": riscritto cosi' com'e' archiviato, il numero
+// rompe la preparazione degli input di TradingView (`e.toLowerCase is not a function`),
+// getInputValues() torna vuoto e la strategia finisce in «Calculation failed». Misurato dal vivo
+// il 2026-09-21 sulla VWAP New York 1m Reversal (backtest #1306): 6 colori, 6 comandi falliti.
+// Non cambiano un solo trade, quindi saltarli non toglie niente alla replica.
+test('resolveInputKeys: gli input colore si saltano, per id e per nome, e si riportano a parte', () => {
+  const info = [
+    { id: 'in_0', name: 'Risk/Reward', type: 'float', group: 'Ingressi' },
+    { id: 'in_16', name: 'VWAP con prezzo sopra', type: 'color', group: 'Grafica' },
+    { id: 'in_17', name: 'VWAP con prezzo sotto', type: 'color', group: 'Grafica' },
+  ];
+  const r = resolveInputKeys(info, {
+    in_0: 2, in_16: { value: 4285267791, type: 'color' }, 'VWAP con prezzo sotto': 4282726130,
+  });
+  assert.deepEqual(r.resolved, { in_0: 2 });
+  assert.deepEqual(r.skippedColor, ['in_16', 'VWAP con prezzo sotto']);
+  assert.deepEqual(r.unresolved, []);
+});
