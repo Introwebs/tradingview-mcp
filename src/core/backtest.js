@@ -747,9 +747,24 @@ export async function grindSession(opts, deps = {}) {
         // Numeri fermi ma banner sparito, anche dopo aver riletto: identita' LEGITTIMA (C4).
         // Si accetta — il costo di un falso allarme e' una matrice interrotta.
       }
-      // I due controlli confluiscono: contesto fermo O input fermi, in entrambi i casi si scrive
-      // qualcosa che non appartiene a questa run.
-      if (staleContesto && !report.aggiornato) staleConfermato = true;
+      // Contesto cambiato e numeri ANCORA quelli di prima: qui il banner non conta. C'era
+      // `&& !report.aggiornato`, la stessa confusione fra banner e ridisegno corretta sopra per gli
+      // input — ma con un altro symbol, timeframe o periodo l'identita' non e' sospetta, e'
+      // impossibile, quindi non esiste un caso C4 da salvare. Incidente #257 (2026-11-03): ES1! 5m
+      // registrato coi 68 trade e -2.553,53 di DJI 15m, banner gia' sparito. Si rilegge come per
+      // gli input; se i numeri non si muovono la run non si scrive.
+      if (staleContesto && results?.metrics && fingerprint(results.metrics) === preContestoFp) {
+        const ri = await rileggiFinoACambio(entity_id, preContestoFp, {
+          leggiMetriche, periodoRistretto, sleep, aggiornaReport: aggiornaReportSeObsoleto,
+        });
+        if (ri.cambiato) {
+          results = ri.results;
+          sameAsPrevious = false;
+          avviso = `pannello in ritardo dopo il cambio di contesto, metriche rilette al tentativo ${ri.tentativi}`;
+        } else {
+          staleConfermato = true;
+        }
+      }
 
       const actual = await readInputValues(entity_id);
       const readbackOk = readbackMatches(richiesti, actual);

@@ -1196,6 +1196,60 @@ test('identita che resiste alla rilettura resta un dato, non un guasto', async (
   assert.equal(finalized.length, 1);
 });
 
+// --- Cambio di MERCATO col banner "attuale" (incidente #257, 2026-11-03) ----------------------
+// Sessione 33, run 130: il chart passa da TVC:DJI 15m (ultima run della sessione 32) a
+// CME_MINI:ES1! 5m, input_set vuoto. TradingView dichiara il report attuale, il pannello resta sui
+// numeri di DJI: 68 trade, -2.553,53, PF 0,933, identici al centesimo. Il controllo sul contesto
+// c'era, ma scattava solo col banner ancora su — la stessa confusione fra banner e ridisegno che
+// la regola C4 ha gia' pagato con gli input (sessione 54). Con un altro symbol l'identita' non e'
+// sospetta: e' impossibile.
+
+test('cambio di symbol + pannello fermo + banner ATTUALE = stale, non un backtest', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 130, symbol: 'CME_MINI:ES1!', timeframe: '5', input_set: {}, period_start: '2020-01-01', period_end: '2023-12-08' }],
+    metricsSeq: [M()],
+  });
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  deps.readStrategyLoading = async () => false;
+  const dji = M({ total_trades: 68, net_profit: -2553.53 });
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: dji });
+  deps.readReportFor = async () => ({ success: true, metrics: dji });
+
+  const out = await grindSession({
+    session_id: 33, entity_id: 'ent1', period_start: '2020-01-01', period_end: '2023-12-08',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1, recalc_step_ms: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason?.kind, 'stale_metrics');
+  assert.equal(finalized.length, 0, 'i numeri di DJI non devono finire sotto l etichetta ES1!');
+});
+
+test('cambio di symbol + pannello che si ridisegna in ritardo: si registrano i numeri nuovi', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 130, symbol: 'CME_MINI:ES1!', timeframe: '5', input_set: {}, period_start: '2020-01-01', period_end: '2023-12-08' }],
+    metricsSeq: [M()],
+  });
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  deps.readStrategyLoading = async () => false;
+  const dji = M({ total_trades: 68, net_profit: -2553.53 });
+  const es = M({ total_trades: 412, net_profit: 8120.4 });
+  // Il ridisegno arriva solo quando qualcuno torna a guardare: il primo giro di rilettura.
+  let riletture = 0;
+  deps.aggiornaReportSeObsoleto = async () => { riletture += 1; return { obsoleto: false, cliccato: false }; };
+  const pannello = () => (riletture >= 2 ? es : dji);
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: pannello() });
+  deps.readReportFor = async () => ({ success: true, metrics: pannello() });
+
+  const out = await grindSession({
+    session_id: 33, entity_id: 'ent1', period_start: '2020-01-01', period_end: '2023-12-08',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1, recalc_step_ms: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason, null);
+  assert.equal(finalized.length, 1);
+  assert.equal(finalized[0].payload.total_trades, 412);
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Lo stato d'errore della strategia: guardarlo, invece di consigliare a un umano
 // di guardarlo.
