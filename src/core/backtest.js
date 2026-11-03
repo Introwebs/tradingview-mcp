@@ -519,24 +519,20 @@ export async function grindSession(opts, deps = {}) {
       // Se la run dichiara un periodo, il pannello e' l'unica fonte ammessa (l'API interna lo ignora).
       const periodoRistretto = !!(giornoISO(run.period_start) && giornoISO(run.period_end));
 
-      // Fotografia PRIMA di toccare il contesto, e SOLO per le run che non cambiano input.
+      // Fotografia PRIMA di toccare il contesto, per OGNI run.
       //
-      // Perche' solo quelle: se la run cambia anche gli input, il confronto baseline(post-contesto)
-      // vs risultato(post-input) copre gia' tutto — se il pannello e' rimasto indietro la baseline
-      // e' il valore vecchio e il confronto successivo se ne accorge. Aggiungere qui un secondo
-      // vincolo ("il contesto DEVE aver mosso i numeri") non aggiungerebbe protezione e potrebbe
-      // fermare la matrice per niente.
-      // Le run a `input_set` vuoto invece non hanno un secondo confronto: se il cambio di periodo o
-      // di timeframe non muove nulla, senza questa fotografia si registrerebbe il report del
-      // contesto precedente sotto l'etichetta di quello nuovo.
-      const soloContesto = Object.keys(run.input_set || {}).length === 0;
+      // Si prendeva solo per le run a `input_set` vuoto, con l'idea che per le altre bastasse il
+      // confronto baseline(post-contesto) vs risultato(post-input). Non basta quando l'input_set e'
+      // GIA' quello sul chart: nessun cambiamento di input, nessun secondo confronto, e il cambio di
+      // contesto passa senza controllo. Incidente #259 (2026-11-03): margine 5% gia' applicato dalla
+      // run prima, timeframe 15m -> 5m, registrati i numeri del 15m. Fermare la matrice "per niente"
+      // non e' un rischio: dopo un cambio di contesto l'identita' coi numeri di prima e' impossibile,
+      // e prima di fermarsi si rilegge.
       let preContestoFp = null;
-      if (soloContesto) {
-        try {
-          const p = await leggiMetriche(entity_id, periodoRistretto);
-          if (p?.success !== false && Object.keys(p?.metrics || {}).length) preContestoFp = fingerprint(p.metrics);
-        } catch { /* senza riferimento il controllo sul contesto si salta */ }
-      }
+      try {
+        const p = await leggiMetriche(entity_id, periodoRistretto);
+        if (p?.success !== false && Object.keys(p?.metrics || {}).length) preContestoFp = fingerprint(p.metrics);
+      } catch { /* senza riferimento il controllo sul contesto si salta */ }
 
       // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
       // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.

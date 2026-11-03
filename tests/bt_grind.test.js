@@ -1224,6 +1224,30 @@ test('cambio di symbol + pannello fermo + banner ATTUALE = stale, non un backtes
   assert.equal(finalized.length, 0, 'i numeri di DJI non devono finire sotto l etichetta ES1!');
 });
 
+// Incidente #259 (sessione 33, run 135): la run porta un input_set (margine 5%) che e' GIA' sul
+// chart dalla run prima. Cambia solo il timeframe, 15m -> 5m, e il pannello resta sui numeri del
+// 15m. La fotografia pre-contesto si prendeva solo per le run a input_set vuoto, quindi qui non
+// c'era: #259 e' uscito identico a #258.
+test('input_set gia applicato + cambio di timeframe + pannello fermo = stale', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 135, symbol: 'EURUSD', timeframe: '5', input_set: { in_0: 1 }, period_start: '2020-01-01', period_end: '2023-12-08' }],
+    metricsSeq: [M()],
+  });
+  deps.attendiReportAggiornato = async () => ({ aggiornato: true, click: 1 });
+  deps.readStrategyLoading = async () => false;
+  const es15 = M({ total_trades: 14, net_profit: -78910 });
+  deps.readPanelMetrics = async () => ({ success: true, source: 'panel', metrics: es15 });
+  deps.readReportFor = async () => ({ success: true, metrics: es15 });
+
+  const out = await grindSession({
+    session_id: 33, entity_id: 'ent1', period_start: '2020-01-01', period_end: '2023-12-08',
+    recalc_timeout_ms: 50, recalc_stable_checks: 1, recalc_step_ms: 1,
+  }, deps);
+
+  assert.equal(out.stopped_reason?.kind, 'stale_metrics');
+  assert.equal(finalized.length, 0, 'i numeri del 15m non devono finire sotto l etichetta 5m');
+});
+
 test('cambio di symbol + pannello che si ridisegna in ritardo: si registrano i numeri nuovi', async () => {
   const { deps, finalized } = makeDeps({
     runs: [{ id: 130, symbol: 'CME_MINI:ES1!', timeframe: '5', input_set: {}, period_start: '2020-01-01', period_end: '2023-12-08' }],
