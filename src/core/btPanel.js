@@ -346,12 +346,128 @@ export async function setPanelMaximized(massimizzato, {
 }
 
 /**
+ * Il report DEL PERIODO, letto dallo stato React dello Strategy Tester: l'unica fonte di Sharpe e
+ * Sortino quando il periodo di test e' ristretto.
+ *
+ * Perche' serve: "Statistiche chiave" non espone Sharpe e Sortino, e `reportData()` li ha ma per
+ * l'intero storico. Risultato misurato: tutti i backtest con `metrics_source: panel` arrivavano con
+ * lo Sharpe a null, e ogni collaudo usciva `non_conclusiva` («non ha uno Sharpe registrato»).
+ *
+ * Dove sta (verificato dal vivo il 2026-09-17 e il 2026-11-03): risalendo la fiber React da
+ * `#strategy-report-summary`, uno degli hook state e' il report che il pannello sta disegnando —
+ * `settings.dateRange`, `performance.{sharpeRatio,sortinoRatio,all}`, `trades[]`. Il componente e'
+ * minificato e cambia con gli aggiornamenti di TradingView: si cerca PER FORMA, mai per percorso.
+ * Gli hit sono piu' d'uno (stesso oggetto a livelli diversi); se discordano si dichiara `ambiguous`.
+ *
+ * Si proietta nella pagina: il report porta `marginUsage` (~270k caratteri), non deve uscire.
+ *
+ * @returns {Promise<{found: boolean, ambiguous?: boolean, backtest_from?: number, backtest_to?: number,
+ *   total_trades?: number, net_profit?: number, sharpe?: number|null, sortino?: number|null, error?: string}>}
+ */
+export async function readPeriodReport({ evaluate = realEvaluate } = {}) {
+  try {
+    const out = await evaluate(`
+      (function() {
+        function fin(x) { return (typeof x === 'number' && isFinite(x)) ? x : null; }
+        var radici = document.querySelectorAll('[id="strategy-report-summary"], #report-tabs, #periodical-tab');
+        if (!radici.length) return { found: false, error: 'report del tester non montato (#strategy-report-summary assente)' };
+        var hits = [];
+        for (var r = 0; r < radici.length; r++) {
+          var key = Object.keys(radici[r]).find(function(k) { return k.indexOf('__reactFiber') === 0; });
+          var f = key ? radici[r][key] : null;
+          for (var lvl = 0; f && lvl < 80; lvl++, f = f.return) {
+            var h = f.memoizedState;
+            for (var hi = 0; h && hi < 50; hi++, h = h.next) {
+              var s = h.memoizedState;
+              if (!s || typeof s !== 'object' || Array.isArray(s)) continue;
+              if (!s.performance || !s.settings || !s.settings.dateRange || !s.performance.all) continue;
+              var bt = s.settings.dateRange.backtest || {};
+              var a = s.performance.all;
+              hits.push({
+                backtest_from: fin(bt.from), backtest_to: fin(bt.to),
+                total_trades: fin(a.totalTrades), net_profit: fin(a.netProfit),
+                sharpe: fin(s.performance.sharpeRatio), sortino: fin(s.performance.sortinoRatio),
+              });
+            }
+          }
+        }
+        if (!hits.length) return { found: false, error: 'nessun report del periodo nello stato React del tester' };
+        var firma = function(x) { return [x.backtest_from, x.backtest_to, x.total_trades, x.net_profit, x.sharpe].join('|'); };
+        var primo = hits[0], ambiguous = false;
+        for (var i = 1; i < hits.length; i++) if (firma(hits[i]) !== firma(primo)) ambiguous = true;
+        return Object.assign({ found: true, ambiguous: ambiguous }, primo);
+      })()
+    `);
+    return out && typeof out === 'object' ? out : { found: false, error: 'risposta vuota dalla pagina' };
+  } catch (e) {
+    return { found: false, error: e.message };
+  }
+}
+
+const GIORNO_MS = 86400000;
+const giornoUTC = (iso) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ''));
+  return m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+};
+const finito = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
+
+/**
+ * Sharpe e Sortino dal report del periodo, SOLO se e' lo stesso report che il pannello mostra.
+ *
+ * Tre controlli, tutti obbligatori — prestare lo Sharpe di un altro periodo e' peggio che non
+ * averlo, perche' produce un verdetto di collaudo plausibile e falso:
+ *  1. stessi trade del pannello (lo storico intero ne ha di piu': 288 contro 24, misurato);
+ *  2. stesso P&L, a meno dell'arrotondamento al centesimo del pannello;
+ *  3. date del report dentro il periodo applicato: la prima barra puo' cadere qualche giorno dopo
+ *     l'inizio (weekend, festivi), l'ultima qualche giorno prima della fine.
+ *
+ * Nessuna conversione: lo Sharpe di TradingView e' sui rendimenti mensili e passa com'e'.
+ *
+ * @returns {{ok: true, sharpe: number, sortino: number|null} | {ok: false, reason: string}}
+ */
+export function rischioDalReportDelPeriodo(report, { panel = {}, periodo = {} } = {}) {
+  if (!report || report.found !== true) {
+    return { ok: false, reason: `report del periodo non leggibile: ${report?.error || 'assente'}` };
+  }
+  if (report.ambiguous) return { ok: false, reason: 'report del periodo ambiguo: lo stato React ne contiene di diversi' };
+
+  const tPanel = finito(panel.total_trades);
+  if (tPanel === null || finito(report.total_trades) !== tPanel) {
+    return { ok: false, reason: `trade diversi dal pannello (report ${report.total_trades}, pannello ${panel.total_trades}): e' il report di un altro periodo` };
+  }
+  const pnlPanel = finito(panel.net_profit);
+  const pnlReport = finito(report.net_profit);
+  if (pnlPanel === null || pnlReport === null || Math.abs(pnlPanel - pnlReport) > 0.011) {
+    return { ok: false, reason: `P&L diverso dal pannello (report ${report.net_profit}, pannello ${panel.net_profit})` };
+  }
+
+  const da = giornoUTC(periodo.from);
+  const a = giornoUTC(periodo.to);
+  const rFrom = finito(report.backtest_from);
+  const rTo = finito(report.backtest_to);
+  if (da === null || a === null || rFrom === null || rTo === null) {
+    return { ok: false, reason: 'periodo applicato o date del report non leggibili: coerenza non verificabile' };
+  }
+  if (rFrom < da - GIORNO_MS || rFrom > da + 5 * GIORNO_MS || rTo > a + 2 * GIORNO_MS || rTo < a - 5 * GIORNO_MS) {
+    return {
+      ok: false,
+      reason: `date del report fuori dal periodo applicato (${new Date(rFrom).toISOString().slice(0, 10)} → ${new Date(rTo).toISOString().slice(0, 10)} contro ${periodo.from} → ${periodo.to})`,
+    };
+  }
+
+  const sharpe = finito(report.sharpe);
+  if (sharpe === null) return { ok: false, reason: 'il report del periodo non ha uno Sharpe numerico (periodo troppo corto?)' };
+  return { ok: true, sharpe, sortino: finito(report.sortino) };
+}
+
+/**
  * Le metriche correnti del pannello, nella stessa forma di `readReportFor`
  * (`{success, metrics, source, error}`) cosi' che `toFinalizePayload` e `detectAnomaly` non
  * debbano sapere da dove arrivano.
  *
- * NOTA: il blocco "Statistiche chiave" non espone Sharpe e Sortino (stanno nella tab
- * "Performance corretta per il rischio"). Restano `undefined` e il payload li manda null: e'
+ * NOTA: il blocco "Statistiche chiave" non espone Sharpe e Sortino: li completa il grind con
+ * `readPeriodReport` + `rischioDalReportDelPeriodo`, solo se quel report coincide con questo
+ * pannello. Altrimenti restano `undefined` e il payload li manda null: e'
  * preferibile un buco dichiarato a un numero inventato.
  */
 export async function readPanelMetrics({ evaluate = realEvaluate } = {}) {

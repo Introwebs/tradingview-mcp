@@ -82,6 +82,9 @@ function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
       // due fonti concordano e i test restano leggibili. Chi vuole esercitare la divergenza
       // (periodo ristretto) sovrascrive questa dep.
       readPanelMetrics: async () => ({ success: true, source: 'panel', metrics: metricaCorrente() }),
+      // Il report React del periodo: assente di default, come su una build TV che non lo espone.
+      // Senza stub il grind chiamerebbe la dep VERA e proverebbe a connettersi a TradingView.
+      readPeriodReport: async () => ({ found: false, error: 'stub: report non disponibile' }),
       captureScreenshot: async () => { seen.maximize.push('scatto'); return { file_path: '/tmp/shot.png' }; },
       // Il pannello finto parte da 'normal', come dopo ensureTesterPanel. Si registra la SEQUENZA e
       // non il conteggio: se lo scatto non cade FRA la massimizzazione e il ripristino, l'immagine
@@ -465,6 +468,78 @@ test('con un periodo ristretto le metriche vengono dal PANNELLO, non dall API in
   assert.equal(finalized[0].payload.total_trades, 3);
   assert.equal(finalized[0].payload.net_profit, -101.14);
   assert.equal(finalized[0].payload.extra_metrics.metrics_source, 'panel');
+});
+
+// "Statistiche chiave" non ha lo Sharpe: con un periodo ristretto arrivava SEMPRE null, e ogni
+// collaudo finiva `non_conclusiva` («non ha uno Sharpe registrato»). Il report del periodo sta nello
+// stato React del tester; si prende solo se e' lo stesso report che il pannello sta mostrando.
+function runConPeriodoRistretto(reportDelPeriodo) {
+  const h = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', period_start: '2023-11-06', period_end: '2026-10-01', input_set: { in_0: 2 } }],
+    metricsSeq: [M({ total_trades: 288, net_profit: 28309 })],
+  });
+  let dopoIlSet = false;
+  const setOriginale = h.deps.setInputs;
+  h.deps.setInputs = async (arg) => { const r = await setOriginale(arg); dopoIlSet = true; return r; };
+  const pannello = { total_trades: 61, net_profit: 4210.55, net_profit_percent: 0.0421, max_drawdown: 900, max_drawdown_percent: 0.009, percent_profitable: 0.45, profit_factor: 1.3 };
+  h.deps.readPanelMetrics = async () => ({
+    success: true, source: 'panel',
+    metrics: dopoIlSet ? pannello : { ...pannello, total_trades: 9, net_profit: -50 },
+  });
+  h.deps.readTestPeriod = async () => ({ label: '6 nov 2023 — 1 ott 2026', from: '2023-11-06', to: '2026-10-01' });
+  h.deps.readPeriodReport = async () => reportDelPeriodo(pannello);
+  return h;
+}
+
+const reportCoerente = (p) => ({
+  found: true, ambiguous: false,
+  backtest_from: Date.UTC(2023, 10, 6, 14, 30), backtest_to: Date.UTC(2026, 9, 1, 20, 0),
+  total_trades: p.total_trades, net_profit: p.net_profit + 0.004, sharpe: 0.3124, sortino: 0.5511,
+});
+
+test('periodo ristretto: lo Sharpe del periodo arriva dal report React se coincide col pannello', async () => {
+  const { deps, finalized } = runConPeriodoRistretto(reportCoerente);
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(out.executed, 1);
+  const p = finalized[0].payload;
+  assert.equal(p.total_trades, 61);
+  assert.equal(p.sharpe, 0.3124);
+  assert.equal(p.sortino, 0.5511);
+  assert.equal(p.extra_metrics.metrics_source, 'panel');
+  assert.equal(p.extra_metrics.risk_metrics_source, 'period_report');
+  assert.equal(p.extra_metrics.risk_metrics_unavailable, undefined);
+});
+
+test('periodo ristretto: un report con altri trade (storico intero) NON presta il suo Sharpe', async () => {
+  const h = runConPeriodoRistretto((p) => ({ ...reportCoerente(p), total_trades: 288, net_profit: 28309, sharpe: 1.9 }));
+  await grindSession({ session_id: 7, entity_id: 'ent1', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, h.deps);
+  const p = h.finalized[0].payload;
+  assert.equal(p.sharpe, null);
+  assert.equal(p.sortino, null);
+  assert.equal(p.total_trades, 61);
+  assert.match(p.extra_metrics.risk_metrics_unavailable, /trade/);
+  assert.equal(p.extra_metrics.risk_metrics_source, undefined);
+});
+
+test('periodo ristretto: report illeggibile = Sharpe null e run comunque finalizzata', async () => {
+  const h = runConPeriodoRistretto(() => { throw new Error('fiber non trovata'); });
+  const out = await grindSession({ session_id: 7, entity_id: 'ent1', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, h.deps);
+  assert.equal(out.executed, 1);
+  assert.equal(h.finalized[0].payload.sharpe, null);
+  assert.match(h.finalized[0].payload.extra_metrics.risk_metrics_unavailable, /fiber non trovata/);
+});
+
+test('senza periodo ristretto lo Sharpe resta quello dell API interna e il report non si legge', async () => {
+  const { deps, finalized } = makeDeps({
+    runs: [{ id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 } }],
+    metricsSeq: [M(), M({ net_profit: 200, sharpe_ratio: 0.8, sortino_ratio: 1.1 })],
+  });
+  let letture = 0;
+  deps.readPeriodReport = async () => { letture += 1; return { found: false }; };
+  await grindSession({ session_id: 7, entity_id: 'ent1', recalc_timeout_ms: 50, recalc_stable_checks: 1 }, deps);
+  assert.equal(finalized[0].payload.sharpe, 0.8);
+  assert.equal(letture, 0);
+  assert.equal(finalized[0].payload.extra_metrics.risk_metrics_unavailable, undefined);
 });
 
 test('periodo ristretto e pannello illeggibile: NON si ripiega sull API interna, si fallisce', async () => {

@@ -21,6 +21,8 @@ import {
   aggiornaReportSeObsoleto as realAggiornaReport,
   attendiReportAggiornato as realAttendiReport,
   setPanelMaximized as realSetPanelMaximized,
+  readPeriodReport as realReadPeriodReport,
+  rischioDalReportDelPeriodo,
 } from './btPanel.js';
 import {
   readInputsInfo as realReadInputsInfo,
@@ -157,6 +159,8 @@ export function giornoISO(v) {
   const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v || ''));
   return m ? m[1] : null;
 }
+
+const finito = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
 
 /** Due ticker coincidono anche se uno e' senza exchange ("TVC:NDQ" vs "NDQ"). */
 function stessoSymbol(a, b) {
@@ -359,6 +363,7 @@ export async function grindSession(opts, deps = {}) {
     setCustomPeriod = realSetCustomPeriod,
     readTestPeriod = realReadTestPeriod,
     readPanelMetrics = realReadPanelMetrics,
+    readPeriodReport = realReadPeriodReport,
     ensureTesterPanel = realEnsureTesterPanel,
     aggiornaReportSeObsoleto = realAggiornaReport,
     attendiReportAggiornato = realAttendiReport,
@@ -884,8 +889,25 @@ export async function grindSession(opts, deps = {}) {
       // richiesto: api.md lo dice da sempre ("popola SEMPRE col range REALE"), e scriverlo a fiducia
       // e' esattamente ciò che ha prodotto dieci backtest identici con dieci etichette diverse.
       const periodoFinale = await readTestPeriod();
+      // Col periodo ristretto i numeri vengono dal pannello, che non ha Sharpe ne' Sortino: senza
+      // questo passo arrivavano sempre null e ogni collaudo finiva `non_conclusiva`. Li porta il
+      // report del periodo nello stato React, ma solo se e' lo stesso report del pannello.
+      // Mai bloccante: la run e' gia' misurata, uno Sharpe mancante resta un buco dichiarato.
+      let rischio = null;
+      if (results.source === 'panel' && finito(results.metrics?.sharpe_ratio) === null
+        && Math.round(results.metrics?.total_trades ?? 0) > 0) {
+        let rep;
+        try { rep = await readPeriodReport(); } catch (e) { rep = { found: false, error: e.message }; }
+        rischio = rischioDalReportDelPeriodo(rep, {
+          panel: results.metrics,
+          periodo: periodoFinale.from && periodoFinale.to ? periodoFinale : periodo,
+        });
+      }
+      const metricheFinali = rischio?.ok
+        ? { ...results.metrics, sharpe_ratio: rischio.sharpe, sortino_ratio: rischio.sortino }
+        : results.metrics;
       const { inputs, properties, initialCapital, appliedInputs } = buildInputsPayload(info, actual);
-      const payload = toFinalizePayload(results.metrics, {
+      const payload = toFinalizePayload(metricheFinali, {
         symbol: run.symbol,
         timeframe: run.timeframe,
         period_start: periodoFinale.from || periodo.from || run.period_start || period_start,
@@ -906,6 +928,8 @@ export async function grindSession(opts, deps = {}) {
           ? `${giornoISO(run.period_start)} → ${giornoISO(run.period_end)}`
           : null,
         period_applied: periodoFinale.label || null,
+        ...(rischio?.ok && { risk_metrics_source: 'period_report' }),
+        ...(rischio && !rischio.ok && { risk_metrics_unavailable: rischio.reason }),
       };
       if (costo) {
         payload.extra_metrics = {
