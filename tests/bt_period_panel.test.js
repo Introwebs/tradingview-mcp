@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseDataItaliana, parseEtichettaPeriodo, setCustomPeriod, readTestPeriod, etichettaSembraPeriodo } from '../src/core/btPeriod.js';
+import { parseDataItaliana, parseEtichettaPeriodo, setCustomPeriod, readTestPeriod, etichettaSembraPeriodo, VOCE_MENU_PERIODO } from '../src/core/btPeriod.js';
 import { numeroItaliano, parsePannello, readPanelMetrics, ensureTesterPanel } from '../src/core/btPanel.js';
 
 // I testi qui sotto sono COPIATI dal pannello vero il 2026-08-11, non scritti a mente.
@@ -232,7 +232,7 @@ test('setCustomPeriod: bottone assente = pannello chiuso, NON "voce non trovata"
   assert.equal(out.applied, false);
   assert.equal(out.retryable, true);
   assert.match(out.error, /pannello Strategy Tester/i);
-  assert.ok(!/voce "Intervallo date personalizzato" non trovata/.test(out.error), 'non deve incolpare il menu');
+  assert.ok(!/voce del range personalizzato non trovata/.test(out.error), 'non deve incolpare il menu');
   assert.equal(clic, 0);
 });
 
@@ -268,4 +268,33 @@ test('non scambia per periodo gli altri pulsanti del pannello', () => {
   assert.equal(etichettaSembraPeriodo('Esecuzione dello script1'), false);
   assert.equal(etichettaSembraPeriodo(''), false);
   assert.equal(etichettaSembraPeriodo(null), false);
+});
+
+// Voci COPIATE dal menu vero del periodo di test il 2026-11-15. Quel giorno TradingView aveva
+// rinominato "Intervallo date personalizzato" in "Range date personalizzato": il filtro a testo
+// esatto scartava la voce e il grind si fermava con period_not_applied (run 137 della sessione 34).
+const MENU_PERIODO_2026_11_15 = ['Intervallo grafico disponibile', 'Ultimi 7 giorni', 'Ultimi 30 giorni',
+  'Ultimi 90 giorni', 'Ultimi 365 giorni', 'Storico completo', 'Range date personalizzato'];
+
+test('VOCE_MENU_PERIODO riconosce tutte le voci reali del menu, col nome nuovo e col vecchio', () => {
+  for (const v of MENU_PERIODO_2026_11_15) assert.ok(VOCE_MENU_PERIODO.test(v), `scartata: ${v}`);
+  assert.ok(VOCE_MENU_PERIODO.test('Intervallo date personalizzato'), 'nome di prima di novembre 2026');
+  // Le altre etichette del DOM (nomi di indicatori, "Periodo di test") non devono entrare.
+  for (const v of ['Periodo di test', 'NDQ Box Strategy', 'TVC', 'Liquidity Clusters']) {
+    assert.ok(!VOCE_MENU_PERIODO.test(v), `presa per errore: ${v}`);
+  }
+});
+
+test('setCustomPeriod: il filtro iniettato nel browser e\' lo stesso VOCE_MENU_PERIODO', async () => {
+  let iniettato = null;
+  const evaluate = async (js) => {
+    if (/getBoundingClientRect/.test(js) && /title-/.test(js)) { iniettato = js; return { bottoneTrovato: true, voci: [] }; }
+    return null;
+  };
+  await setCustomPeriod('2020-01-01', '2023-12-08', { evaluate, mouseClick: async () => {}, sleep: async () => {} });
+  assert.ok(iniettato, 'il JS del menu non e\' stato iniettato');
+  assert.ok(iniettato.includes(String(VOCE_MENU_PERIODO)), 'il JS iniettato usa un filtro diverso');
+  // Il JS deve restare valido: niente escape raddoppiati nel passaggio regex -> stringa.
+  const re = new Function(`return ${String(VOCE_MENU_PERIODO)};`)();
+  assert.ok(re.test('Range date personalizzato') && re.test('Ultimi 30 giorni'));
 });

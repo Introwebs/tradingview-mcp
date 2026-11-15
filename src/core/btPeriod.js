@@ -14,7 +14,8 @@
  *     Servono eventi mouse VERI (CDP Input.dispatchMouseEvent), cioe' `mouseClick`. Aprire il menu
  *     invece funziona anche col click del DOM.
  *  2. I preset coprono solo 7/30/90/365 giorni, storico completo e intervallo grafico. Qualunque
- *     altro periodo passa da "Intervallo date personalizzato", che accetta due campi
+ *     altro periodo passa dalla voce del range personalizzato ("Intervallo date personalizzato",
+ *     dal 2026-11-15 "Range date personalizzato"), che accetta due campi
  *     `input[placeholder="YYYY-MM-DD"]` in ISO -- nessuna data localizzata da comporre, per
  *     fortuna. Il pulsante di conferma e' `[data-name="submit-button"]`.
  *  3. L'etichetta del pulsante, invece, e' localizzata: "4 ago 2026 - 11 ago 2026". E' l'unica
@@ -23,6 +24,14 @@
  */
 import { evaluate as realEvaluate } from '../connection.js';
 import { mouseClick as realMouseClick } from './ui.js';
+
+/**
+ * Le voci del menu del periodo di test. Il range personalizzato si riconosce da "personalizzat"
+ * e NON dal testo intero: TradingView ha gia' rinominato la voce una volta ("Intervallo date
+ * personalizzato" -> "Range date personalizzato", visto dal vivo il 2026-11-15) e il filtro a testo
+ * esatto la scartava, fermando il grind con period_not_applied mentre la voce c'era.
+ */
+export const VOCE_MENU_PERIODO = /^(Ultimi \d+ giorni|Storico completo|.{0,30}personalizzat.{0,10}|Intervallo grafico.*)$/i;
 
 const MESI = { gen: 1, feb: 2, mar: 3, apr: 4, mag: 5, giu: 6, lug: 7, ago: 8, set: 9, ott: 10, nov: 11, dic: 12 };
 
@@ -114,7 +123,7 @@ export async function openTestPeriodMenu({ evaluate = realEvaluate } = {}) {
       var all = document.querySelectorAll('div[class*="title-"]');
       for (var i = 0; i < all.length; i++) {
         var t = (all[i].textContent || '').trim();
-        if (!/^(Ultimi \\d+ giorni|Storico completo|Intervallo date personalizzato|Intervallo grafico.*)$/.test(t)) continue;
+        if (!(${String(VOCE_MENU_PERIODO)}).test(t)) continue;
         var node = all[i];
         for (var up = 0; up < 4 && node; up++) {
           var rr = node.getBoundingClientRect();
@@ -170,7 +179,7 @@ export async function setCustomPeriod(from, to, {
     const elenco = voci.length ? voci.map((v) => v.testo).join(' | ') : '(menu vuoto)';
     return {
       applied: false, label: null, from: null, to: null,
-      error: `voce "Intervallo date personalizzato" non trovata nel menu del periodo di test. Voci lette: ${elenco}`,
+      error: `voce del range personalizzato non trovata nel menu del periodo di test. Voci lette: ${elenco}`,
     };
   }
 
