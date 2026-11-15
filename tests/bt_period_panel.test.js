@@ -298,3 +298,36 @@ test('setCustomPeriod: il filtro iniettato nel browser e\' lo stesso VOCE_MENU_P
   const re = new Function(`return ${String(VOCE_MENU_PERIODO)};`)();
   assert.ok(re.test('Range date personalizzato') && re.test('Ultimi 30 giorni'));
 });
+
+// Regressione del 2026-11-15 (sessione 34): TradingView aveva riaperto il tester sulla scheda
+// "Trade" (Lista operazioni). Il blocco "Statistiche chiave" non c'era e il grind si e' fermato
+// due volte con runtime_error. Gli id delle schede sono COPIATI dal DOM vero quel giorno.
+function eseguiNelFintoDom(js, { selezionata }) {
+  const tab = { _sel: selezionata, clic: 0, getAttribute(n) { return n === 'aria-selected' ? String(this._sel) : null; },
+    click() { this.clic++; this._sel = true; } };
+  const document = {
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    getElementById: (id) => (id === 'Strategy report' ? tab : null),
+  };
+  const risultato = new Function('document', `return ${js.trim()};`)(document);
+  return { risultato, tab };
+}
+
+test('readPanelMetrics: su scheda "Trade" seleziona "Metriche" e chiede di riprovare', async () => {
+  let js = null;
+  const out = await readPanelMetrics({ evaluate: async (codice) => { js = codice; return eseguiNelFintoDom(codice, { selezionata: false }).risultato; } });
+  const { tab } = eseguiNelFintoDom(js, { selezionata: false });
+  assert.equal(tab.clic, 1, 'deve cliccare la scheda Metriche');
+  assert.equal(out.success, false);
+  assert.equal(out.retryable, true, 'il chiamante deve rileggere dopo il ridisegno');
+  assert.match(out.error, /Metriche/);
+});
+
+test('readPanelMetrics: scheda Metriche gia\' attiva -> nessun click, messaggio di sempre', async () => {
+  let tabVisto = null;
+  const out = await readPanelMetrics({ evaluate: async (codice) => { const r = eseguiNelFintoDom(codice, { selezionata: true }); tabVisto = r.tab; return r.risultato; } });
+  assert.equal(tabVisto.clic, 0, 'non deve fare toggle su una scheda gia\' giusta');
+  assert.equal(out.retryable, true);
+  assert.match(out.error, /non ancora disponibile/);
+});

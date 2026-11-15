@@ -489,6 +489,18 @@ export async function readPanelMetrics({ evaluate = realEvaluate } = {}) {
       if (/richiede dati dei trade|almeno un trade|requires trade data|at least one trade/i.test(pt)) {
         return { stato: 'vuoto' };
       }
+      // Scheda sbagliata: il tester ha due schede, "Metriche" (id "Strategy report") e "Trade"
+      // (id "List of Trades"). TradingView riapre l'ultima usata, e su "Trade" il blocco non
+      // esiste: il grind si fermava due volte di fila con runtime_error (sessione 34, 2026-11-15).
+      // Si seleziona la scheda del report e si torna "assente": e' il retry del chiamante a
+      // rileggere dopo il ridisegno. L'id e' un nome leggibile, non un hash di classe; il
+      // data-name e' la riserva. Un .click() del DOM basta (verificato dal vivo).
+      var tab = document.getElementById('Strategy report')
+        || document.querySelector('[role="tab"][data-name="light-tab-0"]');
+      if (tab && tab.getAttribute('aria-selected') !== 'true') {
+        tab.click();
+        return { stato: 'assente', schedaCambiata: true };
+      }
       return { stato: 'assente' };
     })()
   `);
@@ -503,7 +515,10 @@ export async function readPanelMetrics({ evaluate = realEvaluate } = {}) {
     // `retryable`: il blocco manca anche mentre il pannello si sta ri-renderizzando dopo un cambio
     // di timeframe o di periodo. Non e' un errore definitivo, e' un "non ancora": chi legge deve
     // riprovare, NON ripiegare sull'API interna, che con un periodo ristretto risponde sbagliato.
-    return { success: false, retryable: true, metrics: {}, source: 'panel', error: 'blocco "Statistiche chiave" non ancora disponibile (pannello chiuso o in ridisegno)' };
+    const error = letto && letto.schedaCambiata
+      ? 'blocco "Statistiche chiave" non visibile: era attiva la scheda "Trade", passato a "Metriche"'
+      : 'blocco "Statistiche chiave" non ancora disponibile (pannello chiuso o in ridisegno)';
+    return { success: false, retryable: true, metrics: {}, source: 'panel', error };
   }
   const metrics = parsePannello(testo);
   if (!Object.keys(metrics).length) {
