@@ -1634,3 +1634,97 @@ test('zero trade con la strategia sana resta zero_trades e la matrice prosegue',
   assert.equal(out.rows.find((r) => r.run_id === 1).error, 'zero_trades');
   assert.equal(out.executed, 1);
 });
+
+// ---- measure_timing: la scomposizione del tempo di ogni run ----------------------------------
+// Orologio finto: avanza solo quando uno stub lo fa avanzare, cosi' ogni fase ha un valore noto.
+const OPT_TEMPO = { session_id: 1, entity_id: 'ent-1', period_start: '2025-01-01', period_end: '2025-12-31', recalc_timeout_ms: 50, recalc_stable_checks: 1 };
+const sommaFasi = (r) => Object.values(r.fasi).reduce((a, b) => a + b, 0);
+
+function conOrologio(deps) {
+  const orologio = { t: 0 };
+  deps.now = () => orologio.t;
+  const scatto = deps.captureScreenshot;
+  deps.captureScreenshot = async (a) => { orologio.t += 1300; return scatto(a); };
+  const fin = deps.api.finalize;
+  deps.api.finalize = async (...a) => { orologio.t += 400; return fin(...a); };
+  const set = deps.setInputs;
+  deps.setInputs = async (a) => { orologio.t += 200; return set(a); };
+  const att = deps.attendiReportAggiornato;
+  deps.attendiReportAggiornato = async (a) => { orologio.t += 3000; return att(a); };
+  return orologio;
+}
+
+const dueRun = () => ([
+  { id: 1, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 2 }, label: 'a' },
+  { id: 2, symbol: 'EURUSD', timeframe: '15', input_set: { in_0: 3 }, label: 'b' },
+]);
+
+test('measure_timing scompone ogni run e la somma delle fasi e\' il totale', async () => {
+  const { deps } = makeDeps({ runs: dueRun(), metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 })] });
+  conOrologio(deps);
+  const out = await grindSession({ ...OPT_TEMPO, measure_timing: true }, deps);
+  assert.equal(out.executed, 2);
+  assert.equal(out.timing.unita, 'ms');
+  assert.equal(out.timing.run.length, 2);
+  const r0 = out.timing.run[0];
+  assert.equal(r0.fasi.screenshot, 1300);
+  assert.equal(r0.fasi.salvataggio, 400);
+  assert.equal(r0.fasi.input, 200);
+  assert.equal(r0.fasi.report, 3000);
+  for (const r of out.timing.run) assert.equal(sommaFasi(r), r.totale_ms);
+  assert.ok(out.timing.mediane_done.salvataggio >= 1700);
+});
+
+test('senza measure_timing il ritorno non cambia e non c\'e\' nessun progress in piu\'', async () => {
+  const a = makeDeps({ runs: dueRun(), metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 })] });
+  conOrologio(a.deps);
+  const senza = await grindSession({ ...OPT_TEMPO }, a.deps);
+  const b = makeDeps({ runs: dueRun(), metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 })] });
+  conOrologio(b.deps);
+  const con = await grindSession({ ...OPT_TEMPO, measure_timing: true }, b.deps);
+  assert.equal('timing' in senza, false);
+  assert.deepEqual(a.seen.progress, b.seen.progress);
+  const { timing, ...resto } = con;
+  assert.deepEqual(resto, senza);
+});
+
+test('una run a zero trade ha il suo record ma non entra nelle mediane', async () => {
+  const { deps } = makeDeps({
+    runs: dueRun(),
+    metricsSeq: [M(), M({ total_trades: 0, net_profit: 0 }), M({ net_profit: 300 }), M({ net_profit: 400 })],
+  });
+  conOrologio(deps);
+  const out = await grindSession({ ...OPT_TEMPO, measure_timing: true }, deps);
+  assert.equal(out.timing.run.length, 2);
+  assert.equal(out.timing.run[0].esito, 'failed');
+  assert.equal(out.timing.run[1].esito, 'done');
+  assert.equal(out.timing.mediane_done.totale, out.timing.run[1].totale_ms);
+});
+
+test('un\'eccezione a meta\' run chiude comunque il record', async () => {
+  const { deps } = makeDeps({ runs: dueRun(), metricsSeq: [M(), M({ net_profit: 200 })] });
+  conOrologio(deps);
+  deps.setInputs = async () => { throw new Error('CDP giu'); };
+  const out = await grindSession({ ...OPT_TEMPO, measure_timing: true }, deps);
+  assert.equal(out.stopped_reason.kind, 'runtime_error');
+  assert.equal(out.timing.run.length, 1);
+  assert.equal(out.timing.run[0].esito, 'failed');
+  assert.equal(sommaFasi(out.timing.run[0]), out.timing.run[0].totale_ms);
+});
+
+test('coda vuota: nessun record e nessuna mediana', async () => {
+  const { deps } = makeDeps({ runs: [], metricsSeq: [M()] });
+  conOrologio(deps);
+  const out = await grindSession({ ...OPT_TEMPO, measure_timing: true }, deps);
+  assert.deepEqual(out.timing.run, []);
+  assert.equal(out.timing.mediane_done, null);
+});
+
+test('con il digest le righe si sfoltiscono ma i tempi no', async () => {
+  const { deps } = makeDeps({ runs: [dueRun()[0]], metricsSeq: [M(), M({ net_profit: 200 })] });
+  conOrologio(deps);
+  const out = await grindSession({ ...OPT_TEMPO, measure_timing: true }, deps);
+  assert.ok(out.digest);
+  assert.equal('trades' in out.rows[0], false);
+  assert.equal(out.timing.run[0].esito, 'done');
+});

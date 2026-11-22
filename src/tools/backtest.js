@@ -26,6 +26,7 @@ export function registerBacktestTools(server) {
       maximize_for_screenshot: z.boolean().optional().describe('Massimizza il pannello Strategy Tester per lo scatto dell\'equity e lo rimette com\'era (default true)'),
       run_ids: z.array(z.number().int()).optional().describe('Esegui QUESTE run per id, nell\'ordine dato (varianti di costo: il ?next=1 le filtra apposta). Senza, esegue le pending della sessione come sempre'),
       strategy_name: z.string().optional().describe('Titolo della strategia sul chart, per risolvere entity_id quando non lo hai'),
+      measure_timing: z.boolean().optional().describe('Restituisce la scomposizione del tempo di ogni run (timing). Default false: il ritorno resta quello di sempre'),
     },
     async (args) => {
       try {

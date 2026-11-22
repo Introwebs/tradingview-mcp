@@ -13,6 +13,7 @@
  * controllo appena compare un'anomalia (circuit breaker).
  */
 import { setInputs as realSetInputs } from './indicators.js';
+import { creaCronometro, riassumi, FASI } from './cronometro.js';
 import { captureScreenshot as realCaptureScreenshot } from './capture.js';
 import { setSymbol as realSetSymbol, setTimeframe as realSetTimeframe, getState as realGetState } from './chart.js';
 import { setCustomPeriod as realSetCustomPeriod, readTestPeriod as realReadTestPeriod } from './btPeriod.js';
@@ -339,6 +340,9 @@ export async function grindSession(opts, deps = {}) {
     verbose = false,
     // Massimizzare il pannello per lo scatto e rimetterlo subito com'era. Costa ~1,3 s per run.
     maximize_for_screenshot = true,
+    // Restituisce in `timing` la scomposizione del tempo di ogni run. Il cronometro gira sempre
+    // (costa pochi now()): cambia solo se il ritorno lo mostra.
+    measure_timing = false,
     // Varianti di costo: le run si eseguono PER ID (il `?next=1` le filtra apposta) e l'entity_id
     // puo' arrivare come nome della strategia, risolto qui sul chart.
     run_ids = null,
@@ -369,7 +373,11 @@ export async function grindSession(opts, deps = {}) {
     attendiReportAggiornato = realAttendiReport,
     setPanelMaximized = realSetPanelMaximized,
     sleep = realSleep,
+    now = () => performance.now(),
   } = deps;
+
+  const t0 = now();
+  const cron = creaCronometro(now);
 
   // Il dettaglio passo-passo passa da qui: si vede solo con `verbose`. Gli eventi (✔ ⛔ ○) chiamano
   // `api.progress` direttamente, cosi' non c'e' modo di silenziarli per sbaglio.
@@ -498,15 +506,20 @@ export async function grindSession(opts, deps = {}) {
   // Il corpo del ciclo NON e' rientrato apposta: sul percorso ordinario (nessuno snapshot) il
   // finally e' un no-op e il diff resta leggibile.
   let commissionRestored;
+  const avvio_ms = Math.round(now() - t0);
+  let tChiusura = 0;
   try {
   for (;;) {
     if (stopped_reason) break;
     if (max_runs && executed + failed >= max_runs) break;
 
+    cron.apri();
     const run = await prossimaRun();
-    if (!run) break;
+    if (!run) { cron.scarta(); break; }
 
     await api.markRunning(run.id);
+    cron.assegna(run.id);
+    cron.segna('coda');
     await nota(`run ${run.id}${run.label ? ` (${run.label})` : ''}: applico gli input`);
 
     // Rete di sicurezza: QUALUNQUE eccezione qui dentro deve comunque togliere la run dallo
@@ -533,10 +546,12 @@ export async function grindSession(opts, deps = {}) {
         const p = await leggiMetriche(entity_id, periodoRistretto);
         if (p?.success !== false && Object.keys(p?.metrics || {}).length) preContestoFp = fingerprint(p.metrics);
       } catch { /* senza riferimento il controllo sul contesto si salta */ }
+      cron.segna('pre_contesto');
 
       // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
       // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
       const { problemi, periodo, contestoCambiato } = await applicaContestoRun(run, ctxRun);
+      cron.segna('contesto');
       if (problemi.length) {
         const a = problemi[0];
         await api.markFailed(run.id, `${a.kind}: ${a.detail}`);
@@ -589,6 +604,7 @@ export async function grindSession(opts, deps = {}) {
           await nota(`run ${run.id}: pannello ancora senza metriche, baseline presa dopo l'attesa`);
         }
       }
+      cron.segna('baseline');
 
       // Il contesto e' cambiato ma i numeri sono gli stessi di prima del cambio: impossibile.
       // Un altro symbol, un altro timeframe o un'altra finestra temporale non possono produrre lo
@@ -669,6 +685,7 @@ export async function grindSession(opts, deps = {}) {
       if (Object.keys(richiesti).length) {
         setResult = await setInputs({ entity_id, inputs: richiesti });
       }
+      cron.segna('input');
 
       // ⛔ IL PASSO SENZA IL QUALE NIENTE FUNZIONA ⛔
       // Con un periodo di test personalizzato TradingView NON ricalcola il report da solo: lo marca
@@ -681,6 +698,7 @@ export async function grindSession(opts, deps = {}) {
       // -> sempre 651 trade, perche' agisce solo in mgmt mode "Classic"), quindi "numeri fermi" non
       // e' una prova di niente. Banner sparito = report attuale per QUESTI input.
       const report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+      cron.segna('report');
       if (report.click > 0) {
         await nota(`run ${run.id}: report obsoleto → premuto "Aggiorna report"${report.click > 1 ? ` (${report.click}x)` : ''}`);
       }
@@ -690,6 +708,7 @@ export async function grindSession(opts, deps = {}) {
         timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
         stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
       });
+      cron.segna('ricalcolo');
       let results = results0;
       let sameAsPrevious = !!results?.metrics && fingerprint(results.metrics) === baselineFp;
 
@@ -761,6 +780,7 @@ export async function grindSession(opts, deps = {}) {
           staleConfermato = true;
         }
       }
+      cron.segna('rilettura');
 
       const actual = await readInputValues(entity_id);
       const readbackOk = readbackMatches(richiesti, actual);
@@ -895,6 +915,7 @@ export async function grindSession(opts, deps = {}) {
         }
         verificaCosto = { ...c, implied_rate: esito.implied_rate ?? 0 };
       }
+      cron.segna('verifica');
 
       // Il periodo si rilegge dal tester DOPO il ricalcolo, e si registra QUELLO. Mai quello
       // richiesto: api.md lo dice da sempre ("popola SEMPRE col range REALE"), e scriverlo a fiducia
@@ -954,6 +975,7 @@ export async function grindSession(opts, deps = {}) {
           implied_rate: verificaCosto.implied_rate,
         };
       }
+      cron.segna('periodo');
 
       // Lo screenshot si scatta col pannello MASSIMIZZATO e poi si rimette tutto com'era.
       // A pannello normale il tester e' ~370px su 994: la curva equity esce alta un centinaio di
@@ -977,6 +999,7 @@ export async function grindSession(opts, deps = {}) {
           try { await setPanelMaximized(false); } catch { /* il grind non si ferma per il layout */ }
         }
       }
+      cron.segna('screenshot');
       if (!shot?.file_path) {
         await api.markFailed(run.id, 'screenshot equity non prodotto');
         failed++;
@@ -1016,6 +1039,7 @@ export async function grindSession(opts, deps = {}) {
           break;
         }
       }
+      cron.segna('salvataggio');
 
       prevFp = fingerprint(results.metrics);
     } catch (err) {
@@ -1033,6 +1057,8 @@ export async function grindSession(opts, deps = {}) {
     }
   }
   } finally {
+    cron.chiudi();
+    tChiusura = now();
     // Ripristino dallo snapshot, e `commission_restored` e' il READBACK — non "il set non ha
     // lanciato": un set accettato e non applicato e' esattamente il difetto da cui nasce tutto.
     if (snapshotCommissione) {
@@ -1077,6 +1103,13 @@ export async function grindSession(opts, deps = {}) {
   // Lo sfoltimento avviene qui e non nel loop di proposito: prima di aver visto arrivare il digest
   // non si sa se le metriche saranno altrove. Se non arriva, i rows restano completi — il grind non
   // deve mai diventare muto.
+  // I tempi si riassumono sulle righe COMPLETE: lo sfoltimento col digest toglie le metriche, non gli esiti.
+  const timing = measure_timing ? {
+    unita: 'ms', fasi: FASI, avvio_ms,
+    chiusura_ms: Math.round(now() - tChiusura), totale_ms: Math.round(now() - t0),
+    ...riassumi(cron.records(), rows),
+  } : null;
+
   const righe = digest
     ? rows.map((r) => (r.status === 'done' && r.commission_per_lot == null ? { run_id: r.run_id, label: r.label, status: r.status } : r))
     : rows;
@@ -1084,6 +1117,7 @@ export async function grindSession(opts, deps = {}) {
   return {
     success: true, session_id, entity_id, executed, failed, stopped_reason, rows: righe,
     digest, ...(digest_error && { digest_error }),
+    ...(timing && { timing }),
     ...(restoreHidden && { visibility_restored: restored }),
     ...(commissionRestored !== undefined && { commission_restored: commissionRestored }),
   };
