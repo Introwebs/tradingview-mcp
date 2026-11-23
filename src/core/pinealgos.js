@@ -48,7 +48,9 @@ export function makeApi({
 } = {}) {
   const headers = (extra = {}) => ({ Authorization: `Bearer ${token}`, Accept: 'application/json', ...extra });
 
-  async function req(method, path, { body, raw } = {}) {
+  // La parte comune a `req` e `reqConEsito`: invia, applica timeout e ritento sul 429, e torna
+  // la risposta grezza. Cosa fare di un !ok lo decide il chiamante.
+  async function inviaConRitento(method, path, { body, raw } = {}) {
     for (let tentativo = 0; ; tentativo++) {
       let res;
       try {
@@ -85,12 +87,40 @@ export function makeApi({
         continue;
       }
 
-      if (!res.ok) {
-        const text = typeof res.text === 'function' ? await res.text() : '';
-        throw new Error(`${method} ${path} → HTTP ${res.status}: ${text}`);
-      }
-      return await leggiCorpo(res);
+      return res;
     }
+  }
+
+  async function lanciaSuErrore(method, path, res) {
+    const text = typeof res.text === 'function' ? await res.text() : '';
+    throw new Error(`${method} ${path} → HTTP ${res.status}: ${text}`);
+  }
+
+  async function req(method, path, opts = {}) {
+    const res = await inviaConRitento(method, path, opts);
+    if (!res.ok) await lanciaSuErrore(method, path, res);
+    return await leggiCorpo(res);
+  }
+
+  /**
+   * Come `req`, ma un 4xx (il 429 e' gia' stato ritentato) e' una risposta del server nel merito,
+   * non un guasto: torna `{ ok:false, status, reason_code, message, data }` invece di lanciare.
+   * 5xx ed errori di rete lanciano come in `req`.
+   */
+  async function reqConEsito(method, path, body) {
+    const res = await inviaConRitento(method, path, { body });
+    if (res.ok) {
+      const corpo = await leggiCorpo(res);
+      return { ok: true, status: res.status, data: corpo?.data };
+    }
+    if (res.status < 400 || res.status >= 500) await lanciaSuErrore(method, path, res);
+    const corpo = await leggiCorpo(res);
+    let message = corpo?.message;
+    if (typeof message !== 'string' || !message) {
+      const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
+      message = `HTTP ${res.status}${text ? `: ${String(text).slice(0, 200)}` : ''}`;
+    }
+    return { ok: false, status: res.status, reason_code: corpo?.reason_code, message, data: corpo?.data };
   }
 
   async function leggiCorpo(res) {
@@ -106,6 +136,23 @@ export function makeApi({
   }
 
   return {
+    /** Lo stato di una campagna, con la mappa degli input. */
+    async campaignState(campaignId) {
+      const out = await req('GET', `/api/v1/campaigns/${campaignId}?with=map`);
+      return out?.data ?? null;
+    },
+    /** Apre una fase. Un rifiuto del server (4xx) torna come `{ ok:false, ... }`, non lancia. */
+    openPhase(campaignId, body) {
+      return reqConEsito('POST', `/api/v1/campaigns/${campaignId}/phases`, body);
+    },
+    async getPhase(phaseId) {
+      const out = await req('GET', `/api/v1/campaign-phases/${phaseId}`);
+      return out?.data ?? null;
+    },
+    /** Spedisce le righe di una fase. Un rifiuto del server (4xx) torna come `{ ok:false, ... }`. */
+    sendTrials(phaseId, body) {
+      return reqConEsito('POST', `/api/v1/campaign-phases/${phaseId}/trials`, body);
+    },
     async nextRun(sessionId) {
       const out = await req('GET', `/api/v1/backtest-sessions/${sessionId}/runs?next=1`);
       return out?.data ?? null;

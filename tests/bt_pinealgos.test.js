@@ -120,3 +120,58 @@ test('getBacktest legge un backtest per id e ritorna data', async () => {
   assert.equal(bt.strategy_name, 'Index Grow Test Claude');
   assert.equal(calls[0], 'https://a.test/api/v1/backtests/1056');
 });
+
+test('openPhase restituisce il rifiuto del server invece di lanciare', async () => {
+  const api = makeApi({ base: 'http://x', token: 't', fetchImpl: async () => ({
+    ok: false, status: 422, headers: new Map(),
+    json: async () => ({ message: 'La prova no tocca il periodo riservato.', reason_code: 'outside_search_interval', data: { trial: 'no' } }),
+    text: async () => '',
+  }) });
+  const out = await api.openPhase(3, { type: 'entry', trials: [] });
+  assert.deepEqual([out.ok, out.status, out.reason_code, out.data.trial], [false, 422, 'outside_search_interval', 'no']);
+});
+
+test('sendTrials lancia su un 500 e ritenta su un 429', async () => {
+  let n = 0;
+  const api = makeApi({ base: 'http://x', token: 't', sleep: async () => {}, fetchImpl: async (url, init) => {
+    n += 1;
+    if (n === 1) return { ok: false, status: 429, headers: new Map([['retry-after', '1']]), text: async () => '' };
+    assert.equal(url, 'http://x/api/v1/campaign-phases/9/trials');
+    assert.equal(JSON.parse(init.body).rows.length, 1);
+    return { ok: true, status: 200, headers: new Map(), json: async () => ({ data: { table: { phase: { position: 2 } } } }) };
+  } });
+  assert.equal((await api.sendTrials(9, { rows: [{ key: 't1' }] })).data.table.phase.position, 2);
+
+  const giu = makeApi({ base: 'http://x', token: 't', fetchImpl: async () => ({ ok: false, status: 500, headers: new Map(), text: async () => 'boom' }) });
+  await assert.rejects(() => giu.sendTrials(9, { rows: [] }), /HTTP 500/);
+});
+
+test('campaignState chiede anche la mappa', async () => {
+  const api = makeApi({ base: 'http://x', token: 't', fetchImpl: async (url) => {
+    assert.equal(url, 'http://x/api/v1/campaigns/3?with=map');
+    return { ok: true, status: 200, headers: new Map(), json: async () => ({ data: { id: 3, map: { inputs: [] } } }) };
+  } });
+  assert.equal((await api.campaignState(3)).id, 3);
+});
+
+test('un 4xx col corpo non JSON torna ok:false con un testo breve, senza lanciare', async () => {
+  const api = makeApi({ base: 'http://x', token: 't', fetchImpl: async () => ({
+    ok: false, status: 404, headers: new Map(),
+    json: async () => { throw new Error('not json'); },
+    text: async () => '<html>non trovato</html>',
+  }) });
+  const out = await api.openPhase(3, {});
+  assert.equal(out.ok, false);
+  assert.equal(out.status, 404);
+  assert.equal(out.reason_code, undefined);
+  assert.equal(out.data, undefined);
+  assert.match(out.message, /HTTP 404/);
+});
+
+test('getPhase legge il campo data', async () => {
+  const api = makeApi({ base: 'http://x', token: 't', fetchImpl: async (url) => {
+    assert.equal(url, 'http://x/api/v1/campaign-phases/7');
+    return { ok: true, status: 200, headers: new Map(), json: async () => ({ data: { id: 7 } }) };
+  } });
+  assert.equal((await api.getPhase(7)).id, 7);
+});
