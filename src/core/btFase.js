@@ -41,7 +41,7 @@ import {
 import { buildInputsPayload } from './btInputs.js';
 import { resolveStrategyEntity } from './btCost.js';
 import { toFinalizePayload, fingerprint } from './btMetrics.js';
-import { misuraProva, fpNotoO } from './btProva.js';
+import { misuraProva, fpNotoO, stessoSymbol } from './btProva.js';
 import { risolviMappa, verificaMappa, daApplicare, configLetta, chiaveMappa } from './btMappa.js';
 import { creaRegistro } from './btRegistro.js';
 
@@ -241,8 +241,9 @@ export async function eseguiFase(opts, deps = {}) {
   let consegnaTentata = false;
   // Una ripresa che non consegna niente restituisce la tabella e le prove rimaste come la
   // piattaforma le ha adesso: lo stato letto all'inizio della chiamata.
+  let faseAltrui = false;
   const tabellaSalvata = () => {
-    if (ripresa && fase && !consegnaTentata) {
+    if (ripresa && fase && !consegnaTentata && !faseAltrui) {
       esito.table = fase.table ?? null;
       esito.budget = stato?.budget ?? null;
     }
@@ -320,6 +321,28 @@ export async function eseguiFase(opts, deps = {}) {
   // Il fermo del ciclo, tenuto dentro quello della consegna: senza, resterebbe solo nel file locale.
   const precedente = (m) => (m ? { previous: { kind: m.kind, detail: m.detail ?? null, trial: m.trial ?? null } } : {});
 
+  // Il mercato e' quello della fase come lo scrive la piattaforma; in mancanza, la chiave del
+  // confine (la scrittura della campagna), mai quella di chi chiama.
+  const mercatoDella = (f) => f?.symbol ?? confineDi(stato.boundaries, mercatoChiesto)?.chiave ?? mercatoChiesto;
+
+  // ⛔ Il cambio di mercato lo fa il nucleo (applicaContestoRun), con tutte le sue guardie sul
+  // report vecchio: qui non si chiama mai setSymbol. Resta un solo caso che il nucleo non vede: lo
+  // stesso ticker su due borse DICHIARATE (grafico FX:EURUSD, campagna OANDA:EURUSD). Per il nucleo
+  // e' lo stesso mercato e non cambierebbe niente; per la piattaforma sono due feed, e ogni prova
+  // verrebbe misurata sull'altro e registrata sotto la campagna. Ci si ferma, senza cambiare ne'
+  // misurare niente: e' l'operatore a portare il grafico sul mercato giusto.
+  const dueBorse = async (mercato, faseId) => {
+    const sulGrafico = (await getChartState())?.symbol;
+    if (!stessoSymbol(sulGrafico, mercato) || stessoMercato(sulGrafico, mercato)) return null;
+    return {
+      kind: 'symbol_not_applied',
+      detail: `Il grafico è su ${sulGrafico}, la campagna è su ${mercato}: stesso ticker ma due borse diverse, cioè due feed diversi. Non ho cambiato niente e nessuna prova è partita. Porta il grafico su ${mercato} e richiama bt_phase`
+        + (faseId != null ? ` con phase_id ${faseId}.` : ' (la fase non è stata dichiarata).'),
+      chart_symbol: sulGrafico,
+      campaign_symbol: mercato,
+    };
+  };
+
   // 3. La fase: nuova (controlli locali, poi dichiarazione) o ripresa.
   const consegnate = new Set();
   if (!ripresa) {
@@ -358,6 +381,9 @@ export async function eseguiFase(opts, deps = {}) {
         budget,
       });
     }
+    // Prima di dichiarare: una fase dichiarata e mai eseguita resterebbe aperta per niente.
+    const borse = await dueBorse(trovato.chiave, null);
+    if (borse) return ferma(borse);
     // Si dichiara la scrittura della campagna (la chiave del confine), non quella di chi chiama:
     // e' anche quella su cui poi si misura.
     const aperta = await allAvvio(() => api.openPhase(campaign_id, { type, symbol: trovato.chiave, trials: dichiarate }));
@@ -390,6 +416,8 @@ export async function eseguiFase(opts, deps = {}) {
     // La fase deve essere di QUESTA campagna: configurazione di lavoro, timeframe e confini sono
     // quelli della campagna chiamata, e le righe andrebbero a un'altra.
     if (fase.campaign_id != null && String(fase.campaign_id) !== String(campaign_id)) {
+      // La tabella e' di un'altra campagna: non va accanto al budget di questa.
+      faseAltrui = true;
       return ferma({
         kind: 'phase_not_in_campaign',
         detail: `La fase ${esito.phase_id} è della campagna ${fase.campaign_id}, non della campagna ${campaign_id}: non la riprendo e non ho toccato il grafico. Richiama bt_phase con il campaign_id della fase.`,
@@ -401,6 +429,9 @@ export async function eseguiFase(opts, deps = {}) {
         detail: `La fase ${esito.phase_id} è già stata decisa: le sue prove non si eseguono più. Per provare altro dichiara una fase nuova (type e trials).`,
       });
     }
+    // Prima di consegnare il file e di toccare il grafico.
+    const borse = await dueBorse(mercatoDella(fase), esito.phase_id);
+    if (borse) return ferma(borse);
 
     // Le righe rimaste in locale da una chiamata precedente si consegnano PRIMA di tutto: le prove
     // gia' misurate non si rifanno. Ma solo se il file e' di questa fase: stessa campagna, e ogni
@@ -452,9 +483,7 @@ export async function eseguiFase(opts, deps = {}) {
 
   // Il confine si guarda anche sulle prove come le restituisce la piattaforma: e' la stessa regola,
   // e nessuna prova parte senza esserci passata.
-  // Il mercato e' quello della fase come lo scrive la piattaforma; in mancanza, la chiave del
-  // confine (la scrittura della campagna), mai quella di chi chiama.
-  const mercato = fase.symbol ?? confineDi(stato.boundaries, mercatoChiesto)?.chiave ?? mercatoChiesto;
+  const mercato = mercatoDella(fase);
   const confineFase = confineDi(stato.boundaries, mercato)?.confine ?? null;
   const fuori = daFare.find((t) => !dentroIlConfine(confineFase, t.period_start, t.period_end));
   if (fuori) {
@@ -463,23 +492,6 @@ export async function eseguiFase(opts, deps = {}) {
       detail: `La prova ${fuori.key} (${fuori.period_start ?? '?'} → ${fuori.period_end ?? '?'}) non sta nel periodo di ricerca del mercato ${mercato ?? '?'}: nessuna prova è partita.`,
       trial: fuori.key,
     });
-  }
-
-  // Il grafico sul mercato della campagna, con la regola della piattaforma. Il nucleo cambia simbolo
-  // solo se il ticker e' diverso: col grafico sullo stesso ticker ma su un'altra borsa misurerebbe
-  // ogni prova sull'altro feed e la registrerebbe sotto il mercato della campagna. Prima del
-  // pannello, perche' un cambio di simbolo lo chiude.
-  const sulGrafico = (await getChartState())?.symbol;
-  if (!stessoMercato(sulGrafico, mercato)) {
-    await setSymbol({ symbol: mercato });
-    await sleep(500);
-    const dopo = (await getChartState())?.symbol;
-    if (!stessoMercato(dopo, mercato)) {
-      return ferma({
-        kind: 'symbol_not_applied',
-        detail: `Il grafico è su ${dopo ?? '?'} e non sono riuscito a portarlo su ${mercato}, il mercato della campagna: nessuna prova è partita. Apri ${mercato} sul grafico e richiama bt_phase con phase_id ${esito.phase_id}.`,
-      });
-    }
   }
 
   // 4. Come grindSession: pannello, strategia visibile, studio non rotto, impronta di partenza.

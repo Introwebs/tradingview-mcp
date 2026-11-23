@@ -165,6 +165,13 @@ test('una fase di un altra campagna non si riprende: fermo prima di toccare il g
   assert.equal(b.registro.leggi(9).campaign_id, 55, 'il file della fase resta a chi appartiene');
 });
 
+test('una fase di un altra campagna non porta la sua tabella accanto al budget di questa', async () => {
+  const b = banco({ metricsSeq: [M()], fase: faseDa([provaDa('t1', 'measured', 2)], { campaign_id: 55, table: { altrui: true } }) });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'phase_not_in_campaign');
+  assert.deepEqual([out.table, out.budget], [null, null]);
+});
+
 test('una fase gia decisa non si riprende', async () => {
   const b = banco({ metricsSeq: [M()], fase: faseDa([provaDa('t1', 'failed', 2)], { decision: { adopt: [], reason: 'x' } }) });
   const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
@@ -317,25 +324,50 @@ test('un mercato con un altra borsa dichiarata non e quello della campagna', asy
   assert.deepEqual([out.stopped_reason.kind, b.visto.open.length], ['unknown_symbol', 0]);
 });
 
-test('grafico sullo stesso ticker ma su un altra borsa: prima si porta sul mercato della campagna', async () => {
-  const b = banco({ simboloGrafico: 'OANDA:NDQ', metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })] });
+/** Il banco con l'ordine delle chiamate a setSymbol e ensureTesterPanel registrato in `ordine`. */
+function bancoConOrdine(opzioni) {
+  const b = banco(opzioni);
   const ordine = [];
   const { setSymbol, ensureTesterPanel } = b.deps;
   b.deps.setSymbol = async (a) => { ordine.push(`setSymbol ${a.symbol}`); return setSymbol(a); };
   b.deps.ensureTesterPanel = async () => { ordine.push('ensureTesterPanel'); return ensureTesterPanel(); };
+  return { ...b, ordine };
+}
+
+test('grafico su un altro ticker: il cambio di mercato lo fa il nucleo, con le sue guardie', async () => {
+  const b = bancoConOrdine({ simboloGrafico: 'FX:EURUSD', metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })] });
   const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(b.ordine[0], 'ensureTesterPanel', 'btFase non cambia simbolo prima di passare la prova al nucleo');
+  assert.ok(b.ordine.includes('setSymbol TVC:NDQ'), 'il nucleo porta il grafico sul mercato della campagna');
   assert.equal(b.chart.symbol, 'TVC:NDQ');
-  assert.deepEqual(ordine.slice(0, 2), ['setSymbol TVC:NDQ', 'ensureTesterPanel'], 'il cambio di simbolo chiude il pannello: prima il simbolo');
   assert.deepEqual([out.executed, out.stopped_reason], [3, null]);
 });
 
-test('se il grafico non passa al mercato della campagna nessuna prova parte', async () => {
-  const b = banco({ simboloGrafico: 'OANDA:NDQ', metricsSeq: [M()] });
-  b.deps.setSymbol = async () => ({ success: true });   // TradingView non cambia
+test('stesso ticker su un altra borsa dichiarata: fermo prima di dichiarare, niente cambiato ne misurato', async () => {
+  const b = bancoConOrdine({ simboloGrafico: 'OANDA:NDQ', metricsSeq: [M()] });
   const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
   assert.equal(out.stopped_reason.kind, 'symbol_not_applied');
   assert.match(out.stopped_reason.detail, /OANDA:NDQ/);
-  assert.deepEqual([out.executed, out.remaining_in_phase, b.chart.setInputsChiamate, b.visto.inviate.length], [0, 3, 0, 0]);
+  assert.match(out.stopped_reason.detail, /TVC:NDQ/);
+  assert.deepEqual([out.executed, b.visto.open.length, b.ordine.length, b.chart.setInputsChiamate], [0, 0, 0, 0]);
+  assert.equal(b.chart.symbol, 'OANDA:NDQ');
+});
+
+test('stesso ticker su un altra borsa alla ripresa: fermo prima di consegnare il file o toccare il grafico', async () => {
+  const b = bancoConOrdine({ simboloGrafico: 'OANDA:NDQ', metricsSeq: [M()], fase: faseDa([provaDa('t1', 'pending', 2), provaDa('t2', 'pending', 3)]) });
+  b.registro.scrivi(9, { campaign_id: 3, rows: [rigaMisurata('t1', 2)] });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'symbol_not_applied');
+  assert.match(out.stopped_reason.detail, /richiama bt_phase con phase_id 9/);
+  assert.deepEqual([out.executed, b.visto.inviate.length, b.ordine.length, b.chart.setInputsChiamate], [0, 0, 0, 0]);
+  assert.equal(b.registro.leggi(9).rows.length, 1, 'il file resta per la ripresa');
+});
+
+test('un mercato scritto senza borsa da un lato e lo stesso mercato: nessun fermo, nessun cambio', async () => {
+  const b = bancoConOrdine({ simboloGrafico: 'NDQ', metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })] });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual([out.executed, out.stopped_reason], [3, null]);
+  assert.equal(b.ordine.some((o) => o.startsWith('setSymbol')), false);
 });
 
 test('una campagna senza timeframe non si esegue', async () => {
