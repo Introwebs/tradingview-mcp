@@ -116,6 +116,76 @@ test('il progress parla per fasi e per prove, non per ogni passo', async () => {
   assert.match(b.visto.progress[1], /^Fase gestione: 3 prove in /);
 });
 
+// --- Ripresa: il file locale e la fase devono essere di QUESTA campagna -------------------------
+
+const RICERCA = { period_start: '2018-01-01', period_end: '2024-01-01' };
+const faseDa = (trials, extra = {}) => ({ id: 9, campaign_id: 3, position: 2, type: 'management', symbol: 'TVC:NDQ', table: null, decision: null, trials, ...extra });
+const provaDa = (key, status, value) => ({ key, status, ...RICERCA, inputs: value === undefined ? [] : [{ name: 'Risk/Reward', position: 1, value }] });
+const rigaMisurata = (key, value) => ({ key, status: 'measured', ...RICERCA, config: [{ name: 'Risk/Reward', position: 1, value }], metrics: {}, metrics_source: 'panel' });
+
+test('un file locale di un altra campagna non si consegna: si mette da parte e le prove si eseguono', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 })],
+    fase: faseDa([provaDa('t1', 'pending', 2), provaDa('t2', 'pending', 3)]) });
+  b.registro.scrivi(9, { campaign_id: 77, rows: [rigaMisurata('t1', 9), rigaMisurata('t2', 9)] });
+
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+
+  assert.equal(out.discarded_local_file, true);
+  assert.equal(b.visto.inviate.length, 1, 'una sola consegna: quella delle prove eseguite ora');
+  assert.deepEqual(b.visto.inviate[0].rows.map((r) => [r.key, r.config[0].value]), [['t1', 2], ['t2', 3]]);
+  assert.deepEqual([out.executed, out.remaining_in_phase], [2, 0]);
+  assert.equal(b.registro.scartati[0].campaign_id, 77, 'messo da parte, non cancellato');
+});
+
+test('un file locale con prove che la fase non ha non si consegna', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 })], fase: faseDa([provaDa('a', 'pending', 2)]) });
+  b.registro.scrivi(9, { campaign_id: 3, rows: [rigaMisurata('t1', 2)] });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.discarded_local_file, true);
+  assert.deepEqual(b.visto.inviate.map((c) => c.rows.map((r) => r.key)), [['a']]);
+});
+
+test('il file locale giusto si consegna ancora, e il risultato non dice di averlo scartato', async () => {
+  const b = banco({ metricsSeq: [M()], fase: faseDa([provaDa('t1', 'pending', 2)]) });
+  b.registro.scrivi(9, { campaign_id: '3', rows: [rigaMisurata('t1', 2)] });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual([out.discarded_local_file, out.executed, b.visto.inviate.length, b.chart.setInputsChiamate], [false, 0, 1, 0]);
+});
+
+test('una fase di un altra campagna non si riprende: fermo prima di toccare il grafico', async () => {
+  const b = banco({ metricsSeq: [M()], fase: faseDa([provaDa('t1', 'pending', 2)], { campaign_id: 55 }) });
+  b.registro.scrivi(9, { campaign_id: 55, rows: [rigaMisurata('t1', 2)] });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'phase_not_in_campaign');
+  assert.match(out.stopped_reason.detail, /campagna 55/);
+  assert.deepEqual([out.executed, b.visto.inviate.length, b.chart.setInputsChiamate], [0, 0, 0]);
+  assert.equal(b.registro.leggi(9).campaign_id, 55, 'il file della fase resta a chi appartiene');
+});
+
+test('una fase gia decisa non si riprende', async () => {
+  const b = banco({ metricsSeq: [M()], fase: faseDa([provaDa('t1', 'failed', 2)], { decision: { adopt: [], reason: 'x' } }) });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'already_decided');
+  assert.deepEqual([out.executed, b.visto.inviate.length, b.chart.setInputsChiamate], [0, 0, 0]);
+});
+
+test('alla ripresa prima le prove da fare, per ultime quelle fallite', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })],
+    fase: faseDa([provaDa('t1', 'failed', 2), provaDa('t2', 'pending', 3), provaDa('t3', 'pending', 4)]) });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1', max_trials_per_call: 2 }, b.deps);
+  assert.deepEqual(b.visto.inviate[0].rows.map((r) => r.key), ['t2', 't3']);
+  assert.equal(out.remaining_in_phase, 1);
+});
+
+test('una ripresa senza niente da eseguire restituisce la tabella salvata e le prove rimaste', async () => {
+  const tabella = { phase: { position: 2 }, inputs: [] };
+  const b = banco({ metricsSeq: [M()], fase: faseDa([provaDa('t1', 'measured', 2)], { table: tabella }) });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual([out.executed, out.remaining_in_phase, out.stopped_reason], [0, 0, null]);
+  assert.deepEqual(out.table, tabella);
+  assert.deepEqual(out.budget, STATO.budget);
+});
+
 test('il confine: entrambe le date, nel formato giusto, dentro il periodo di ricerca', () => {
   const c = { search_from: '2018-01-01', search_until: '2024-01-01' };
   assert.equal(dentroIlConfine(c, '2018-01-01', '2024-01-01'), true);

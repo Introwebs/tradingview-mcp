@@ -169,14 +169,27 @@ export async function eseguiFase(opts, deps = {}) {
   const esito = {
     success: true, campaign_id, phase_id: null, position: null, type: ripresa ? null : type,
     executed: 0, zero_trades: 0, failed: 0, remaining_in_phase: 0,
-    stopped_reason: null, table: null, budget: null, pending_file: false,
+    stopped_reason: null, table: null, budget: null, pending_file: false, discarded_local_file: false,
+  };
+  let stato = null;
+  let fase = null;
+  // Vero appena questa chiamata prova a consegnare righe: da li' in poi `table` e `budget` sono
+  // quelli della consegna (o null se e' fallita), mai quelli letti all'inizio.
+  let consegnaTentata = false;
+  // Una ripresa che non consegna niente restituisce la tabella e le prove rimaste come la
+  // piattaforma le ha adesso: lo stato letto all'inizio della chiamata.
+  const tabellaSalvata = () => {
+    if (ripresa && fase && !consegnaTentata) {
+      esito.table = fase.table ?? null;
+      esito.budget = stato?.budget ?? null;
+    }
   };
   const nome = () => NOMI_FASE[esito.type] ?? esito.type ?? '?';
   const avvisaFermo = (m) => api.progress(command_id, `⛔ Fase ${nome()}: ${motivoBreve(m)} — mi fermo`);
-  const ferma = async (m) => { esito.stopped_reason = m; await avvisaFermo(m); return esito; };
+  const ferma = async (m) => { esito.stopped_reason = m; tabellaSalvata(); await avvisaFermo(m); return esito; };
 
   // 1. Lo stato della campagna, con la mappa degli input.
-  const stato = await api.campaignState(campaign_id);
+  stato = await api.campaignState(campaign_id);
   if (!stato) throw new Error(`campagna ${campaign_id} non trovata`);
   if (!Array.isArray(stato.map?.inputs)) throw new Error(`lo stato della campagna ${campaign_id} non porta la mappa degli input`);
   if (stato.next?.action === 'blocked') {
@@ -203,6 +216,7 @@ export async function eseguiFase(opts, deps = {}) {
   // Consegna alla piattaforma. Il file locale si cancella quando la piattaforma ha risposto, anche
   // con un rifiuto (le righe rifiutate non vanno riproposte); resta solo se non ha risposto.
   const consegna = async (phaseId, corpo) => {
+    consegnaTentata = true;
     let r;
     try { r = await api.sendTrials(phaseId, corpo); } catch (e) { return { guasto: e }; }
     registro.cancella(phaseId);
@@ -221,7 +235,6 @@ export async function eseguiFase(opts, deps = {}) {
   });
 
   // 3. La fase: nuova (controlli locali, poi dichiarazione) o ripresa.
-  let fase;
   const consegnate = new Set();
   if (!ripresa) {
     const confine = confineDi(stato.boundaries, mercatoChiesto);
@@ -279,29 +292,59 @@ export async function eseguiFase(opts, deps = {}) {
   esito.type = fase.type ?? esito.type;
 
   if (ripresa) {
-    // Le righe rimaste in locale da una chiamata precedente si consegnano PRIMA di tutto: le prove
-    // gia' misurate non si rifanno.
-    const salvato = registro.leggi(esito.phase_id);
-    if (salvato?.rows?.length) {
-      const fatteInLocale = salvato.rows.filter((r) => r.status === 'measured' || r.status === 'zero_trades').map((r) => r.key);
-      const c = await consegna(esito.phase_id, {
-        rows: salvato.rows,
-        ...(salvato.properties && { properties: salvato.properties }),
-        ...(salvato.stopped_reason && { stopped_reason: salvato.stopped_reason }),
+    // La fase deve essere di QUESTA campagna: configurazione di lavoro, timeframe e confini sono
+    // quelli della campagna chiamata, e le righe andrebbero a un'altra.
+    if (fase.campaign_id != null && String(fase.campaign_id) !== String(campaign_id)) {
+      return ferma({
+        kind: 'phase_not_in_campaign',
+        detail: `La fase ${esito.phase_id} è della campagna ${fase.campaign_id}, non della campagna ${campaign_id}: non la riprendo e non ho toccato il grafico. Richiama bt_phase con il campaign_id della fase.`,
       });
-      if (!c.ok) {
-        esito.remaining_in_phase = fase.trials.filter((t) => (t.status === 'pending' || t.status === 'failed') && !fatteInLocale.includes(t.key)).length;
-        if (c.guasto) { esito.pending_file = true; return ferma(fermoIrraggiungibile(c.guasto, true)); }
-        return ferma(fermoRifiuto(c.rifiuto));
+    }
+    if (fase.decision != null) {
+      return ferma({
+        kind: 'already_decided',
+        detail: `La fase ${esito.phase_id} è già stata decisa: le sue prove non si eseguono più. Per provare altro dichiara una fase nuova (type e trials).`,
+      });
+    }
+
+    // Le righe rimaste in locale da una chiamata precedente si consegnano PRIMA di tutto: le prove
+    // gia' misurate non si rifanno. Ma solo se il file e' di questa fase: stessa campagna, e ogni
+    // sua prova fra quelle dichiarate. Un file di un'altra campagna (o di un'altra piattaforma con
+    // gli stessi id) porterebbe in questa i numeri di un'altra strategia, in silenzio.
+    const salvato = registro.leggi(esito.phase_id);
+    if (salvato) {
+      const dichiarate = new Set(fase.trials.map((t) => t.key));
+      const righe = Array.isArray(salvato.rows) ? salvato.rows : [];
+      const suo = String(salvato.campaign_id) === String(campaign_id) && righe.every((r) => dichiarate.has(r.key));
+      if (!suo) {
+        registro.scarta(esito.phase_id);
+        esito.discarded_local_file = true;
+      } else if (righe.length) {
+        const fatteInLocale = righe.filter((r) => r.status === 'measured' || r.status === 'zero_trades').map((r) => r.key);
+        const c = await consegna(esito.phase_id, {
+          rows: righe,
+          ...(salvato.properties && { properties: salvato.properties }),
+          ...(salvato.stopped_reason && { stopped_reason: salvato.stopped_reason }),
+        });
+        if (!c.ok) {
+          esito.remaining_in_phase = fase.trials.filter((t) => (t.status === 'pending' || t.status === 'failed') && !fatteInLocale.includes(t.key)).length;
+          if (c.guasto) { esito.pending_file = true; return ferma(fermoIrraggiungibile(c.guasto, true)); }
+          return ferma(fermoRifiuto(c.rifiuto));
+        }
+        for (const k of fatteInLocale) consegnate.add(k);
       }
-      for (const k of fatteInLocale) consegnate.add(k);
     }
   }
-  const daFare = ripresa
+  // Alla ripresa prima le prove ancora da fare, per ultime quelle fallite: una prova che fallisce
+  // sempre, messa in testa, fermerebbe la fase ogni volta prima che le altre partano.
+  const senzaRisultato = ripresa
     ? fase.trials.filter((t) => (t.status === 'pending' || t.status === 'failed') && !consegnate.has(t.key))
     : fase.trials;
+  const daFare = ripresa
+    ? [...senzaRisultato.filter((t) => t.status === 'pending'), ...senzaRisultato.filter((t) => t.status === 'failed')]
+    : senzaRisultato;
   esito.remaining_in_phase = daFare.length;
-  if (!daFare.length) return esito;
+  if (!daFare.length) { tabellaSalvata(); return esito; }
 
   // Il confine si guarda anche sulle prove come le restituisce la piattaforma: e' la stessa regola,
   // e nessuna prova parte senza esserci passata.

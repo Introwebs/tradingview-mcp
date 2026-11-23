@@ -28,10 +28,18 @@ export const STATO = {
 
 function registroInMemoria() {
   const file = new Map();
+  // I file messi da parte (`scarta`): il contenuto, nell'ordine in cui sono stati scartati.
+  const scartati = [];
   return {
+    scartati,
     leggi: (phaseId) => (file.has(String(phaseId)) ? JSON.parse(file.get(String(phaseId))) : null),
     scrivi: (phaseId, dati) => { file.set(String(phaseId), JSON.stringify(dati)); },
     cancella: (phaseId) => { file.delete(String(phaseId)); },
+    scarta: (phaseId) => {
+      if (!file.has(String(phaseId))) return;
+      scartati.push(JSON.parse(file.get(String(phaseId))));
+      file.delete(String(phaseId));
+    },
   };
 }
 

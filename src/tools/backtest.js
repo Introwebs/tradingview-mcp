@@ -4,6 +4,7 @@ import * as core from '../core/backtest.js';
 import { resolveConfig, makeApi } from '../core/pinealgos.js';
 import { applyBacktest } from '../core/btApply.js';
 import { eseguiFase } from '../core/btFase.js';
+import { creaRegistro } from '../core/btRegistro.js';
 
 export function registerBacktestTools(server) {
   server.tool(
@@ -92,7 +93,8 @@ export function registerBacktestTools(server) {
         }
         const { base, token } = resolveConfig();
         const api = makeApi({ base, token });
-        return jsonResult(await eseguiFase(args, { api }));
+        // Il registro locale e' per piattaforma: la fase 9 del locale non e' la fase 9 della produzione.
+        return jsonResult(await eseguiFase(args, { api, registro: creaRegistro({ ambito: base }) }));
       } catch (err) {
         return jsonResult({ success: false, error: err.message }, true);
       }
