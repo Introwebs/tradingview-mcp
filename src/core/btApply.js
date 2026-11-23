@@ -18,7 +18,9 @@ import { setCustomPeriod as realSetCustomPeriod, readTestPeriod as realReadTestP
 import {
   readPanelMetrics as realReadPanelMetrics, ensureTesterPanel as realEnsureTesterPanel,
   attendiReportAggiornato as realAttendiReport, aggiornaReportSeObsoleto as realAggiornaReportSeObsoleto,
+  reportObsoleto as realReportObsoleto,
 } from './btPanel.js';
+import { readDeepState as realReadDeepState, sincronizzaReport } from './btDeep.js';
 import {
   readInputsInfo as realReadInputsInfo, readInputValues as realReadInputValues,
   readReportFor as realReadReportFor, readStrategyLoading as realReadStrategyLoading,
@@ -117,10 +119,23 @@ export async function applyBacktest(opts, deps = {}) {
     readStrategyLoading = realReadStrategyLoading,
     readReportFor = realReadReportFor, readPanelMetrics = realReadPanelMetrics,
     readStudyStatus = realReadStudyStatus, ensureVisibleFor = realEnsureVisibleFor, sleep = realSleep,
+    readDeepState = realReadDeepState, reportObsoleto = realReportObsoleto, now = () => performance.now(),
   } = deps;
   if (!backtest_id) throw new Error('backtest_id è obbligatorio');
   if (!api || typeof api.getBacktest !== 'function') throw new Error('deps.api.getBacktest è obbligatorio');
   const nota = async (m) => { if (typeof api.progress === 'function') await api.progress(command_id, m); };
+
+  // Il report si aspetta sulla RICHIESTA di backtest esteso, non sul banner ne' sui numeri: vedi
+  // btDeep.js. Dove il modello di TradingView non e' leggibile (`disponibile: false`) restano le
+  // attese di prima, invariate.
+  const sincronizza = (extra = {}) => sincronizzaReport({
+    readDeepState, reportObsoleto,
+    cliccaAggiorna: () => aggiornaReportSeObsoleto({ tentativi: 1, attesaMs: 0 }),
+    sleep, now, timeoutMs: Math.max(recalc_timeout_ms, 60000), ...extra,
+  });
+  const reportNonArrivato = (sinc) => (sinc.motivo === 'errore_tradingview'
+    ? ['deep_backtest_error', `TradingView ha rifiutato il backtest esteso ("${sinc.errore}"): il report non esiste, quindi le metriche non sono leggibili. Riavvia TradingView e rilancia.`]
+    : ['report_not_synced', `il report del backtest esteso non e' arrivato (${sinc.motivo}): le metriche sul pannello sono di una configurazione precedente. Controlla il tester su TradingView e rilancia.`]);
 
   const bt = await api.getBacktest(backtest_id);
   if (!bt) return fail('backtest_not_found', `backtest #${backtest_id} non trovato`);
@@ -189,7 +204,14 @@ export async function applyBacktest(opts, deps = {}) {
   // prima, altrimenti la baseline sarebbe quella del contesto precedente.
   const periodoRistretto = !!(giornoISO(bt.period_start) && giornoISO(bt.period_end));
   const leggi = (id) => leggiMetricheEffettive(id, { readReportFor, readPanelMetrics, periodoRistretto });
-  if (contesto.contestoCambiato) await aggiornaReportSeObsoleto();
+  // Dal 2026-11-23 il rinfresco aspetta che la richiesta partita col cambio di contesto ATTERRI: su
+  // quattro anni di M5 impiega 5-7 s, e in quel tempo il pannello mostra il report di prima.
+  const sincPrima = await sincronizza();
+  if (sincPrima.disponibile && sincPrima.deep) {
+    if (!sincPrima.ok) return fail(...reportNonArrivato(sincPrima), appliedSoFar());
+  } else if (contesto.contestoCambiato) {
+    await aggiornaReportSeObsoleto();
+  }
   const prima = await leggi(entity_id);
   const baselineFp = fpNotoO(null, prima?.success !== false ? prima?.metrics : null);
   // Se il chart e' GIA' sui valori richiesti, non ricalcolare e' corretto e l'identita' con la
@@ -217,10 +239,21 @@ export async function applyBacktest(opts, deps = {}) {
     return fail('strategy_in_error', `dopo aver applicato gli input la strategia e' in errore di runtime su TradingView: "${statoDopoSet}". Il chart e' rimasto con questi input: ricarica la strategia (o rimetti la versione con cui il backtest e' stato misurato) prima di rileggerne le metriche.`, appliedSoFar());
   }
 
-  const report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+  // «Banner sparito» non e' «report attuale»: il banner sparisce al click, e non compare affatto se
+  // l'input cambia mentre un'altra richiesta e' in volo (e' il "banner arrivato dopo" del #1009).
+  let report;
+  const sincDopo = await sincronizza({ graziaInizialeMs: deltaReale ? 1500 : 0 });
+  if (sincDopo.disponibile && sincDopo.deep) {
+    if (!sincDopo.ok) return fail(...reportNonArrivato(sincDopo), appliedSoFar());
+    report = { aggiornato: true, click: sincDopo.click, sincronizzato: true };
+  } else {
+    report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+  }
   if (report.click > 0) await nota('report obsoleto → premuto "Aggiorna report"');
   const { results: results0 } = await waitForRecalc(entity_id, baselineFp, {
     readReport: leggi, readLoading: readStrategyLoading, sleep, timeoutMs: recalc_timeout_ms,
+    // Con la richiesta gia' vista atterrare non c'e' un ricalcolo da aspettare che parta.
+    ...(report.sincronizzato && { startGraceMs: 0 }),
   });
   let results = results0;
   let avviso = null;
@@ -230,7 +263,13 @@ export async function applyBacktest(opts, deps = {}) {
   // ridipinge dopo). Si rilegge invece di scrivere: se i numeri si muovono era stale; se non si
   // muovono nemmeno insistendo e il banner e' sparito, l'identita' e' vera (C4). Banner ancora su
   // = ricalcolo mai partito, si insiste di piu' e, se non basta, e' `stale_metrics`.
-  if (deltaReale && results?.metrics && fingerprint(results.metrics) === baselineFp) {
+  if (report.sincronizzato) {
+    // La richiesta di questi input e' partita ed e' atterrata: se i numeri coincidono con quelli di
+    // prima l'identita' e' provata, e rileggere costerebbe solo tempo.
+    if (deltaReale && results?.metrics && fingerprint(results.metrics) === baselineFp) {
+      avviso = 'metriche identiche alla configurazione precedente (report ricalcolato e attuale)';
+    }
+  } else if (deltaReale && results?.metrics && fingerprint(results.metrics) === baselineFp) {
     const corsaColRidisegno = report.aggiornato;
     const ri = await rileggiFinoACambio(entity_id, baselineFp, {
       leggiMetriche: leggi, periodoRistretto, sleep, aggiornaReport: aggiornaReportSeObsoleto,
@@ -253,7 +292,14 @@ export async function applyBacktest(opts, deps = {}) {
   // c'e' si preme e si rilegge, altrimenti si consegnerebbero i numeri di prima con l'etichetta di
   // adesso — e all'utente resta il pannello che dice "obsoleto" su un comando riuscito.
   // Misurato il 2026-09-04 sul #1009: periodo e input applicati, banner mai premuto.
-  const ultimoGiro = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+  let ultimoGiro;
+  if (report.sincronizzato) {
+    const sincFine = await sincronizza();
+    if (sincFine.disponibile && sincFine.deep && !sincFine.ok) return fail(...reportNonArrivato(sincFine), appliedSoFar());
+    ultimoGiro = { aggiornato: true, click: sincFine.click || 0 };
+  } else {
+    ultimoGiro = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+  }
   if (ultimoGiro.click > 0) {
     await nota(`report tornato obsoleto → premuto "Aggiorna report"${ultimoGiro.click > 1 ? ` (${ultimoGiro.click}x)` : ''}`);
     const fpPrima = results?.metrics ? fingerprint(results.metrics) : null;

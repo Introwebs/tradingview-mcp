@@ -23,8 +23,10 @@ import {
   attendiReportAggiornato as realAttendiReport,
   setPanelMaximized as realSetPanelMaximized,
   readPeriodReport as realReadPeriodReport,
+  reportObsoleto as realReportObsoleto,
   rischioDalReportDelPeriodo,
 } from './btPanel.js';
+import { readDeepState as realReadDeepState, sincronizzaReport } from './btDeep.js';
 import {
   readInputsInfo as realReadInputsInfo,
   readInputValues as realReadInputValues,
@@ -371,6 +373,8 @@ export async function grindSession(opts, deps = {}) {
     ensureTesterPanel = realEnsureTesterPanel,
     aggiornaReportSeObsoleto = realAggiornaReport,
     attendiReportAggiornato = realAttendiReport,
+    readDeepState = realReadDeepState,
+    reportObsoleto = realReportObsoleto,
     setPanelMaximized = realSetPanelMaximized,
     sleep = realSleep,
     now = () => performance.now(),
@@ -387,6 +391,19 @@ export async function grindSession(opts, deps = {}) {
   // l'attesa del ricalcolo sia il payload, cosi' non possono divergere.
   const leggiMetriche = (id, periodoRistretto) => leggiMetricheEffettive(id, { readReportFor, readPanelMetrics, periodoRistretto });
   const ctxRun = { getChartState, setSymbol, setTimeframe, setCustomPeriod, readTestPeriod, ensureTesterPanel, sleep };
+
+  // ⛔ IL REPORT SI ASPETTA SULLA RICHIESTA, NON SUL BANNER NE' SUI NUMERI ⛔
+  // In modalita' ESTESO (periodo personalizzato) ogni report e' una richiesta che impiega secondi.
+  // Il banner "report obsoleto" sparisce al click, non all'arrivo; e i numeri che cambiano possono
+  // essere quelli di una richiesta precedente. `sincronizzaReport` aspetta che la richiesta degli
+  // input e del periodo CORRENTI sia atterrata (btDeep.js: la storia e le misure sono li').
+  // Se il modello di TradingView non e' leggibile torna `disponibile: false` e valgono le attese di
+  // prima, invariate.
+  const sincronizza = (extra = {}) => sincronizzaReport({
+    readDeepState, reportObsoleto,
+    cliccaAggiorna: () => aggiornaReportSeObsoleto({ tentativi: 1, attesaMs: 0 }),
+    sleep, now, timeoutMs: Math.max(recalc_timeout_ms, 60000), ...extra,
+  });
 
   if (!session_id) throw new Error('session_id è obbligatorio');
   if (!entity_id && strategy_name) {
@@ -478,6 +495,30 @@ export async function grindSession(opts, deps = {}) {
   // Run consecutive senza alcun trade: una e' un dato sul periodo, tante di fila sono una
   // configurazione rotta (vedi il ramo zero_trades nel loop).
   let consecutiveZeroTrades = 0;
+
+  // Il report degli input correnti non e' arrivato: TradingView l'ha rifiutato (es. "not_allowed",
+  // visto dal vivo il 2026-11-23: da li' in poi ogni richiesta estesa falliva finche' TradingView non
+  // e' stato riavviato) oppure la richiesta non e' atterrata in tempo. In nessuno dei due casi c'e'
+  // qualcosa da misurare, e qualunque numero resti sul pannello e' di una configurazione precedente.
+  // La run non ha colpa: torna in coda, e il grind si ferma perche' le successive farebbero lo stesso.
+  const fermaReportNonArrivato = async (run, sinc) => {
+    const rifiuto = sinc.motivo === 'errore_tradingview';
+    const cosa = rifiuto ? `TradingView ha rifiutato il backtest esteso ("${sinc.errore}")` : `il report del backtest esteso non e' arrivato (${sinc.motivo})`;
+    let inCoda = false;
+    try {
+      if (typeof api.reclaimRun === 'function') { await api.reclaimRun(run.id); inCoda = true; }
+      else await api.markFailed(run.id, `${rifiuto ? 'deep_backtest_error' : 'report_not_synced'}: ${rifiuto ? sinc.errore : sinc.motivo}`);
+    } catch { /* la diagnosi vera e' lo stop qui sotto, non l'esito di questa chiamata */ }
+    stopped_reason = {
+      kind: rifiuto ? 'deep_backtest_error' : 'report_not_synced',
+      detail: `${cosa}: non c'e' un report da misurare e nessuna run e' stata registrata con numeri non suoi.`
+        + `${inCoda ? ` La run ${run.id} e' tornata in coda.` : ''}`
+        + `${rifiuto ? ' Riavvia TradingView e rilancia' : ' Controlla il tester su TradingView e rilancia'}: il grind riparte dalle pending.`,
+      run_id: run.id, label: run.label ?? null,
+    };
+    rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: `${stopped_reason.kind}: ${rifiuto ? sinc.errore : sinc.motivo}${inCoda ? ' (run rimessa in coda)' : ''}`.slice(0, 300) });
+    await api.progress(command_id, `⛔ run ${run.id}: ${cosa} — mi fermo`);
+  };
 
   // ⛔ LO STATO D'ERRORE SI CHIEDE, NON SI DEDUCE ⛔
   // Una strategia in errore di runtime non produce report: da fuori e' indistinguibile da una che
@@ -573,7 +614,17 @@ export async function grindSession(opts, deps = {}) {
       // valore vecchio, e il confronto successivo non direbbe niente. Quindi: si aggiorna il report,
       // si aspetta che i numeri si assestino, e SOLO ALLORA si fotografa lo stato "contesto nuovo,
       // input vecchi". Da li' in poi qualunque immobilita' e' colpa degli input non applicati.
-      if (contestoCambiato) {
+      //
+      // Dal 2026-11-23 «si aspetta che si assestino» non si deduce piu' dai numeri fermi: un cambio di
+      // periodo fa partire una richiesta che su quattro anni impiega 5-7 s, e in quel tempo il
+      // pannello mostra — fermissimo — il report del periodo di PRIMA. Si aspetta che la richiesta
+      // atterri. Vale anche a contesto fermo: una richiesta rimasta in volo o un banner non premuto
+      // dalla run precedente si chiudono qui, prima di prendere il riferimento.
+      const sincPrima = await sincronizza();
+      if (sincPrima.disponibile && sincPrima.deep) {
+        if (!sincPrima.ok) { await fermaReportNonArrivato(run, sincPrima); break; }
+        if (sincPrima.click > 0) await nota(`run ${run.id}: report obsoleto all'inizio della run, aggiornato prima della baseline`);
+      } else if (contestoCambiato) {
         const rinfresco = await aggiornaReportSeObsoleto();
         if (rinfresco.cliccato) {
           await nota(`run ${run.id}: contesto cambiato, report aggiornato prima della baseline`);
@@ -697,7 +748,19 @@ export async function grindSession(opts, deps = {}) {
       // Due input_set diversi possono dare lo stesso identico report (misurato: RR target 1.5/2/3
       // -> sempre 651 trade, perche' agisce solo in mgmt mode "Classic"), quindi "numeri fermi" non
       // e' una prova di niente. Banner sparito = report attuale per QUESTI input.
-      const report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+      //
+      // Dal 2026-11-23: «banner sparito» NON e' «report attuale». Il banner sparisce al click, e non
+      // compare affatto se l'input cambia mentre un'altra richiesta e' in volo. Dove il modello di
+      // TradingView e' leggibile si aspetta la richiesta vera (`sincronizzato`); altrove resta il
+      // banner, com'era.
+      let report;
+      const sincDopo = await sincronizza({ graziaInizialeMs: deltaReale ? 1500 : 0 });
+      if (sincDopo.disponibile && sincDopo.deep) {
+        if (!sincDopo.ok) { cron.segna('report'); await fermaReportNonArrivato(run, sincDopo); break; }
+        report = { aggiornato: true, click: sincDopo.click, sincronizzato: true };
+      } else {
+        report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+      }
       cron.segna('report');
       if (report.click > 0) {
         await nota(`run ${run.id}: report obsoleto → premuto "Aggiorna report"${report.click > 1 ? ` (${report.click}x)` : ''}`);
@@ -706,7 +769,8 @@ export async function grindSession(opts, deps = {}) {
       const { results: results0, recalcObserved } = await waitForRecalc(entity_id, baselineFp, {
         readReport: (id) => leggiMetriche(id, periodoRistretto), readLoading: readStrategyLoading, sleep,
         timeoutMs: recalc_timeout_ms, stableChecks: recalc_stable_checks,
-        stepMs: recalc_step_ms, startGraceMs: recalc_start_grace_ms,
+        // Con la richiesta gia' vista atterrare non c'e' un ricalcolo da aspettare che parta.
+        stepMs: recalc_step_ms, startGraceMs: report.sincronizzato ? 0 : recalc_start_grace_ms,
       });
       cron.segna('ricalcolo');
       let results = results0;
@@ -740,7 +804,9 @@ export async function grindSession(opts, deps = {}) {
       // C4 resta valida — due input diversi POSSONO dare lo stesso risultato — ma la domanda giusta
       // non e' "cosa dice il banner": e' "rileggendo, i numeri si muovono?". Se si muovono era
       // stale; se non si muovono nemmeno insistendo, l'identita' e' vera.
-      if (sameAsPrevious && cambiamentoChiesto) {
+      // Con `sincronizzato` l'identita' e' PROVATA (la richiesta di questi input e' partita ed e'
+      // atterrata): rileggere costerebbe secondi su ogni run legittimamente identica.
+      if (sameAsPrevious && cambiamentoChiesto && !report.sincronizzato) {
         // Budget diverso a seconda di chi dice cosa. Banner ancora su = il ricalcolo non e' partito,
         // vale la pena insistere a lungo. Banner sparito = e' una CORSA col ridisegno, e una corsa
         // si risolve in un paio di secondi o non era una corsa: insistere di piu' rallenterebbe

@@ -64,6 +64,11 @@ function makeDeps({ runs, metricsSeq, metricheFerme = false }) {
       // Senza questo stub la guardia di grindSession chiamerebbe la dep VERA e ogni test
       // proverebbe a connettersi a TradingView. Chi vuole lo studio rotto lo sovrascrive.
       readStudyStatus: async () => ({ ok: true, type: 0, error: null }),
+      // Il modello del backtest esteso: non leggibile per default, cosi' questi test esercitano le
+      // attese di prima (banner e numeri). Senza stub il grind chiamerebbe la dep VERA e proverebbe a
+      // connettersi a TradingView. Il percorso sincronizzato ha i suoi test in bt_grind_esteso.test.js.
+      readDeepState: async () => ({ found: false }),
+      reportObsoleto: async () => false,
       setStrategyVisibility: async () => true,
       // Chart finto: tiene davvero symbol/timeframe/periodo, cosi' le verifiche di
       // applicaContestoRun esercitano il comportamento vero invece di passare a vuoto.

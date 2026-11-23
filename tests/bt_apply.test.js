@@ -45,6 +45,11 @@ function makeDeps({ bt = BT, studies = [{ id: 'ent-1', name: 'Index Grow Test Cl
       // questo stub la guardia chiamerebbe la dep VERA e il test proverebbe a connettersi a
       // TradingView. Chi vuole lo studio rotto lo sovrascrive.
       readStudyStatus: async () => ({ ok: true, type: 0, error: null }),
+      // Modello del backtest esteso non leggibile per default: questi test esercitano le attese di
+      // prima. Senza stub la dep VERA proverebbe a connettersi a TradingView. Il percorso
+      // sincronizzato ha i suoi test in fondo al file.
+      readDeepState: async () => ({ found: false }),
+      reportObsoleto: async () => false,
       // Strategia gia' visibile per default: la dep vera si collegherebbe a TradingView.
       ensureVisibleFor: async () => ({ found: true, wasHidden: false, visible: true }),
       readReportFor: async () => ({ success: true, metrics }),
@@ -388,4 +393,85 @@ test('strategia che non si riesce a rendere visibile → strategy_hidden, senza 
   assert.equal(r.ok, false);
   assert.equal(r.error.kind, 'strategy_hidden');
   assert.equal(seen.setInputs.length, 0);
+});
+
+// ── Tester in modalita' ESTESO che si comporta come quello vero (helpers/testerFinto.js) ──
+// Le richieste impiegano secondi, il banner sparisce al click e non compare mentre una richiesta e'
+// in volo: le condizioni in cui le attese basate sul banner leggevano i numeri di prima.
+const { creaTesterFinto } = await import('./helpers/testerFinto.js');
+
+function depsEsteso(tv, bt, { modelloLeggibile = true } = {}) {
+  const progress = [];
+  return {
+    progress,
+    deps: {
+      api: { getBacktest: async (id) => (id === bt.id ? bt : null), progress: async (_c, m) => { progress.push(m); } },
+      getChartState: async () => ({ symbol: 'TVC:DJI', resolution: '5', studies: [{ id: 'ent-1', name: bt.strategy_name }] }),
+      readInputsInfo: async () => ([
+        { id: 'in_0', name: 'Risk/Reward', type: 'float', group: 'Ingressi' },
+        { id: 'in_40', name: 'Initial Capital', type: 'float', group: null },
+      ]),
+      readInputValues: async () => ({ ...tv.stato.inputs }),
+      setInputs: async ({ inputs }) => { tv.setInputs(inputs); return { updated_inputs: inputs, missing: [] }; },
+      setSymbol: async () => {}, setTimeframe: async () => {},
+      ensureTesterPanel: async () => ({ ok: true }),
+      readTestPeriod: async () => ({ label: `${tv.stato.periodo.from} — ${tv.stato.periodo.to}`, ...tv.stato.periodo }),
+      setCustomPeriod: async (from, to) => { tv.setPeriodo({ from, to }); return { applied: true, label: `${from} — ${to}`, from, to }; },
+      aggiornaReportSeObsoleto: async () => tv.cliccaAggiorna(),
+      attendiReportAggiornato: async () => {
+        let click = 0;
+        await tv.sleep(500);
+        for (;;) {
+          const e = tv.cliccaAggiorna();
+          if (e.cliccato) click += 1;
+          else if (!tv.reportObsoleto()) return { aggiornato: true, click };
+          await tv.sleep(1000);
+        }
+      },
+      readStrategyLoading: async () => tv.strategiaInCaricamento(),
+      readStudyStatus: async () => ({ ok: true, type: 0, error: null }),
+      ensureVisibleFor: async () => ({ found: true, wasHidden: false, visible: true }),
+      readReportFor: async () => ({ success: true, metrics: tv.metricheMostrate() }),
+      readPanelMetrics: async () => ({ success: true, source: 'panel', metrics: tv.metricheMostrate() }),
+      readDeepState: async () => (modelloLeggibile ? tv.readDeepState() : { found: false }),
+      reportObsoleto: async () => tv.reportObsoleto(),
+      sleep: tv.sleep, now: tv.now,
+    },
+  };
+}
+
+const P1E = { from: '2022-12-08', to: '2023-12-08' };
+const P4E = { from: '2020-01-01', to: '2023-12-08' };
+const btEsteso = (tv, rr) => {
+  const vero = tv.metricheDi(P4E, { in_0: rr, in_40: 10000 });
+  return {
+    id: 263, strategy_name: 'NDQ Box Strategy', symbol: 'TVC:DJI', timeframe: '5',
+    period_start: `${P4E.from}T00:00:00.000000Z`, period_end: `${P4E.to}T00:00:00.000000Z`,
+    inputs: { 'Risk/Reward': rr }, applied_inputs: null,
+    extra_metrics: { properties: { 'Initial Capital': 10000 } },
+    total_trades: vero.total_trades, net_profit: vero.net_profit,
+  };
+};
+
+test('esteso: cambia periodo e input insieme e legge il report dei PROPRI input, non quello in arrivo da prima', async () => {
+  const tv = creaTesterFinto({ periodo: P1E, inputs: { in_0: 2, in_40: 10000 }, durataMs: 6500 });
+  const bt = btEsteso(tv, 1);
+  const { deps } = depsEsteso(tv, bt);
+  const out = await applyBacktest({ backtest_id: 263 }, deps);
+  assert.equal(out.ok, true, JSON.stringify(out.error));
+  assert.equal(out.metrics.total_trades, bt.total_trades);
+  assert.equal(out.vs_backtest.total_trades_delta, 0);
+  assert.deepEqual(tv.stato.mostrato, { periodo: P4E, inputs: { in_0: 1, in_40: 10000 } });
+});
+
+test('esteso: TradingView rifiuta la richiesta → ok:false con deep_backtest_error, non metriche vecchie', async () => {
+  const tv = creaTesterFinto({ periodo: P4E, inputs: { in_0: 2, in_40: 10000 }, durataMs: 3000 });
+  const bt = btEsteso(tv, 1);
+  const { deps } = depsEsteso(tv, bt);
+  tv.rifiutaLaProssima('not_allowed');
+  const out = await applyBacktest({ backtest_id: 263 }, deps);
+  assert.equal(out.ok, false);
+  assert.equal(out.error.kind, 'deep_backtest_error');
+  assert.match(out.error.detail, /not_allowed/);
+  assert.equal(out.applied_so_far.inputs_set, true);
 });
