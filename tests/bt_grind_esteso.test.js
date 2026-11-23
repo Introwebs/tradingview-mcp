@@ -212,6 +212,7 @@ test('stesso rifiuto al secondo tentativo della run: resta failed, non blocca la
   assert.equal(out.stopped_reason?.kind, 'deep_backtest_error');
   assert.equal(reclaimed.length, 0);
   assert.deepEqual(failed, [{ id: 1, motivo: 'deep_backtest_error: not_allowed' }]);
+  assert.equal(out.failed, 1, 'la run fallita si conta');
 });
 
 test('rifiuto gia\' sul cambio di periodo: si ferma prima di toccare gli input', async () => {

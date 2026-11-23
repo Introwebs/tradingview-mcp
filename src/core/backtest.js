@@ -26,7 +26,7 @@ import {
   reportObsoleto as realReportObsoleto,
   rischioDalReportDelPeriodo,
 } from './btPanel.js';
-import { readDeepState as realReadDeepState, sincronizzaReport } from './btDeep.js';
+import { readDeepState as realReadDeepState, sincronizzaReport, riferimentoRichiesta } from './btDeep.js';
 import {
   readInputsInfo as realReadInputsInfo,
   readInputValues as realReadInputValues,
@@ -408,9 +408,7 @@ export async function grindSession(opts, deps = {}) {
   // Il requestId di ADESSO: si legge PRIMA di cambiare contesto o input e si passa a `sincronizza`
   // come `richiestaDopo`. E' la prova positiva: il report vale solo se una richiesta piu' recente di
   // questa e' atterrata. null = modello non leggibile, e allora non si sincronizza affatto.
-  const richiestaCorrente = async () => {
-    try { const s = await readDeepState(); return s && s.found === true ? s.requestId : null; } catch { return null; }
-  };
+  const richiestaCorrente = () => riferimentoRichiesta({ readDeepState, sleep, now, timeoutMs: Math.max(recalc_timeout_ms, 60000) });
   const NON_SINCRONIZZABILE = { disponibile: false };
 
   if (!session_id) throw new Error('session_id è obbligatorio');
@@ -520,7 +518,7 @@ export async function grindSession(opts, deps = {}) {
     const motivoRun = `${rifiuto ? 'deep_backtest_error' : 'report_not_synced'}: ${rifiuto ? sinc.errore : sinc.motivo}`;
     try {
       if (primoTentativo && typeof api.reclaimRun === 'function') { await api.reclaimRun(run.id, `${motivoRun} — rimessa in coda`); inCoda = true; }
-      else await api.markFailed(run.id, motivoRun);
+      else { await api.markFailed(run.id, motivoRun); failed++; }
     } catch { /* la diagnosi vera e' lo stop qui sotto, non l'esito di questa chiamata */ }
     stopped_reason = {
       kind: rifiuto ? 'deep_backtest_error' : 'report_not_synced',
@@ -644,6 +642,9 @@ export async function grindSession(opts, deps = {}) {
       if (sincPrima.disponibile && sincPrima.deep) {
         if (!sincPrima.ok) { cron.segna('baseline'); await fermaReportNonArrivato(run, sincPrima); break; }
         if (sincPrima.click > 0) await nota(`run ${run.id}: report obsoleto all'inizio della run, aggiornato prima della baseline`);
+        // Il contesto e' cambiato ma TradingView non ha fatto ne' chiesto nessun ricalcolo: non c'e'
+        // prova, quindi resta anche il rinfresco di prima.
+        if (sincPrima.attuale === 'senza_richiesta') await aggiornaReportSeObsoleto();
       } else if (contestoCambiato) {
         const rinfresco = await aggiornaReportSeObsoleto();
         if (rinfresco.cliccato) {

@@ -20,7 +20,7 @@ import {
   attendiReportAggiornato as realAttendiReport, aggiornaReportSeObsoleto as realAggiornaReportSeObsoleto,
   reportObsoleto as realReportObsoleto,
 } from './btPanel.js';
-import { readDeepState as realReadDeepState, sincronizzaReport } from './btDeep.js';
+import { readDeepState as realReadDeepState, sincronizzaReport, riferimentoRichiesta } from './btDeep.js';
 import {
   readInputsInfo as realReadInputsInfo, readInputValues as realReadInputValues,
   readReportFor as realReadReportFor, readStrategyLoading as realReadStrategyLoading,
@@ -135,9 +135,7 @@ export async function applyBacktest(opts, deps = {}) {
   });
   // Il requestId di ADESSO, letto PRIMA di cambiare contesto o input: e' il riferimento che la
   // richiesta buona deve superare (`richiestaDopo`). null = modello non leggibile: non si sincronizza.
-  const richiestaCorrente = async () => {
-    try { const s = await readDeepState(); return s && s.found === true ? s.requestId : null; } catch { return null; }
-  };
+  const richiestaCorrente = () => riferimentoRichiesta({ readDeepState, sleep, now, timeoutMs: Math.max(recalc_timeout_ms, 60000) });
   const NON_SINCRONIZZABILE = { disponibile: false };
   const reportNonArrivato = (sinc) => (sinc.motivo === 'errore_tradingview'
     ? ['deep_backtest_error', `TradingView ha rifiutato il backtest esteso ("${sinc.errore}"): il report non esiste, quindi le metriche non sono leggibili. Riavvia TradingView e rilancia.`]
@@ -219,6 +217,8 @@ export async function applyBacktest(opts, deps = {}) {
     : await sincronizza({ richiestaDopo: contesto.contestoCambiato ? reqPrimaDelContesto : null });
   if (sincPrima.disponibile && sincPrima.deep) {
     if (!sincPrima.ok) return fail(...reportNonArrivato(sincPrima), appliedSoFar());
+    // Contesto cambiato ma nessun ricalcolo fatto ne' chiesto: non c'e' prova, resta il rinfresco di prima.
+    if (sincPrima.attuale === 'senza_richiesta') await aggiornaReportSeObsoleto();
   } else if (contesto.contestoCambiato) {
     await aggiornaReportSeObsoleto();
   }

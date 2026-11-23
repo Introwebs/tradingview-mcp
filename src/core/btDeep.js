@@ -140,6 +140,7 @@ export async function sincronizzaReport({
   richiestaDopo = null,
   timeoutMs = 60000, passoMs = 150, confermaMs = 600, confermaDopoVoloMs = 1500,
   attesaSenzaRichiestaMs = 8000, attesaPartenzaMs = 3000, attesaClickMs = 5000, maxClick = 3,
+  tolleranzaNonDeepMs = 2000,
 } = {}) {
   const t0 = now();
   const valido = (s) => !!s && s.found === true && typeof s.requestId === 'number' && STATI_NOTI.includes(s.status);
@@ -156,6 +157,11 @@ export async function sincronizzaReport({
   let fermoDa = null;
   let voloVisto = false;
   let bannerSenzaClickDa = null;
+  let nonDeepDa = null;
+  let precedente = null;
+  // Il tempo massimo vale per OGNI richiesta, non per l'intera chiamata: dopo un click riparte, cosi'
+  // una richiesta attesa in volo seguita dalla nostra non esaurisce il tempo della seconda.
+  let limite = t0 + timeoutMs;
   const nuova = (s) => daSuperare !== null && s.requestId > daSuperare;
   const esito = (s, extra) => ({
     disponibile: true, deep: true, click,
@@ -168,7 +174,19 @@ export async function sincronizzaReport({
   for (;;) {
     const s = await leggi();
     if (!valido(s)) return illeggibile(s);
-    if (!s.deep) return { disponibile: true, deep: false, ok: true, click, richieste: 0 };
+    if (!s.deep) {
+      // Una sola lettura «non esteso» puo' essere un attimo di rimontaggio del pannello (cambio di
+      // timeframe): crederle subito riporterebbe alle attese sul banner. Si conferma per un po'.
+      if (nonDeepDa === null) nonDeepDa = now();
+      if (now() - nonDeepDa >= tolleranzaNonDeepMs) return { disponibile: true, deep: false, ok: true, click, richieste: 0 };
+      await sleep(passoMs);
+      continue;
+    }
+    nonDeepDa = null;
+    // Qualunque cambio di contatore o di stato azzera la conferma: «fermo da 600 ms» deve voler dire
+    // fermo in QUESTO stato, non fermo prima che il contatore avanzasse.
+    if (precedente && (s.requestId !== precedente.requestId || s.status !== precedente.status)) fermoDa = null;
+    precedente = s;
 
     if (s.status === 1) {
       // Richiesta in volo: qualunque cosa mostri il pannello adesso, e' il report di prima.
@@ -185,6 +203,7 @@ export async function sincronizzaReport({
       if (c && c.cliccato) {
         click += 1;
         bannerSenzaClickDa = null;
+        limite = now() + timeoutMs;
         // Da qui conta solo la richiesta partita da QUESTO click.
         daSuperare = daSuperare === null ? s.requestId : Math.max(daSuperare, s.requestId);
         // ⛔ LA FINESTRA CHE INGANNAVA IL GRIND ⛔ Dopo il click il banner sparisce subito ma la
@@ -230,7 +249,32 @@ export async function sincronizzaReport({
       }
     }
 
-    if (now() - t0 >= timeoutMs) return esito(s, { ok: false, motivo: 'timeout' });
+    if (now() >= limite) return esito(s, { ok: false, motivo: 'timeout' });
+    await sleep(passoMs);
+  }
+}
+
+/**
+ * Il `requestId` da usare come riferimento (`richiestaDopo`), letto a tester FERMO.
+ *
+ * Perche' si aspetta: quando una richiesta parte lo stato va a 1 circa 0,2 s PRIMA che il contatore
+ * avanzi. Un riferimento letto in quell'attimo sarebbe piu' basso della richiesta gia' in volo, che
+ * poi atterrando sembrerebbe «piu' recente» pur essendo partita con la configurazione di prima.
+ *
+ * @returns {Promise<number|null>} null = modello non leggibile, o richiesta ancora in volo allo
+ *          scadere: senza riferimento non si sincronizza (valgono le attese di prima).
+ */
+export async function riferimentoRichiesta({
+  readDeepState: leggi, sleep = realSleep, now = () => performance.now(),
+  timeoutMs = 60000, passoMs = 150,
+} = {}) {
+  const t0 = now();
+  for (;;) {
+    let s;
+    try { s = await leggi(); } catch { return null; }
+    if (!s || s.found !== true || typeof s.requestId !== 'number' || !STATI_NOTI.includes(s.status)) return null;
+    if (s.status !== 1) return s.requestId;
+    if (now() - t0 >= timeoutMs) return null;
     await sleep(passoMs);
   }
 }

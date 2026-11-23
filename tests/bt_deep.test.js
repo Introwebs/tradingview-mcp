@@ -267,3 +267,59 @@ test('readDeepState: restituisce lo stato cosi\' com\'e\' nel modello', async ()
   const maiRichiesto = { found: true, deep: false, status: null, error: null, requestId: 0, connected: false };
   assert.deepEqual(await readDeepState({ evaluate: async () => maiRichiesto }), maiRichiesto);
 });
+
+// ── Irrigidimenti dalla seconda revisione ──
+
+test('il contatore avanza mentre lo stato dice ancora "pronto": non e\' la prova, si aspetta l\'atterraggio', async () => {
+  // Per le richieste che TradingView fa partire da solo l'ordine fra contatore e stato non e' stato
+  // misurato: se il contatore avanzasse per primo, «fermo da 600 ms» non deve valere per lo stato nuovo.
+  const tv = creaTesterFinto();
+  const stato = () => {
+    const t = tv.now();
+    if (t < 700) return { status: 2, requestId: 5 };
+    if (t < 1000) return { status: 2, requestId: 6 };
+    if (t < 6000) return { status: 1, requestId: 6 };
+    return { status: 2, requestId: 6 };
+  };
+  const r = await sincronizzaReport(depsDi(tv, {
+    richiestaDopo: 5,
+    readDeepState: async () => ({ found: true, deep: true, error: null, connected: false, ...stato() }),
+    reportObsoleto: async () => false,
+  }));
+  assert.equal(r.attuale, 'provato');
+  assert.ok(tv.now() >= 6000, `ha creduto al report a ${tv.now()} ms, prima dell\'atterraggio`);
+});
+
+test('una sola lettura "non esteso" a meta\' (pannello che si rimonta) non fa abbandonare la sincronizzazione', async () => {
+  const tv = creaTesterFinto({ durataMs: 4000 });
+  const prima = req(tv);
+  tv.setInputs({ in_0: 3 });
+  let letture = 0;
+  const r = await sincronizzaReport(depsDi(tv, {
+    richiestaDopo: prima,
+    readDeepState: async () => { letture += 1; return letture === 6 ? { ...tv.readDeepState(), deep: false } : tv.readDeepState(); },
+  }));
+  assert.equal(r.deep, true);
+  assert.equal(r.attuale, 'provato');
+  assert.deepEqual(tv.stato.mostrato.inputs, { in_0: 3 });
+});
+
+test('il tempo massimo riparte dopo il click: una richiesta in volo all\'ingresso non consuma quello della nostra', async () => {
+  const tv = creaTesterFinto({ durataMs: 15000 });
+  tv.setPeriodo(P4);
+  await tv.sleep(1000);
+  tv.setInputs({ in_0: 1 });
+  const r = await sincronizzaReport(depsDi(tv, { timeoutMs: 20000 }));
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(tv.stato.mostrato.inputs, { in_0: 1 });
+});
+
+test('riferimentoRichiesta: aspetta che il tester sia fermo prima di dare il riferimento', async () => {
+  const { riferimentoRichiesta } = await import('../src/core/btDeep.js');
+  const tv = creaTesterFinto({ durataMs: 5000, ritardoIdMs: 400 });
+  tv.setPeriodo(P4);                 // stato 1 subito, contatore +1 dopo 400 ms
+  const rif = await riferimentoRichiesta({ readDeepState: async () => tv.readDeepState(), sleep: tv.sleep, now: tv.now });
+  assert.equal(rif, 1, 'il riferimento include la richiesta che era in volo');
+  assert.ok(tv.now() >= 5000);
+  assert.equal(await riferimentoRichiesta({ readDeepState: async () => ({ found: false }), sleep: tv.sleep, now: tv.now }), null);
+});
