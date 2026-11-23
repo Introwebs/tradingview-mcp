@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { join } from 'node:path';
 import { registerBacktestTools } from '../src/tools/backtest.js';
+import { readFileConfig } from '../src/core/pinealgos.js';
 
 /**
  * Lo schema di un tool e' un contratto con chi lo chiama, e il chiamante di `bt_grind` non e' piu'
@@ -23,6 +27,37 @@ function tool(nome) {
   return trovato;
 }
 const errore = (risposta) => JSON.parse(risposta.content[0].text).error;
+
+/**
+ * Un gestore che arriva a `resolveConfig()` legge ~/.pinealgos/config.json anche quando le env
+ * vincono (il default `fileConfig = readFileConfig()` si valuta subito), e su questa macchina quel
+ * file porta il token di PRODUZIONE. Per la durata di `fn` la casa e' una cartella temporanea con
+ * un config marcatore (os.homedir() segue USERPROFILE su Windows e HOME altrove), e le env puntano
+ * a una porta chiusa. Tutto torna com'era nel `finally`.
+ */
+const MARCATORE = { base: 'http://127.0.0.1:1', token: 'marcatore-del-test' };
+async function conCasaFinta(fn) {
+  const casa = mkdtempSync(join(tmpdir(), 'casa-finta-'));
+  mkdirSync(join(casa, '.pinealgos'));
+  writeFileSync(join(casa, '.pinealgos', 'config.json'), JSON.stringify(MARCATORE));
+  const nomi = ['USERPROFILE', 'HOME', 'PINEALGOS_BASE', 'PINEALGOS_TOKEN'];
+  const prima = Object.fromEntries(nomi.map((k) => [k, process.env[k]]));
+  process.env.USERPROFILE = casa;
+  process.env.HOME = casa;
+  process.env.PINEALGOS_BASE = 'http://127.0.0.1:1';
+  process.env.PINEALGOS_TOKEN = 'prova';
+  try {
+    // La casa finta e' davvero quella che legge il client: se no, il test si ferma QUI.
+    assert.equal(homedir(), casa, 'os.homedir() non segue la casa finta');
+    assert.deepEqual(readFileConfig(), MARCATORE, 'il config letto non e quello della casa finta');
+    return await fn();
+  } finally {
+    for (const k of nomi) {
+      if (prima[k] === undefined) delete process.env[k]; else process.env[k] = prima[k];
+    }
+    rmSync(casa, { recursive: true, force: true });
+  }
+}
 
 test('bt_grind accetta la chiamata del runner: session_id + run_ids + strategy_name, senza periodo', () => {
   const ok = schemi().bt_grind.safeParse({
@@ -78,7 +113,8 @@ test('bt_phase: la descrizione dice quando richiamare e quando smettere', () => 
 
 test('bt_phase rifiuta phase_id insieme alle prove di una fase nuova', async () => {
   const { handler } = tool('bt_phase');
-  const r = await handler({ campaign_id: 3, phase_id: 9, type: 'management', trials: [{}] });
+  // Anche qui la casa finta: se il controllo regredisse, il gestore arriverebbe a resolveConfig().
+  const r = await conCasaFinta(() => handler({ campaign_id: 3, phase_id: 9, type: 'management', trials: [{}] }));
   assert.equal(r.isError, true);
   assert.match(errore(r), /phase_id/);
   assert.match(errore(r), /non tutti e due/);
@@ -86,16 +122,8 @@ test('bt_phase rifiuta phase_id insieme alle prove di una fase nuova', async () 
 
 test('bt_phase: se la piattaforma non risponde all avvio lo dice in italiano', async () => {
   const { handler } = tool('bt_phase');
-  const prima = { base: process.env.PINEALGOS_BASE, token: process.env.PINEALGOS_TOKEN };
-  process.env.PINEALGOS_BASE = 'http://127.0.0.1:1';
-  process.env.PINEALGOS_TOKEN = 'prova';
-  try {
-    const r = await handler({ campaign_id: 3, phase_id: 9 });
-    assert.equal(r.isError, true);
-    assert.match(errore(r), /^La piattaforma non risponde: .+ Nessuna prova è stata eseguita\.$/s);
-  } finally {
-    for (const [k, v] of [['PINEALGOS_BASE', prima.base], ['PINEALGOS_TOKEN', prima.token]]) {
-      if (v === undefined) delete process.env[k]; else process.env[k] = v;
-    }
-  }
+  const r = await conCasaFinta(() => handler({ campaign_id: 3, phase_id: 9 }));
+  assert.equal(r.isError, true);
+  assert.match(errore(r), /^La piattaforma non risponde: .+ Nessuna prova è stata eseguita\.$/s);
+  assert.match(errore(r), /127\.0\.0\.1:1|fetch failed/);
 });
