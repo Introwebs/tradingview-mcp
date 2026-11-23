@@ -299,6 +299,48 @@ test('un rifiuto di forma alla dichiarazione arriva in italiano', async () => {
   assert.match(b.visto.progress.at(-1), /la piattaforma ha rifiutato/);
 });
 
+// --- Identita' del mercato -----------------------------------------------------------------------
+
+test('il mercato senza borsa si dichiara con la scrittura della campagna', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })] });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1', symbol: 'NDQ' }, b.deps);
+  assert.equal(b.visto.open[0].symbol, 'TVC:NDQ');
+  assert.equal(out.executed, 3);
+});
+
+test('un mercato con un altra borsa dichiarata non e quello della campagna', async () => {
+  const b = banco({ metricsSeq: [M()] });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1', symbol: 'FX:NDQ' }, b.deps);
+  assert.deepEqual([out.stopped_reason.kind, b.visto.open.length], ['unknown_symbol', 0]);
+});
+
+test('grafico sullo stesso ticker ma su un altra borsa: prima si porta sul mercato della campagna', async () => {
+  const b = banco({ simboloGrafico: 'OANDA:NDQ', metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })] });
+  const ordine = [];
+  const { setSymbol, ensureTesterPanel } = b.deps;
+  b.deps.setSymbol = async (a) => { ordine.push(`setSymbol ${a.symbol}`); return setSymbol(a); };
+  b.deps.ensureTesterPanel = async () => { ordine.push('ensureTesterPanel'); return ensureTesterPanel(); };
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(b.chart.symbol, 'TVC:NDQ');
+  assert.deepEqual(ordine.slice(0, 2), ['setSymbol TVC:NDQ', 'ensureTesterPanel'], 'il cambio di simbolo chiude il pannello: prima il simbolo');
+  assert.deepEqual([out.executed, out.stopped_reason], [3, null]);
+});
+
+test('se il grafico non passa al mercato della campagna nessuna prova parte', async () => {
+  const b = banco({ simboloGrafico: 'OANDA:NDQ', metricsSeq: [M()] });
+  b.deps.setSymbol = async () => ({ success: true });   // TradingView non cambia
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'symbol_not_applied');
+  assert.match(out.stopped_reason.detail, /OANDA:NDQ/);
+  assert.deepEqual([out.executed, out.remaining_in_phase, b.chart.setInputsChiamate, b.visto.inviate.length], [0, 3, 0, 0]);
+});
+
+test('una campagna senza timeframe non si esegue', async () => {
+  const b = banco({ stato: { ...STATO, timeframe: '' }, metricsSeq: [M()] });
+  await assert.rejects(eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps), /timeframe/);
+  assert.equal(b.visto.open.length, 0);
+});
+
 test('il confine: entrambe le date, nel formato giusto, dentro il periodo di ricerca', () => {
   const c = { search_from: '2018-01-01', search_until: '2024-01-01' };
   assert.equal(dentroIlConfine(c, '2018-01-01', '2024-01-01'), true);

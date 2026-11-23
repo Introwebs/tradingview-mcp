@@ -9,7 +9,7 @@
  *                          lo strumento di fase non ne deve chiamare nessuno.
  *
  * Il registro e' in memoria, con la stessa interfaccia di `creaRegistro`. Il chart parte su
- * TVC:NDQ 15 col periodo di ricerca gia' impostato. Lo riusa la prova del contratto (Task 16), che
+ * TVC:NDQ 15 (o su `simboloGrafico`) col periodo di ricerca gia' impostato. Lo riusa la prova del contratto (Task 16), che
  * prende le sole dipendenze TradingView e ci mette l'API vera.
  */
 import { creaTradingViewFinto, INFO_FINTO, M } from './tradingviewFinto.js';
@@ -45,11 +45,24 @@ function registroInMemoria() {
 
 const copia = (x) => (x === undefined ? undefined : JSON.parse(JSON.stringify(x)));
 
-export function banco({ stato = STATO, fase, metricsSeq, apiOver = {}, registro } = {}) {
-  const confineDi = (symbol) => stato.boundaries?.[symbol] ?? Object.values(stato.boundaries ?? {})[0];
+// La chiave del confine come la trova la piattaforma (HoldoutService::sameSymbol): uguali, oppure
+// un lato senza borsa e lo stesso ticker. Come la piattaforma, `openPhase` restituisce QUESTA
+// scrittura, non quella di chi chiama.
+const bare = (s) => String(s).toUpperCase().split(':').pop();
+const stessoMercato = (a, b) => {
+  const A = String(a).trim().toUpperCase();
+  const B = String(b).trim().toUpperCase();
+  if (A === B) return true;
+  if (A.includes(':') && B.includes(':')) return false;
+  return bare(A) === bare(B);
+};
+
+export function banco({ stato = STATO, fase, metricsSeq, apiOver = {}, registro, simboloGrafico = 'TVC:NDQ' } = {}) {
+  const chiaveDi = (symbol) => Object.keys(stato.boundaries ?? {}).find((k) => symbol && stessoMercato(k, symbol)) ?? symbol;
+  const confineDi = (symbol) => stato.boundaries?.[chiaveDi(symbol)] ?? Object.values(stato.boundaries ?? {})[0];
   const ricerca = confineDi('TVC:NDQ');
   const { deps: tv, chart } = creaTradingViewFinto({
-    metricsSeq, symbol: 'TVC:NDQ', resolution: '15',
+    metricsSeq, symbol: simboloGrafico, resolution: '15',
     periodo: { label: `${ricerca.search_from} — ${ricerca.search_until}`, from: ricerca.search_from, to: ricerca.search_until },
   });
 
@@ -63,7 +76,7 @@ export function banco({ stato = STATO, fase, metricsSeq, apiOver = {}, registro 
       return {
         ok: true, status: 201,
         data: {
-          id: 9, position: 2, type: body.type, symbol: body.symbol,
+          id: 9, campaign_id: campaignId, position: 2, type: body.type, symbol: chiaveDi(body.symbol),
           trials: (body.trials || []).map((t, i) => ({
             key: t.key ?? `t${i + 1}`, label: t.label ?? null, status: 'pending',
             period_start: t.period_start ?? confine.search_from, period_end: t.period_end ?? confine.search_until,
