@@ -135,7 +135,7 @@ export function giornoISO(v) {
 const finito = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
 
 /** Due ticker coincidono anche se uno e' senza exchange ("TVC:NDQ" vs "NDQ"). */
-function stessoSymbol(a, b) {
+export function stessoSymbol(a, b) {
   if (!a || !b) return false;
   const norm = (s) => String(s).toUpperCase().split(':').pop();
   return String(a).toUpperCase() === String(b).toUpperCase() || norm(a) === norm(b);
