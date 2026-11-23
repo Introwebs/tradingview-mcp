@@ -9,10 +9,13 @@
  * Il progetto deve essere una strategia con la mappa degli input e un periodo riservato SIGILLATO su
  * TEST:CONTRATTO 15 che comincia il 2024-01-02.
  *
- * Passi: crea la campagna, deposita un piano minimo, esegue la fase `base`, la decide, esegue una
- * fase `management` con tre valori del primo input numerico della mappa, prova una fase con una
- * prova che finisce nel periodo riservato, rilegge lo stato. Stampa una riga per passo; l'ultima e'
- * `CONTRATTO OK` solo se ogni condizione tiene, altrimenti le differenze e un codice d'uscita 1.
+ * Passi: crea la campagna, deposita un piano minimo, esegue la fase `base` (e, se la mappa ha un
+ * input dal nome oltre 60 caratteri, controlla che arrivi intero), la decide, esegue una fase
+ * `management` con tre valori del primo input numerico della mappa, prova una fase con una prova
+ * che finisce nel periodo riservato, rilegge lo stato; poi decide la gestione, esegue una fase con
+ * una prova a zero trade, una che si ferma (input non applicato) e una che resta da fare, la
+ * riprende con phase_id e rilegge lo stato. Stampa una riga per passo; l'ultima e' `CONTRATTO OK`
+ * solo se ogni condizione tiene, altrimenti le differenze e un codice d'uscita 1.
  *
  * Non usa ~/.pinealgos: il registro locale delle righe sta in una cartella temporanea, cancellata
  * alla fine. Base, token e progetto arrivano solo dalla riga di comando.
@@ -155,6 +158,15 @@ async function prova() {
   const lavoroOk = Array.isArray(lavoro) && lavoro.length === attesa.length
     && attesa.every((a) => lavoro.some((w) => w.name === a.name && Number(w.position) === a.position && (w.value === a.value || (typeof a.value === 'number' && Number(w.value) === a.value))));
   passo('la base registra i valori del grafico', lavoroOk, `working_config ${breve(lavoro)}`);
+  // Un nome oltre 60 caratteri: la riga deve portarlo intero, come la piattaforma lo indicizza.
+  // Se la mappa non ne ha, il passo si segnala e si salta (non e' una differenza).
+  const lungo = stato.map.inputs.find((v) => v.type !== 'color' && String(v.name).length > 60);
+  if (lungo) {
+    passo('input dal nome lungo', Array.isArray(lavoro) && lavoro.some((w) => w.name === lungo.name && Number(w.position ?? 1) === Number(lungo.position ?? 1)),
+      `«${lungo.name}» (${lungo.name.length} caratteri) in working_config: ${lavoro?.some((w) => w.name === lungo.name) ? 'col nome intero' : 'ASSENTE col nome intero'}`);
+  } else {
+    console.log('--  input dal nome lungo — la mappa non ha nomi oltre 60 caratteri: passo saltato');
+  }
   passo('la base registra le Proprieta', stato.measurement?.properties?.['Initial Capital'] === 10000, `measurement ${breve(stato.measurement)}`);
   passo('next dopo la base', stato.next?.action === 'decide' && stato.next?.phase_id === fBase.phase_id, `next ${breve(stato.next)}`);
 
@@ -187,6 +199,56 @@ async function prova() {
   const next = finale.json?.data?.next;
   passo('stato finale', finale.status === 200 && next?.action === 'decide' && next?.phase_id === fGest.phase_id,
     finale.status === 200 ? `next ${breve(next)}, budget ${breve(finale.json?.data?.budget)}, status ${finale.json?.data?.status}` : `HTTP ${finale.status} ${finale.text}`);
+
+  // 9. La gestione si decide, per poter dichiarare un'altra fase.
+  const decisoGest = await chiama('POST', `/api/v1/campaign-phases/${fGest.phase_id}/decision`, { adopt: [], reason: 'Gestione misurata: si resta sui valori di lavoro.' });
+  if (!passo('decide la gestione', decisoGest.status === 200 && decisoGest.json?.data?.next?.action === 'open_phase',
+    decisoGest.status === 200 ? `next ${breve(decisoGest.json?.data?.next)}` : `HTTP ${decisoGest.status} ${decisoGest.text}`)) return fine();
+
+  // 10. Una fase con una prova a zero trade, una che si ferma (input non applicato) e una che
+  // resta da fare. Il grafico finto decide dal valore dell'input numerico.
+  const passiZ = numerico.type === 'int' ? [4, 5, 6] : [0.25, 0.75, 1.25];
+  const [vZero, vFallita, vOk] = passiZ.map((d) => v0 + d);
+  let rompiUnaVolta = true;
+  const conZero = (r) => (r && r.metrics && valori[idNumerico] === vZero ? { ...r, metrics: { ...r.metrics, total_trades: 0 } } : r);
+  const depsProve = {
+    ...deps,
+    readReportFor: async (id) => conZero(await deps.readReportFor(id)),
+    readPanelMetrics: async () => conZero(await deps.readPanelMetrics()),
+    setInputs: async (args) => {
+      if (rompiUnaVolta && Object.values(args.inputs || {}).includes(vFallita)) {
+        rompiUnaVolta = false;
+        return { updated_inputs: {}, missing: Object.keys(args.inputs) };
+      }
+      return deps.setInputs(args);
+    },
+  };
+  const proveZF = [vZero, vFallita, vOk].map((value) => ({ inputs: [{ name: numerico.name, position: numerico.position, value }] }));
+  const fZF = await eseguiFase({ ...opzioni, type: 'management', trials: proveZF, recalc_start_grace_ms: 500 }, depsProve);
+  if (!passo('fase con zero trade e un fermo', fZF.zero_trades === 1 && fZF.failed === 1 && fZF.stopped_reason?.kind === 'inputs_not_applied'
+      // remaining 2: la fallita e quella mai partita sono entrambe senza risultato.
+      && fZF.stopped_reason?.trial === 't2' && fZF.remaining_in_phase === 2 && !!fZF.table && fZF.pending_file === false,
+    `zero ${fZF.zero_trades}, failed ${fZF.failed}, fermo ${fZF.stopped_reason?.kind} su ${fZF.stopped_reason?.trial}, remaining ${fZF.remaining_in_phase}, table ${fZF.table ? 'presente' : 'assente'}, pending_file ${fZF.pending_file}`)) return fine();
+  const letta = await chiama('GET', `/api/v1/campaign-phases/${fZF.phase_id}`);
+  const stati = letta.json?.data?.trials?.map((t) => t.status);
+  passo('la piattaforma ha la riga a zero trade, la fallita e il fermo', letta.status === 200
+      && JSON.stringify(stati) === JSON.stringify(['zero_trades', 'failed', 'pending']) && letta.json?.data?.stop?.kind === 'inputs_not_applied',
+    letta.status === 200 ? `stati ${breve(stati)}, stop ${breve(letta.json?.data?.stop)}` : `HTTP ${letta.status} ${letta.text}`);
+  stato = await api.campaignState(campaignId);
+  passo('next dopo il fermo', stato.next?.action === 'run_phase' && stato.next?.phase_id === fZF.phase_id, `next ${breve(stato.next)}`);
+
+  // 11. La ripresa con phase_id: prima la prova da fare, poi la fallita, che ora passa.
+  const fRipresa = await eseguiFase({ ...opzioni, phase_id: fZF.phase_id, recalc_start_grace_ms: 500 }, depsProve);
+  passo('ripresa con phase_id', fRipresa.executed === 2 && fRipresa.failed === 0 && fRipresa.remaining_in_phase === 0 && fRipresa.stopped_reason === null
+      && !!fRipresa.table && fRipresa.discarded_local_file === false,
+    `executed ${fRipresa.executed}, failed ${fRipresa.failed}, remaining ${fRipresa.remaining_in_phase}, table ${fRipresa.table ? 'presente' : 'assente'}${fRipresa.stopped_reason ? `, fermo ${breve(fRipresa.stopped_reason)}` : ''}`);
+  passo('dopo la ripresa niente in locale', readdirSync(dirRegistro).length === 0, `file nel registro: ${readdirSync(dirRegistro).join(', ') || 'nessuno'}`);
+
+  // 12. Lo stato dopo la ripresa.
+  const dopoRipresa = await chiama('GET', `/api/v1/campaigns/${campaignId}`);
+  const nextRipresa = dopoRipresa.json?.data?.next;
+  passo('stato dopo la ripresa', dopoRipresa.status === 200 && nextRipresa?.action === 'decide' && nextRipresa?.phase_id === fZF.phase_id,
+    dopoRipresa.status === 200 ? `next ${breve(nextRipresa)}, budget ${breve(dopoRipresa.json?.data?.budget)}` : `HTTP ${dopoRipresa.status} ${dopoRipresa.text}`);
 
   return fine();
 }
