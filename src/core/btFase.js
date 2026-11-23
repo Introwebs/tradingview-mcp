@@ -77,7 +77,7 @@ export function dentroIlConfine(boundary, from, to) {
  * lato senza borsa e lo stesso ticker. Due borse DICHIARATE diverse sono due feed diversi: piu'
  * stretto di `stessoSymbol` del nucleo, che le considera uguali.
  */
-export function stessoMercato(a, b) {
+function stessoMercato(a, b) {
   if (!a || !b) return false;
   const A = String(a).trim().toUpperCase();
   const B = String(b).trim().toUpperCase();
