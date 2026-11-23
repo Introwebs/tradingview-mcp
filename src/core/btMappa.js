@@ -43,16 +43,26 @@ export function risolviMappa(info, mapInputs) {
   const perChiave = new Map();
   const mancanti = [];
   const tipoDiverso = [];
+  // Due voci della mappa che cadono sulla stessa chiave (stessi primi 60 caratteri, o diverse solo
+  // per gli spazi ai bordi): per la piattaforma sono due input, sul grafico se ne indirizzerebbe uno.
+  const doppioni = [];
+  const primaVoce = new Map();
   const inMappa = new Set();
   for (const voce of mapInputs || []) {
     const chiave = chiaveMappa(voce.name, posizione(voce));
+    if (primaVoce.has(chiave)) {
+      doppioni.push({ name: voce.name, position: posizione(voce), come: primaVoce.get(chiave).name });
+      continue;
+    }
+    primaVoce.set(chiave, voce);
     inMappa.add(chiave);
     const item = sulGrafico.get(chiave);
     if (!item) {
       if (voce.group !== 'skip') mancanti.push({ name: voce.name, position: posizione(voce) });
       continue;
     }
-    perChiave.set(chiave, { id: item.id, type: item.type, tipoMappa: voce.type, group: voce.group });
+    // `name` e `position` sono quelli della mappa, interi: la piattaforma indicizza per quelli.
+    perChiave.set(chiave, { id: item.id, type: item.type, tipoMappa: voce.type, group: voce.group, name: voce.name, position: posizione(voce) });
     const ammessi = TIPI_TV[voce.type];
     if (voce.group !== 'skip' && ammessi && TIPI_NOTI.has(item.type) && !ammessi.includes(item.type)) {
       tipoDiverso.push({ name: voce.name, position: posizione(voce), mappa: voce.type, grafico: item.type });
@@ -64,19 +74,22 @@ export function risolviMappa(info, mapInputs) {
     const nome = String(item.name ?? '').trim();
     if (!inMappa.has(chiave) && !nonInMappa.includes(nome)) nonInMappa.push(nome);
   }
-  return { perChiave, mancanti, tipoDiverso, nonInMappa };
+  return { perChiave, mancanti, tipoDiverso, nonInMappa, doppioni };
 }
 
 const primi = (lista, f) => lista.slice(0, 8).map(f).join(', ') + (lista.length > 8 ? ', ...' : '');
 
 export function verificaMappa(info, mapInputs) {
-  const { mancanti, tipoDiverso, nonInMappa } = risolviMappa(info, mapInputs);
-  if (!mancanti.length && !tipoDiverso.length) return null;
+  const { mancanti, tipoDiverso, nonInMappa, doppioni } = risolviMappa(info, mapInputs);
+  if (!mancanti.length && !tipoDiverso.length && !doppioni.length) return null;
   const utili = (mapInputs || []).filter((v) => v.group !== 'skip').length;
   const probabile = utili > 0 && mancanti.length * 2 >= utili;
   const parti = [];
   if (mancanti.length) parti.push(`la mappa elenca input che il grafico non ha: ${primi(mancanti, (m) => m.name)}`);
   if (tipoDiverso.length) parti.push(`input con un tipo diverso dal grafico: ${primi(tipoDiverso, (t) => `${t.name} (${t.mappa} contro ${t.grafico})`)}`);
+  if (doppioni.length) {
+    parti.push(`due voci della mappa cadono sullo stesso input del grafico (nomi uguali nei primi 60 caratteri, o diversi solo per gli spazi ai bordi): ${primi(doppioni, (d) => `«${d.come}» e «${d.name}» (posizione ${d.position})`)}`);
+  }
   if (probabile) parti.push('il grafico sembra un\'altra versione della strategia');
   return {
     kind: 'map_mismatch',
@@ -84,6 +97,7 @@ export function verificaMappa(info, mapInputs) {
     mancanti,
     tipo_diverso: tipoDiverso,
     non_in_mappa: nonInMappa,
+    doppioni,
     probabile_altra_versione: probabile,
   };
 }
@@ -108,8 +122,12 @@ export function configLetta(perChiave, valori = {}) {
   const out = [];
   for (const [chiave, ris] of perChiave) {
     if (ris.tipoMappa === 'color' || ris.type === 'color') continue;
-    const [name, position] = chiave.split('\u0000');
-    out.push({ name, position: Number(position), value: Object.prototype.hasOwnProperty.call(valori, ris.id) ? valori[ris.id] : null });
+    // Il nome intero della mappa, non la chiave rifilata e tagliata a 60: e' quello che la
+    // piattaforma usa per configurazione di lavoro, differenze e tabella.
+    const [nomeChiave, posChiave] = chiave.split('\u0000');
+    const name = ris.name ?? nomeChiave;
+    const position = ris.position ?? Number(posChiave);
+    out.push({ name, position, value: Object.prototype.hasOwnProperty.call(valori, ris.id) ? valori[ris.id] : null });
   }
   return out;
 }

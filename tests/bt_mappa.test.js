@@ -56,6 +56,29 @@ test('si applica solo cio che cambia, mai un colore e mai un null', () => {
   assert.deepEqual(r.ignoti, [{ name: 'Sconosciuto', position: 1 }]);
 });
 
+const LUNGO = 'Distanza minima dal massimo della sessione precedente in tick, per ingresso';
+const LUNGO_2 = 'Distanza minima dal massimo della sessione precedente in tick, per uscita';
+
+test('due voci della mappa che cadono sullo stesso input del grafico fermano tutto, e le nomina entrambe', () => {
+  assert.equal(LUNGO.slice(0, 60), LUNGO_2.slice(0, 60));
+  const info = [...INFO, { id: 'in_7', name: LUNGO, type: 'integer', group: 'A' }, { id: 'in_8', name: LUNGO_2, type: 'integer', group: 'A' }];
+  const mappa = [...MAPPA, { name: LUNGO, position: 1, type: 'int', group: 'entry' }, { name: LUNGO_2, position: 1, type: 'int', group: 'management' }];
+  const v = verificaMappa(info, mappa);
+  assert.equal(v?.kind, 'map_mismatch');
+  assert.ok(v.detail.includes(LUNGO) && v.detail.includes(LUNGO_2), v.detail);
+  assert.deepEqual(v.doppioni, [{ name: LUNGO_2, position: 1, come: LUNGO }]);
+});
+
+test('la configurazione riletta porta il nome intero della mappa, anche lungo o con spazi ai bordi', () => {
+  const info = [{ id: 'in_0', name: 'Stop ATR', type: 'float', group: 'G' }, { id: 'in_7', name: LUNGO, type: 'integer', group: 'A' }];
+  const mappa = [{ name: ' Stop ATR ', position: 1, type: 'float', group: 'management' }, { name: LUNGO, position: 1, type: 'int', group: 'entry' }];
+  assert.equal(verificaMappa(info, mappa), null);
+  const { perChiave } = risolviMappa(info, mappa);
+  assert.deepEqual(configLetta(perChiave, { in_0: 2, in_7: 12 }), [
+    { name: ' Stop ATR ', position: 1, value: 2 }, { name: LUNGO, position: 1, value: 12 },
+  ]);
+});
+
 test('la configurazione riletta segue la mappa e lascia fuori i colori', () => {
   const { perChiave } = risolviMappa(INFO, MAPPA);
   assert.deepEqual(configLetta(perChiave, { in_0: 2, in_1: 10, in_2: 20, in_3: '', in_4: 123 }), [
