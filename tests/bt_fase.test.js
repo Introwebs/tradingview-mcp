@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { eseguiFase, dentroIlConfine } from '../src/core/btFase.js';
 import { banco, STATO, M } from './helpers/bancoFase.js';
 
@@ -63,7 +64,8 @@ test('un fermo a meta lascia registrate le prove gia fatte', async () => {
   let n = 0;
   const vero = b.deps.setInputs;
   b.deps.setInputs = async (a) => { n += 1; return n === 2 ? { updated_inputs: {}, missing: ['in_0'] } : vero(a); };
-  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  // Grazia di avvio corta: la prova che non applica gli input aspetterebbe 5 s veri un ricalcolo che non parte.
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1', recalc_start_grace_ms: 20 }, b.deps);
   assert.deepEqual([out.executed, out.failed, out.stopped_reason.kind], [1, 1, 'inputs_not_applied']);
   assert.deepEqual(b.visto.inviate[0].rows.map((r) => r.status), ['measured', 'failed']);
 });
@@ -102,7 +104,8 @@ test('tempo scaduto: la chiamata si chiude e la ripresa esegue solo le prove man
 
 test('la base manda le Proprieta e non fa nessun salvataggio da backtest', async () => {
   const b = banco({ stato: { ...STATO, working_config: null }, metricsSeq: [M()] });
-  const out = await eseguiFase({ campaign_id: 3, type: 'base', trials: [{}], entity_id: 'ent1' }, b.deps);
+  // Grazia di avvio corta: la base non cambia input e aspetterebbe 5 s veri un ricalcolo che non serve.
+  const out = await eseguiFase({ campaign_id: 3, type: 'base', trials: [{}], entity_id: 'ent1', recalc_start_grace_ms: 20 }, b.deps);
   assert.equal(out.executed, 1);
   assert.equal(b.visto.inviate[0].properties['Initial Capital'], 10000);
   assert.deepEqual(b.visto.altreChiamate, [], 'nessun markRunning, stageEquity, finalize');
@@ -353,6 +356,90 @@ test('le chiamate di avvio che non arrivano salgono marcate, le altre eccezioni 
   const p = banco({ metricsSeq: [M()] });
   p.deps.ensureTesterPanel = async () => ({ ok: false, error: 'pannello chiuso' });
   await assert.rejects(eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, p.deps), (e) => !e.piattaforma_all_avvio);
+});
+
+// --- Copertura: periodo dichiarato, ripresa con prove fallite, uscite del nucleo, visibilita' ----
+
+test('il periodo esplicito di una prova arriva com e alla dichiarazione, quello assente e il periodo di ricerca', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 })] });
+  await eseguiFase({ campaign_id: 3, type: 'management', entity_id: 'ent1',
+    trials: [{ ...tre[0], period_start: '2019-01-01', period_end: '2020-06-30' }, tre[1]] }, b.deps);
+  assert.deepEqual(b.visto.open[0].trials.map((t) => [t.period_start, t.period_end]), [['2019-01-01', '2020-06-30'], ['2018-01-01', '2024-01-01']]);
+  assert.deepEqual(b.visto.inviate[0].rows.map((r) => [r.period_start, r.period_end]), [['2019-01-01', '2020-06-30'], ['2018-01-01', '2024-01-01']], 'righe col periodo riletto');
+});
+
+test('ripresa con una prova fallita nel file: si consegna, poi si riesegue insieme a quelle da fare', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 })],
+    fase: faseDa([provaDa('t1', 'pending', 2), provaDa('t2', 'pending', 3), provaDa('t3', 'pending', 4)]) });
+  b.registro.scrivi(9, { campaign_id: 3, rows: [rigaMisurata('t1', 2), { key: 't2', status: 'failed', error: 'inputs_not_applied: id non applicati: in_0' }],
+    stopped_reason: { kind: 'inputs_not_applied', detail: 'id non applicati: in_0' } });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual(b.visto.inviate.map((c) => c.rows.map((r) => `${r.key}:${r.status}`)), [['t1:measured', 't2:failed'], ['t2:measured', 't3:measured']]);
+  assert.equal(b.visto.inviate[0].stopped_reason.kind, 'inputs_not_applied');
+  assert.deepEqual([out.executed, out.remaining_in_phase, out.stopped_reason], [2, 0, null]);
+});
+
+test('uscite del nucleo: TradingView rifiuta il backtest esteso prima della prova', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 })] });
+  b.deps.readDeepState = async () => ({ found: true, requestId: 5, deep: true, status: 3, error: 'not_allowed' });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'deep_backtest_error');
+  assert.match(out.stopped_reason.detail, /not_allowed/);
+  assert.deepEqual(b.visto.inviate[0].rows.map((r) => r.status), ['failed']);
+});
+
+test('uscite del nucleo: il report dopo gli input non arriva', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 })] });
+  let dopo = false;
+  let t = 0;
+  const { setInputs } = b.deps;
+  b.deps.setInputs = async (a) => { dopo = true; return setInputs(a); };
+  b.deps.readDeepState = async () => ({ found: true, requestId: 5, deep: true, status: 2 });
+  b.deps.reportObsoleto = async () => dopo;
+  b.deps.aggiornaReportSeObsoleto = async () => (dopo ? { obsoleto: true, cliccato: true } : { obsoleto: false, cliccato: false });
+  b.deps.now = () => (t += 50);
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'report_not_synced');
+  assert.match(b.visto.inviate[0].rows[0].error, /^report_not_synced: /);
+});
+
+test('uscite del nucleo: la strategia si rompe a meta fase', async () => {
+  const b = banco({ metricsSeq: [M(), Z] });
+  let letture = 0;
+  b.deps.readStudyStatus = async () => ((letture += 1) === 1 ? { ok: true, type: 0, error: null } : { ok: false, type: 1, error: 'division by zero' });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'study_runtime_error');
+  assert.match(out.stopped_reason.detail, /division by zero/);
+  assert.deepEqual([out.zero_trades, out.failed], [0, 1]);
+});
+
+test('uscite del nucleo: un anomalia ferma con il suo kind', async () => {
+  const b = banco({ metricsSeq: [M()] });
+  b.deps.readInputValues = async () => ({ in_0: 1, in_40: 10000 });   // il set non si vede mai
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1', recalc_start_grace_ms: 10 }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'readback_mismatch');
+  assert.match(out.stopped_reason.detail, /registra la decisione della fase/);
+});
+
+test('la strategia nascosta torna nascosta, anche se la fase finisce con un eccezione', async () => {
+  for (const rompi of [false, true]) {
+    const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })] });
+    const nascoste = [];
+    b.deps.ensureVisibleFor = async () => ({ found: true, wasHidden: true });
+    b.deps.setStrategyVisibility = async (id, visibile) => { nascoste.push([id, visibile]); return true; };
+    if (rompi) b.deps.readReportFor = async () => { throw new Error('report illeggibile'); };
+    const fatto = eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+    if (rompi) await assert.rejects(fatto, /report illeggibile/); else await fatto;
+    assert.deepEqual(nascoste, [['ent1', false]], rompi ? 'con eccezione' : 'senza eccezione');
+  }
+});
+
+test('il nucleo riceve le stesse dipendenze da bt_grind e da bt_phase', () => {
+  const chiavi = (file) => {
+    const src = readFileSync(new URL(`../src/core/${file}`, import.meta.url), 'utf8');
+    return /const amb = \{[\s\S]*?deps: \{([\s\S]*?)\}/.exec(src)[1].split(',').map((s) => s.trim()).filter(Boolean).sort();
+  };
+  assert.deepEqual(chiavi('btFase.js'), chiavi('backtest.js'));
 });
 
 test('il confine: entrambe le date, nel formato giusto, dentro il periodo di ricerca', () => {
