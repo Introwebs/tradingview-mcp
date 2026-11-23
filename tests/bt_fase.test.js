@@ -186,6 +186,119 @@ test('una ripresa senza niente da eseguire restituisce la tabella salvata e le p
   assert.deepEqual(out.budget, STATO.budget);
 });
 
+// --- Consegna: rifiuti, guasti e fermi -----------------------------------------------------------
+
+const Z = M({ total_trades: 0, net_profit: 0 });
+
+test('un rifiuto senza motivo della piattaforma (422 di forma) non butta le righe', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })],
+    apiOver: { sendTrials: async () => ({ ok: false, status: 422, message: 'The rows.0.period_start field is required.', data: null }) } });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'http_422');
+  assert.match(out.stopped_reason.detail, /HTTP 422/);
+  assert.match(out.stopped_reason.detail, /The rows\.0\.period_start field is required\./);
+  assert.match(out.stopped_reason.detail, /richiama bt_phase con phase_id 9/);
+  assert.deepEqual([out.pending_file, out.remaining_in_phase, out.table], [true, 3, null]);
+  assert.equal(b.registro.leggi(9).rows.length, 3, 'il file resta');
+  assert.match(b.visto.progress.at(-2), /la piattaforma ha rifiutato/);
+});
+
+test('un rifiuto nel merito (holdout_breach) cancella il file, e nessuna prova risulta fatta', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 }), M({ net_profit: 300 }), M({ net_profit: 400 })],
+    apiOver: { sendTrials: async () => ({ ok: false, status: 422, reason_code: 'holdout_breach', message: 'La prova «t2» è stata misurata sul periodo…', data: { key: 't2' } }) } });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual([out.stopped_reason.kind, out.pending_file, out.remaining_in_phase], ['holdout_breach', false, 3]);
+  assert.equal(b.registro.leggi(9), null);
+});
+
+test('alla ripresa un rifiuto del file locale lascia tutte le prove senza risultato', async () => {
+  const b = banco({ metricsSeq: [M()], fase: faseDa([provaDa('t1', 'pending', 2), provaDa('t2', 'pending', 3)]),
+    apiOver: { sendTrials: async () => ({ ok: false, status: 409, reason_code: 'campaign_blocked', message: 'La campagna è bloccata.' }) } });
+  b.registro.scrivi(9, { campaign_id: 3, rows: [rigaMisurata('t1', 2)] });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual([out.stopped_reason.kind, out.remaining_in_phase, b.chart.setInputsChiamate], ['campaign_blocked', 2, 0]);
+});
+
+test('un periodo che non si rilegge non diventa una riga: prova fallita e fermo', async () => {
+  const b = banco({ metricsSeq: [M(), Z] });
+  const leggi = b.deps.readTestPeriod;
+  b.deps.readTestPeriod = async () => (b.chart.setInputsChiamate > 0 ? { label: '', from: null, to: null } : leggi());
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: [tre[0]], entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'period_unreadable');
+  assert.deepEqual([out.zero_trades, out.failed], [0, 1]);
+  const riga = b.visto.inviate[0].rows[0];
+  assert.deepEqual([riga.status, 'period_start' in riga], ['failed', false]);
+});
+
+test('se la consegna finale fallisce il fermo del ciclo resta dentro quello nuovo', async () => {
+  const b = banco({ metricsSeq: [M(), Z, Z, Z],
+    apiOver: { sendTrials: async () => { throw new Error('POST … → fetch failed'); } } });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'platform_unreachable');
+  assert.deepEqual([out.stopped_reason.previous.kind, out.stopped_reason.previous.trial], ['zero_trades_systemic', 't3']);
+  assert.match(out.stopped_reason.previous.detail, /senza alcun trade/);
+});
+
+test('ripresa: consegna del file riuscita e consegna finale fallita, nessuna tabella vecchia', async () => {
+  let n = 0;
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 })],
+    fase: faseDa([provaDa('t1', 'pending', 2), provaDa('t2', 'pending', 3)]),
+    apiOver: { sendTrials: async () => { n += 1; if (n === 2) throw new Error('fetch failed'); return { ok: true, data: { table: { vecchia: true }, budget: { remaining: 1 } } }; } } });
+  b.registro.scrivi(9, { campaign_id: 3, rows: [rigaMisurata('t1', 2)] });
+  const out = await eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual([out.executed, out.stopped_reason.kind, out.table, out.budget], [1, 'platform_unreachable', null, null]);
+});
+
+test('dopo 13 minuti la consegna non aspetta la piattaforma: le righe restano in locale', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 })] });
+  b.deps.now = () => (b.chart.setInputsChiamate > 0 ? 800000 : 0);
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.deepEqual([out.executed, b.visto.inviate.length, out.pending_file, out.stopped_reason.kind], [1, 0, true, 'platform_unreachable']);
+  assert.equal(b.registro.leggi(9).rows.length, 1);
+});
+
+test('un fermo che non si spiega da solo dice cosa fare', async () => {
+  const b = banco({ metricsSeq: [M()] });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', entity_id: 'ent1',
+    trials: [{ inputs: [{ name: 'Sconosciuto', value: 1 }] }] }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'unknown_input');
+  assert.match(out.stopped_reason.detail, /richiama bt_phase con phase_id 9/);
+  assert.match(out.stopped_reason.detail, /registra la decisione della fase/);
+});
+
+test('lo studio rotto all avvio ferma la fase anche se il progress non risponde', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 })],
+    apiOver: { progress: async (_c, msg) => { if (String(msg).startsWith('⛔')) throw new Error('progress giu'); return null; } } });
+  b.deps.readStudyStatus = async () => ({ ok: false, type: 1, error: 'division by zero' });
+  await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps).catch(() => null);
+  assert.equal(b.chart.setInputsChiamate, 0, 'nessuna prova eseguita');
+});
+
+test('il progress dei fermi parla di prove, non di run', async () => {
+  const b = banco({ metricsSeq: [M(), M({ net_profit: 200 })] });
+  let n = 0;
+  const vero = b.deps.setInputs;
+  b.deps.setInputs = async (a) => { n += 1; return n === 2 ? { updated_inputs: {}, missing: ['in_0'] } : vero(a); };
+  await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1', recalc_start_grace_ms: 10 }, b.deps);
+  const fermo = b.visto.progress.find((p) => p.startsWith('⛔'));
+  assert.match(fermo, /input della prova/);
+  assert.doesNotMatch(fermo, /\brun\b|symbol|timeframe/);
+});
+
+test('una fase gia aperta: il fermo dice quale fase riprendere', async () => {
+  const b = banco({ metricsSeq: [M()], apiOver: { openPhase: async () => ({ ok: false, status: 409, reason_code: 'phase_open', message: "C'è già una fase con prove da fare.", data: { phase_id: 8 } }) } });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.match(out.stopped_reason.detail, /richiama bt_phase con phase_id 8/);
+});
+
+test('un rifiuto di forma alla dichiarazione arriva in italiano', async () => {
+  const b = banco({ metricsSeq: [M()], apiOver: { openPhase: async () => ({ ok: false, status: 422, message: 'The trials.0.inputs.0.value field must be present.' }) } });
+  const out = await eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, b.deps);
+  assert.equal(out.stopped_reason.kind, 'http_422');
+  assert.match(out.stopped_reason.detail, /^La piattaforma ha rifiutato la dichiarazione della fase \(HTTP 422\)/);
+  assert.match(b.visto.progress.at(-1), /la piattaforma ha rifiutato/);
+});
+
 test('il confine: entrambe le date, nel formato giusto, dentro il periodo di ricerca', () => {
   const c = { search_from: '2018-01-01', search_until: '2024-01-01' };
   assert.equal(dentroIlConfine(c, '2018-01-01', '2024-01-01'), true);

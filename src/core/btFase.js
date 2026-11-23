@@ -97,8 +97,14 @@ function durataLeggibile(ms) {
   return s < 60 ? `${s} s` : `${Math.floor(s / 60)} min ${s % 60} s`;
 }
 
-// Le parole del progress per i fermi piu' comuni. Gli altri hanno gia' un `detail` in italiano
-// (le anomalie della misura, i rifiuti del server).
+// Oltre questo tempo dall'inizio della chiamata la consegna non aspetta piu' la piattaforma (i
+// ritenti sul 429 possono durare minuti): il watchdog del runner uccide a 15 minuti di silenzio, e
+// le righe sono gia' al sicuro nel file locale.
+const LIMITE_CONSEGNA_MS = 13 * 60 * 1000;
+
+// Le parole del progress per i fermi. Servono anche per i fermi che arrivano da fuori: le anomalie
+// del nucleo di bt_grind hanno un `detail` che parla di «run» e di «symbol/timeframe», e un
+// rifiuto di forma della piattaforma arriva come frase inglese di Laravel.
 const MOTIVI = {
   campaign_blocked: 'la campagna è bloccata',
   map_mismatch: 'gli input della campagna non corrispondono a quelli sul grafico',
@@ -114,8 +120,33 @@ const MOTIVI = {
   report_not_synced: 'il report di TradingView non è arrivato',
   platform_unreachable: 'la piattaforma non risponde, le righe sono al sicuro in locale',
   holdout_breach: 'una prova è finita nel periodo riservato',
+  period_unreadable: 'il periodo del tester non si è potuto rileggere',
+  phase_not_in_campaign: 'la fase è di un\'altra campagna',
+  // Dal nucleo della misura.
+  inputs_not_applied: 'un input della prova non si è applicato sul grafico',
+  silent_noop: 'TradingView non ha ricalcolato dopo il cambio degli input',
+  stale_metrics: 'il pannello di TradingView mostra ancora i numeri della prova prima',
+  baseline_unavailable: 'il pannello di TradingView non ha numeri con cui confrontare la prova',
+  symbol_not_applied: 'il grafico non è passato al mercato della campagna',
+  timeframe_not_applied: 'il grafico non è passato al timeframe della campagna',
+  period_not_applied: 'TradingView non ha applicato il periodo della prova',
+  panel_not_open: 'il pannello Strategy Tester non si è aperto',
+  // Dalla piattaforma.
+  phase_open: 'c\'è già una fase con prove da fare',
+  decision_missing: 'l\'ultima fase non ha ancora una decisione',
+  already_decided: 'la fase è già stata decisa',
+  unknown_trial: 'una prova non è fra quelle dichiarate nella fase',
 };
-const motivoBreve = (m) => MOTIVI[m.kind] ?? String(m.detail || m.kind).slice(0, 160);
+const motivoBreve = (m) => MOTIVI[m.kind]
+  ?? (/^http_/.test(String(m.kind)) ? `la piattaforma ha rifiutato la richiesta (HTTP ${String(m.kind).slice(5)})` : String(m.detail || m.kind).slice(0, 160));
+
+// I fermi che non si spiegano da soli: dicono anche cosa puo' fare l'operatore. Rifare la stessa
+// chiamata senza cambiare niente ferma la stessa prova nello stesso modo (e dopo tre prove a zero
+// trade ne spende altre tre).
+const SENZA_RIMEDIO = new Set(['readback_mismatch', 'inputs_not_applied', 'unknown_input', 'zero_trades_systemic']);
+const conRimedio = (stop, phaseId) => (SENZA_RIMEDIO.has(stop.kind)
+  ? `${stop.detail} Cosa fare: se la causa si può correggere (sul grafico o nella prova), correggila e richiama bt_phase con phase_id ${phaseId}; se no registra la decisione della fase (le prove non eseguite si scartano) e dichiarane una nuova senza quel valore.`
+  : stop.detail);
 
 /** Il fermo come lo accetta la piattaforma: `kind` ≤ 60, `detail` ≤ 1000. */
 const fermoPerPiattaforma = (m) => (m ? { kind: String(m.kind).slice(0, 60), detail: String(m.detail ?? '').slice(0, 1000) } : null);
@@ -213,26 +244,45 @@ export async function eseguiFase(opts, deps = {}) {
   const mercatoChiesto = symbol ?? stato.symbol ?? stato.symbols?.[0]
     ?? (Object.keys(stato.boundaries ?? {}).length === 1 ? Object.keys(stato.boundaries)[0] : null);
 
-  // Consegna alla piattaforma. Il file locale si cancella quando la piattaforma ha risposto, anche
-  // con un rifiuto (le righe rifiutate non vanno riproposte); resta solo se non ha risposto.
+  // Consegna alla piattaforma. Il file locale si cancella quando la piattaforma ha accettato, o ha
+  // rifiutato con un motivo (`reason_code`: holdout_breach, already_decided, unknown_trial…): e' una
+  // decisione sulla campagna, e quelle righe non vanno riproposte. Un rifiuto senza motivo (un 422
+  // di forma, 401, 403, 404, 413…) non dice niente sulle prove: il file resta.
   const consegna = async (phaseId, corpo) => {
     consegnaTentata = true;
     let r;
     try { r = await api.sendTrials(phaseId, corpo); } catch (e) { return { guasto: e }; }
+    if (!r?.ok) {
+      const rifiuto = r ?? { message: 'risposta vuota' };
+      if (rifiuto.reason_code) registro.cancella(phaseId);
+      return { rifiuto };
+    }
     registro.cancella(phaseId);
-    if (!r?.ok) return { rifiuto: r ?? { message: 'risposta vuota' } };
     esito.table = r.data?.table ?? null;
     esito.budget = r.data?.budget ?? null;
     return { ok: true };
   };
-  const fermoRifiuto = (r) => ({ kind: r.reason_code || `http_${r.status ?? '?'}`, detail: r.message, ...(r.data != null && { data: r.data }) });
+  const fermoRifiuto = (r, alSicuro) => {
+    if (r.reason_code) return { kind: r.reason_code, detail: r.message, ...(r.data != null && { data: r.data }) };
+    const http = r.status ?? '?';
+    return {
+      kind: `http_${http}`,
+      detail: `La piattaforma ha rifiutato la consegna delle righe (HTTP ${http}): «${r.message ?? 'nessun messaggio'}». `
+        + (alSicuro
+          ? `Le righe sono al sicuro in locale: correggi la causa (il token, i permessi, o la riga che la piattaforma non accetta) e richiama bt_phase con phase_id ${esito.phase_id} per consegnarle, senza rieseguire le prove.`
+          : `Le righe non si sono potute salvare in locale: le prove di questa chiamata andranno rifatte, richiama bt_phase con phase_id ${esito.phase_id}.`),
+      ...(r.data != null && { data: r.data }),
+    };
+  };
   const fermoIrraggiungibile = (e, alSicuro) => ({
     kind: 'platform_unreachable',
     detail: alSicuro
-      ? 'Le righe sono al sicuro in locale: richiama bt_phase con phase_id per consegnarle, senza rieseguire le prove.'
-      : 'La piattaforma non ha risposto e le righe non si sono potute salvare in locale: le prove di questa chiamata andranno rifatte, richiama bt_phase con phase_id.',
+      ? `Le righe sono al sicuro in locale: richiama bt_phase con phase_id ${esito.phase_id} per consegnarle, senza rieseguire le prove.`
+      : `La piattaforma non ha risposto e le righe non si sono potute salvare in locale: le prove di questa chiamata andranno rifatte, richiama bt_phase con phase_id ${esito.phase_id}.`,
     error: String(e?.message ?? e).slice(0, 300),
   });
+  // Il fermo del ciclo, tenuto dentro quello della consegna: senza, resterebbe solo nel file locale.
+  const precedente = (m) => (m ? { previous: { kind: m.kind, detail: m.detail ?? null, trial: m.trial ?? null } } : {});
 
   // 3. La fase: nuova (controlli locali, poi dichiarazione) o ripresa.
   const consegnate = new Set();
@@ -274,8 +324,14 @@ export async function eseguiFase(opts, deps = {}) {
     const aperta = await api.openPhase(campaign_id, { type, symbol: mercatoChiesto, trials: dichiarate });
     if (!aperta?.ok) {
       const r = aperta ?? {};
+      let detail = r.message;
+      if (!r.reason_code) {
+        detail = `La piattaforma ha rifiutato la dichiarazione della fase (HTTP ${r.status ?? '?'}): «${r.message ?? 'nessun messaggio'}». Nessuna prova è partita.`;
+      } else if (r.reason_code === 'phase_open' && r.data?.phase_id != null) {
+        detail = `${r.message} Per finirla richiama bt_phase con phase_id ${r.data.phase_id}.`;
+      }
       return ferma({
-        kind: r.reason_code || `http_${r.status ?? '?'}`, detail: r.message,
+        kind: r.reason_code || `http_${r.status ?? '?'}`, detail,
         ...(r.data?.phase_id != null && { phase_id: r.data.phase_id }),
         ...(r.data?.trial != null && { trial: r.data.trial }),
         ...(r.data?.budget != null && { budget: r.data.budget }),
@@ -327,9 +383,18 @@ export async function eseguiFase(opts, deps = {}) {
           ...(salvato.stopped_reason && { stopped_reason: salvato.stopped_reason }),
         });
         if (!c.ok) {
-          esito.remaining_in_phase = fase.trials.filter((t) => (t.status === 'pending' || t.status === 'failed') && !fatteInLocale.includes(t.key)).length;
-          if (c.guasto) { esito.pending_file = true; return ferma(fermoIrraggiungibile(c.guasto, true)); }
-          return ferma(fermoRifiuto(c.rifiuto));
+          const senza = fase.trials.filter((t) => t.status === 'pending' || t.status === 'failed');
+          const prima = precedente(salvato.stopped_reason);
+          if (c.guasto) {
+            // Le righe del file restano e la prossima chiamata le consegna: quelle non sono da rifare.
+            esito.remaining_in_phase = senza.filter((t) => !fatteInLocale.includes(t.key)).length;
+            esito.pending_file = true;
+            return ferma({ ...fermoIrraggiungibile(c.guasto, true), ...prima });
+          }
+          // Rifiutate: sulla piattaforma nessuna di queste prove ha un risultato.
+          esito.remaining_in_phase = senza.length;
+          esito.pending_file = !c.rifiuto.reason_code;
+          return ferma({ ...fermoRifiuto(c.rifiuto, true), ...prima });
         }
         for (const k of fatteInLocale) consegnate.add(k);
       }
@@ -370,17 +435,21 @@ export async function eseguiFase(opts, deps = {}) {
   }
 
   try {
+    // Il fermo si calcola dentro la guardia e si restituisce fuori: un guasto del progress dentro
+    // `ferma` non deve finire nel catch che lascia partire le prove su uno studio rotto.
+    let studioRotto = null;
     try {
       const st = await readStudyStatus(entity_id);
       if (st && st.ok === false) {
         const err = st.error || 'errore di runtime';
-        return await ferma({
+        studioRotto = {
           kind: 'study_runtime_error',
           detail: `la strategia ${entity_id} e' in errore di runtime su TradingView: "${err}". Nessuna prova eseguita: riparala sul chart (ricaricala, oppure correggi l'input che la rompe) e richiama bt_phase con phase_id ${esito.phase_id}.`,
           entity_id, status_type: st.type,
-        });
+        };
       }
     } catch { /* guardia, non oracolo: se lo stato non e' leggibile si prosegue */ }
+    if (studioRotto) return await ferma(studioRotto);
 
     const cron = creaCronometro(now);
     const statoProva = { prevFp: fpNotoO(null, (await readReportFor(entity_id))?.metrics), snapshotCommissione: null };
@@ -436,6 +505,16 @@ export async function eseguiFase(opts, deps = {}) {
                 break;
               }
               const letto = zero ? await readTestPeriod() : { from: m.periodoFinale?.from || m.periodo?.from, to: m.periodoFinale?.to || m.periodo?.to };
+              // Una riga misurata porta il periodo su cui e' stata misurata, nel formato che la
+              // piattaforma accetta: senza, il lotto intero verrebbe rifiutato. Il periodo NON si
+              // confronta qui col confine: quel controllo (e il blocco) e' della piattaforma.
+              if (!giorno(letto?.from) || !giorno(letto?.to)) {
+                stop = {
+                  kind: 'period_unreadable',
+                  detail: `il periodo del tester non si è potuto rileggere dopo la prova (${letto?.from ?? '?'} → ${letto?.to ?? '?'}): una prova senza il periodo su cui è stata misurata non si registra. Controlla il pulsante del periodo nello Strategy Tester e richiama bt_phase con phase_id ${esito.phase_id}: riparte dalle prove mancanti.`,
+                };
+                break;
+              }
               const p = toFinalizePayload(zero ? m.results.metrics : m.metricheFinali);
               riga = {
                 key: prova.key, status: zero ? 'zero_trades' : 'measured',
@@ -459,14 +538,14 @@ export async function eseguiFase(opts, deps = {}) {
               stop = {
                 kind: rifiuto ? 'deep_backtest_error' : 'report_not_synced',
                 detail: `${cosa}: non c'e' un report da misurare e nessuna prova e' stata registrata con numeri non suoi. La prova ${prova.key} resta da rifare.`
-                  + `${rifiuto ? ' Riavvia TradingView e richiama' : ' Controlla il tester su TradingView e richiama'} bt_phase con phase_id: riparte dalle prove mancanti.`,
+                  + `${rifiuto ? ' Riavvia TradingView e richiama' : ' Controlla il tester su TradingView e richiama'} bt_phase con phase_id ${esito.phase_id}: riparte dalle prove mancanti.`,
               };
               break;
             }
             case 'studio_rotto':
               stop = {
                 kind: 'study_runtime_error',
-                detail: `la strategia e' andata in errore di runtime su TradingView ("${m.errore}") mentre la fase girava: da qui in poi ogni prova darebbe zero trade. Riparala sul chart (ricaricala, o togli l'input che la rompe) e richiama bt_phase con phase_id: riparte dalle prove mancanti.`,
+                detail: `la strategia e' andata in errore di runtime su TradingView ("${m.errore}") mentre la fase girava: da qui in poi ogni prova darebbe zero trade. Riparala sul chart (ricaricala, o togli l'input che la rompe) e richiama bt_phase con phase_id ${esito.phase_id}: riparte dalle prove mancanti.`,
               };
               break;
             case 'anomalia':
@@ -502,7 +581,7 @@ export async function eseguiFase(opts, deps = {}) {
         rows.push({ key: prova.key, status: 'failed', error: `${stop.kind}: ${stop.detail}`.slice(0, 500), duration_ms });
         esito.failed += 1;
       }
-      if (stop) fermo = { ...stop, trial: prova.key, label: prova.label ?? null };
+      if (stop) fermo = { ...stop, detail: conRimedio(stop, esito.phase_id), trial: prova.key, label: prova.label ?? null };
 
       // Dopo OGNI prova: e' la rete che rende sicura un'interruzione a meta'.
       try {
@@ -519,20 +598,38 @@ export async function eseguiFase(opts, deps = {}) {
     }
     esito.remaining_in_phase = n - fatte;
 
-    // 6. Consegna.
+    // 6. Consegna. Se non riesce, `table` e `budget` restano null (non quelli di una consegna
+    // precedente della stessa chiamata) e il fermo del ciclo resta dentro quello nuovo.
     if (rows.length) {
-      const c = await consegna(esito.phase_id, {
-        rows,
-        ...(properties && { properties }),
-        ...(fermo && { stopped_reason: fermoPerPiattaforma(fermo) }),
-      });
-      if (c.guasto) {
-        esito.pending_file = fileScritto;
-        await ferma(fermoIrraggiungibile(c.guasto, fileScritto));
-      } else if (c.rifiuto) {
-        await ferma(fermoRifiuto(c.rifiuto));
+      const nonRiuscita = (m) => { esito.table = null; esito.budget = null; return ferma({ ...m, ...precedente(fermo) }); };
+      if (fileScritto && now() - t0 > LIMITE_CONSEGNA_MS) {
+        // Tardi per aspettare la piattaforma: le righe sono nel file e la prossima chiamata le consegna.
+        consegnaTentata = true;
+        esito.pending_file = true;
+        await nonRiuscita({
+          kind: 'platform_unreachable',
+          detail: `La chiamata dura da più di ${Math.round(LIMITE_CONSEGNA_MS / 60000)} minuti: non aspetto la piattaforma. Le righe sono al sicuro in locale: richiama bt_phase con phase_id ${esito.phase_id} per consegnarle, senza rieseguire le prove.`,
+        });
+      } else {
+        const c = await consegna(esito.phase_id, {
+          rows,
+          ...(properties && { properties }),
+          ...(fermo && { stopped_reason: fermoPerPiattaforma(fermo) }),
+        });
+        if (c.guasto) {
+          esito.pending_file = fileScritto;
+          // Senza file le prove di questa chiamata sono da rifare.
+          if (!fileScritto) esito.remaining_in_phase = n;
+          await nonRiuscita(fermoIrraggiungibile(c.guasto, fileScritto));
+        } else if (c.rifiuto) {
+          // Rifiutate: sulla piattaforma nessuna prova di questa chiamata ha un risultato.
+          esito.remaining_in_phase = n;
+          esito.pending_file = fileScritto && !c.rifiuto.reason_code;
+          await nonRiuscita(fermoRifiuto(c.rifiuto, fileScritto));
+        }
       }
     }
+    tabellaSalvata();
     await api.progress(command_id, `Fase ${nome()}: ${esito.executed + esito.zero_trades} prove in ${durataLeggibile(now() - t0)}`);
     return esito;
   } finally {
