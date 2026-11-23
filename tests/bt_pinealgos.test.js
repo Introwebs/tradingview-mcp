@@ -175,3 +175,21 @@ test('getPhase legge il campo data', async () => {
   } });
   assert.equal((await api.getPhase(7)).id, 7);
 });
+
+test('un 429 che sopravvive ai ritenti lancia, non e un rifiuto nel merito', async () => {
+  let n = 0;
+  const api = makeApi({ base: 'http://x', token: 't', sleep: async () => {}, maxRetries429: 2, fetchImpl: async () => {
+    n += 1;
+    return { ok: false, status: 429, headers: new Map(), text: async () => 'slow down' };
+  } });
+  await assert.rejects(() => api.openPhase(3, {}), /HTTP 429/);
+  await assert.rejects(() => api.sendTrials(9, { rows: [] }), /HTTP 429/);
+  assert.equal(n, 6);
+});
+
+test('un 4xx con corpo non JSON letto da una Response vera conserva il testo', async () => {
+  const api = makeApi({ base: 'http://x', token: 't', fetchImpl: async () => new Response('<html>non trovato</html>', { status: 404 }) });
+  const out = await api.openPhase(3, {});
+  assert.equal(out.ok, false);
+  assert.match(out.message, /HTTP 404: <html>non trovato/);
+});

@@ -113,12 +113,17 @@ export function makeApi({
       const corpo = await leggiCorpo(res);
       return { ok: true, status: res.status, data: corpo?.data };
     }
-    if (res.status < 400 || res.status >= 500) await lanciaSuErrore(method, path, res);
-    const corpo = await leggiCorpo(res);
+    // 429 arriva qui solo a ritenti esauriti: e' un guasto transitorio, non un rifiuto nel merito.
+    if (res.status === 429 || res.status < 400 || res.status >= 500) await lanciaSuErrore(method, path, res);
+    // Il corpo si legge UNA volta (su una Response vera json() lo consuma e poi text() lancia).
+    let text = '';
+    try { if (typeof res.text === 'function') text = String(await res.text() ?? ''); } catch { /* corpo gia' consumato o illeggibile */ }
+    let corpo = null;
+    try { if (text) corpo = JSON.parse(text); } catch { /* non JSON: resta il testo */ }
+    if (!corpo && !text) corpo = await leggiCorpo(res);
     let message = corpo?.message;
     if (typeof message !== 'string' || !message) {
-      const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
-      message = `HTTP ${res.status}${text ? `: ${String(text).slice(0, 200)}` : ''}`;
+      message = `HTTP ${res.status}${text ? `: ${text.slice(0, 200)}` : ''}`;
     }
     return { ok: false, status: res.status, reason_code: corpo?.reason_code, message, data: corpo?.data };
   }
