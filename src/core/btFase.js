@@ -166,6 +166,20 @@ const conRimedio = (stop, phaseId) => (SENZA_RIMEDIO.has(stop.kind)
   ? `${stop.detail} Cosa fare: se la causa si può correggere (sul grafico o nella prova), correggila e richiama bt_phase con phase_id ${phaseId}; se no registra la decisione della fase (le prove non eseguite si scartano) e dichiarane una nuova senza quel valore.`
   : stop.detail);
 
+/**
+ * Le chiamate di avvio (stato della campagna, dichiarazione, lettura della fase): se lanciano,
+ * l'eccezione sale com'e', marcata, e il gestore del tool la dice in italiano. Prima di loro non si
+ * e' toccato ne' il grafico ne' il file locale.
+ */
+async function allAvvio(chiamata) {
+  try {
+    return await chiamata();
+  } catch (err) {
+    if (err && typeof err === 'object') err.piattaforma_all_avvio = true;
+    throw err;
+  }
+}
+
 /** Il fermo come lo accetta la piattaforma: `kind` ≤ 60, `detail` ≤ 1000. */
 const fermoPerPiattaforma = (m) => (m ? { kind: String(m.kind).slice(0, 60), detail: String(m.detail ?? '').slice(0, 1000) } : null);
 
@@ -238,7 +252,7 @@ export async function eseguiFase(opts, deps = {}) {
   const ferma = async (m) => { esito.stopped_reason = m; tabellaSalvata(); await avvisaFermo(m); return esito; };
 
   // 1. Lo stato della campagna, con la mappa degli input.
-  stato = await api.campaignState(campaign_id);
+  stato = await allAvvio(() => api.campaignState(campaign_id));
   if (!stato) throw new Error(`campagna ${campaign_id} non trovata`);
   if (!Array.isArray(stato.map?.inputs)) throw new Error(`lo stato della campagna ${campaign_id} non porta la mappa degli input`);
   // Senza timeframe ogni prova si misurerebbe su quello che il grafico ha in quel momento.
@@ -346,7 +360,7 @@ export async function eseguiFase(opts, deps = {}) {
     }
     // Si dichiara la scrittura della campagna (la chiave del confine), non quella di chi chiama:
     // e' anche quella su cui poi si misura.
-    const aperta = await api.openPhase(campaign_id, { type, symbol: trovato.chiave, trials: dichiarate });
+    const aperta = await allAvvio(() => api.openPhase(campaign_id, { type, symbol: trovato.chiave, trials: dichiarate }));
     if (!aperta?.ok) {
       const r = aperta ?? {};
       let detail = r.message;
@@ -364,7 +378,7 @@ export async function eseguiFase(opts, deps = {}) {
     }
     fase = aperta.data;
   } else {
-    fase = await api.getPhase(phase_id);
+    fase = await allAvvio(() => api.getPhase(phase_id));
     if (!fase) throw new Error(`fase ${phase_id} non trovata`);
   }
   if (!Array.isArray(fase.trials)) throw new Error(`la fase ${fase.id ?? phase_id} non porta l'elenco delle prove`);

@@ -341,6 +341,20 @@ test('una campagna senza timeframe non si esegue', async () => {
   assert.equal(b.visto.open.length, 0);
 });
 
+test('le chiamate di avvio che non arrivano salgono marcate, le altre eccezioni no', async () => {
+  const giu = async () => { throw new Error('GET … → fetch failed'); };
+  for (const apiOver of [{ campaignState: giu }, { getPhase: giu }]) {
+    const b = banco({ metricsSeq: [M()], apiOver, fase: faseDa([provaDa('t1', 'pending', 2)]) });
+    await assert.rejects(eseguiFase({ campaign_id: 3, phase_id: 9, entity_id: 'ent1' }, b.deps), (e) => e.piattaforma_all_avvio === true);
+  }
+  const o = banco({ metricsSeq: [M()], apiOver: { openPhase: giu } });
+  await assert.rejects(eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, o.deps), (e) => e.piattaforma_all_avvio === true);
+
+  const p = banco({ metricsSeq: [M()] });
+  p.deps.ensureTesterPanel = async () => ({ ok: false, error: 'pannello chiuso' });
+  await assert.rejects(eseguiFase({ campaign_id: 3, type: 'management', trials: tre, entity_id: 'ent1' }, p.deps), (e) => !e.piattaforma_all_avvio);
+});
+
 test('il confine: entrambe le date, nel formato giusto, dentro il periodo di ricerca', () => {
   const c = { search_from: '2018-01-01', search_until: '2024-01-01' };
   assert.equal(dentroIlConfine(c, '2018-01-01', '2024-01-01'), true);
