@@ -39,3 +39,13 @@ test('bt_apply pretende il backtest_id e accetta il solo command_id in piu', () 
   assert.equal(s.safeParse({ backtest_id: 1056, command_id: 7 }).success, true);
   assert.equal(s.safeParse({}).success, false);
 });
+
+test('bt_phase accetta una fase nuova e una ripresa, e pretende la campagna', () => {
+  const s = schemi().bt_phase;
+  assert.equal(s.safeParse({ campaign_id: 3, type: 'management', strategy_name: 'NDQ Box Strategy',
+    trials: [{ inputs: [{ name: 'Stop ATR', value: 1.5 }, { name: 'Filtro trend', position: 1, value: false }] }] }).success, true);
+  assert.equal(s.safeParse({ campaign_id: 3, phase_id: 9 }).success, true);
+  assert.equal(s.safeParse({ type: 'base', trials: [{}] }).success, false);
+  assert.equal(s.safeParse({ campaign_id: 3, type: 'tenuta', trials: [{}] }).success, false);
+  assert.equal(s.safeParse({ campaign_id: 3, type: 'entry', trials: [{ inputs: [{ name: 'X', value: null }] }] }).success, false);
+});

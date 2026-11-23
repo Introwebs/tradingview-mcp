@@ -3,6 +3,7 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/backtest.js';
 import { resolveConfig, makeApi } from '../core/pinealgos.js';
 import { applyBacktest } from '../core/btApply.js';
+import { eseguiFase } from '../core/btFase.js';
 
 export function registerBacktestTools(server) {
   server.tool(
@@ -52,6 +53,46 @@ export function registerBacktestTools(server) {
         const { base, token } = resolveConfig();
         const api = makeApi({ base, token });
         return jsonResult(await applyBacktest(args, { api }));
+      } catch (err) {
+        return jsonResult({ success: false, error: err.message }, true);
+      }
+    }
+  );
+
+  server.tool(
+    'bt_phase',
+    'Esegue tutte le prove di una FASE di una campagna Pine Algos in una chiamata: applica mercato, timeframe, periodo e input, misura, e manda le righe alla piattaforma. Non salva backtest, non fa screenshot. Rifiuta le prove che toccano il periodo riservato o che sforano le prove rimaste prima di eseguirne una. Ritorna la tabella calcolata dalla piattaforma, mai le righe. Se torna remaining_in_phase > 0 o pending_file, richiamalo con phase_id.',
+    {
+      campaign_id: z.number().int().describe('Id della campagna Pine Algos'),
+      phase_id: z.number().int().optional().describe('Id della fase da riprendere; senza, si apre una fase nuova (servono type e trials)'),
+      type: z.enum(['base', 'entry', 'filter', 'management', 'risk', 'hold']).optional().describe('Tipo della fase nuova'),
+      symbol: z.string().optional().describe('Mercato della fase'),
+      trials: z.array(z.object({
+        key: z.string().max(64).optional().describe('Chiave della prova'),
+        label: z.string().max(120).optional().describe('Etichetta leggibile della prova'),
+        period_start: z.string().optional().describe('Inizio periodo ISO (YYYY-MM-DD)'),
+        period_end: z.string().optional().describe('Fine periodo ISO (YYYY-MM-DD)'),
+        inputs: z.array(z.object({
+          name: z.string().describe("Nome dell'input"),
+          position: z.number().int().optional().describe("Posizione dell'input quando il nome si ripete"),
+          value: z.union([z.string(), z.number(), z.boolean()]).describe('Valore da applicare (la stringa vuota e un valore valido)'),
+        })).max(10).optional().describe('Input da impostare per la prova'),
+      })).max(60).optional().describe('Prove della fase nuova'),
+      entity_id: z.string().optional().describe('entity_id della strategia bersaglio. Opzionale se passi strategy_name'),
+      strategy_name: z.string().optional().describe('Titolo della strategia sul chart, per risolvere entity_id'),
+      command_id: z.number().int().optional().describe('Id del comando operatore, per i progress in console'),
+      max_trials_per_call: z.number().int().optional().describe('Massimo di prove per chiamata'),
+      time_budget_ms: z.number().int().optional().describe('Tempo massimo della chiamata in millisecondi'),
+      recalc_timeout_ms: z.number().int().optional().describe('Attesa massima del ricalcolo per prova'),
+    },
+    async (args) => {
+      try {
+        if (!args.phase_id && !(args.type && args.trials)) {
+          return jsonResult({ success: false, error: 'Servono phase_id (per riprendere una fase) oppure type e trials (per aprirne una nuova)' }, true);
+        }
+        const { base, token } = resolveConfig();
+        const api = makeApi({ base, token });
+        return jsonResult(await eseguiFase(args, { api }));
       } catch (err) {
         return jsonResult({ success: false, error: err.message }, true);
       }
