@@ -144,9 +144,11 @@ export function makeApi({
      * sulla run 1140: bt_grind e' uscito per un'eccezione dopo `markRunning`, e le 10 run M15 non
      * sono mai state eseguite mentre la sessione risultava chiusa.
      */
-    reclaimRun(runId) {
+    reclaimRun(runId, motivo = 'ripresa: era rimasta running da un grind interrotto') {
+      // `motivo` e' cio' che resta scritto sulla run: chi la rimette in coda per un'altra ragione
+      // (es. TradingView ha rifiutato il backtest esteso) lo dice, invece di ereditare questo testo.
       return req('PATCH', `/api/v1/backtest-runs/${runId}`, {
-        body: { status: 'pending', error: 'ripresa: era rimasta running da un grind interrotto' },
+        body: { status: 'pending', error: String(motivo).slice(0, 500) },
       });
     },
     /**

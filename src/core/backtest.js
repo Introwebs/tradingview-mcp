@@ -405,6 +405,14 @@ export async function grindSession(opts, deps = {}) {
     sleep, now, timeoutMs: Math.max(recalc_timeout_ms, 60000), ...extra,
   });
 
+  // Il requestId di ADESSO: si legge PRIMA di cambiare contesto o input e si passa a `sincronizza`
+  // come `richiestaDopo`. E' la prova positiva: il report vale solo se una richiesta piu' recente di
+  // questa e' atterrata. null = modello non leggibile, e allora non si sincronizza affatto.
+  const richiestaCorrente = async () => {
+    try { const s = await readDeepState(); return s && s.found === true ? s.requestId : null; } catch { return null; }
+  };
+  const NON_SINCRONIZZABILE = { disponibile: false };
+
   if (!session_id) throw new Error('session_id è obbligatorio');
   if (!entity_id && strategy_name) {
     const ris = resolveStrategyEntity(await getChartState(), strategy_name);
@@ -500,19 +508,24 @@ export async function grindSession(opts, deps = {}) {
   // visto dal vivo il 2026-11-23: da li' in poi ogni richiesta estesa falliva finche' TradingView non
   // e' stato riavviato) oppure la richiesta non e' atterrata in tempo. In nessuno dei due casi c'e'
   // qualcosa da misurare, e qualunque numero resti sul pannello e' di una configurazione precedente.
-  // La run non ha colpa: torna in coda, e il grind si ferma perche' le successive farebbero lo stesso.
+  // Il grind si ferma perche' le run successive farebbero lo stesso. La run torna in coda UNA volta
+  // sola: se la causa e' sua (un periodo che TradingView rifiuta per quel mercato, una richiesta piu'
+  // lunga del timeout) rimetterla in coda a ogni giro bloccherebbe la matrice per sempre, quindi al
+  // secondo tentativo resta `failed` col motivo vero.
   const fermaReportNonArrivato = async (run, sinc) => {
     const rifiuto = sinc.motivo === 'errore_tradingview';
     const cosa = rifiuto ? `TradingView ha rifiutato il backtest esteso ("${sinc.errore}")` : `il report del backtest esteso non e' arrivato (${sinc.motivo})`;
     let inCoda = false;
+    const primoTentativo = (Number(run.attempts) || 0) < 1;
+    const motivoRun = `${rifiuto ? 'deep_backtest_error' : 'report_not_synced'}: ${rifiuto ? sinc.errore : sinc.motivo}`;
     try {
-      if (typeof api.reclaimRun === 'function') { await api.reclaimRun(run.id); inCoda = true; }
-      else await api.markFailed(run.id, `${rifiuto ? 'deep_backtest_error' : 'report_not_synced'}: ${rifiuto ? sinc.errore : sinc.motivo}`);
+      if (primoTentativo && typeof api.reclaimRun === 'function') { await api.reclaimRun(run.id, `${motivoRun} — rimessa in coda`); inCoda = true; }
+      else await api.markFailed(run.id, motivoRun);
     } catch { /* la diagnosi vera e' lo stop qui sotto, non l'esito di questa chiamata */ }
     stopped_reason = {
       kind: rifiuto ? 'deep_backtest_error' : 'report_not_synced',
       detail: `${cosa}: non c'e' un report da misurare e nessuna run e' stata registrata con numeri non suoi.`
-        + `${inCoda ? ` La run ${run.id} e' tornata in coda.` : ''}`
+        + `${inCoda ? ` La run ${run.id} e' tornata in coda.` : ` La run ${run.id} e' segnata fallita con questo motivo.`}`
         + `${rifiuto ? ' Riavvia TradingView e rilancia' : ' Controlla il tester su TradingView e rilancia'}: il grind riparte dalle pending.`,
       run_id: run.id, label: run.label ?? null,
     };
@@ -591,6 +604,7 @@ export async function grindSession(opts, deps = {}) {
 
       // PRIMA il contesto (symbol, timeframe, periodo), POI gli input: cambiare symbol o timeframe
       // ricarica la serie e farebbe ripartire il calcolo dopo il set, falsando l'attesa.
+      const reqPrimaDelContesto = await richiestaCorrente();
       const { problemi, periodo, contestoCambiato } = await applicaContestoRun(run, ctxRun);
       cron.segna('contesto');
       if (problemi.length) {
@@ -620,9 +634,15 @@ export async function grindSession(opts, deps = {}) {
       // pannello mostra — fermissimo — il report del periodo di PRIMA. Si aspetta che la richiesta
       // atterri. Vale anche a contesto fermo: una richiesta rimasta in volo o un banner non premuto
       // dalla run precedente si chiudono qui, prima di prendere il riferimento.
-      const sincPrima = await sincronizza();
+      //
+      // Dopo un cambio di contesto la prova e' una richiesta PIU' RECENTE di quella letta prima del
+      // cambio, atterrata: il silenzio del tester non basta (la richiesta puo' non essere ancora
+      // partita). Se quel riferimento non si e' potuto leggere, non si sincronizza.
+      const sincPrima = (contestoCambiato && reqPrimaDelContesto === null)
+        ? NON_SINCRONIZZABILE
+        : await sincronizza({ richiestaDopo: contestoCambiato ? reqPrimaDelContesto : null });
       if (sincPrima.disponibile && sincPrima.deep) {
-        if (!sincPrima.ok) { await fermaReportNonArrivato(run, sincPrima); break; }
+        if (!sincPrima.ok) { cron.segna('baseline'); await fermaReportNonArrivato(run, sincPrima); break; }
         if (sincPrima.click > 0) await nota(`run ${run.id}: report obsoleto all'inizio della run, aggiornato prima della baseline`);
       } else if (contestoCambiato) {
         const rinfresco = await aggiornaReportSeObsoleto();
@@ -732,6 +752,7 @@ export async function grindSession(opts, deps = {}) {
         } catch { /* in dubbio si assume che un cambiamento ci sia */ }
       }
 
+      const reqPrimaDegliInput = deltaReale ? await richiestaCorrente() : null;
       let setResult = { updated_inputs: {}, missing: [] };
       if (Object.keys(richiesti).length) {
         setResult = await setInputs({ entity_id, inputs: richiesti });
@@ -754,8 +775,16 @@ export async function grindSession(opts, deps = {}) {
       // TradingView e' leggibile si aspetta la richiesta vera (`sincronizzato`); altrove resta il
       // banner, com'era.
       let report;
-      const sincDopo = await sincronizza({ graziaInizialeMs: deltaReale ? 1500 : 0 });
-      if (sincDopo.disponibile && sincDopo.deep) {
+      //
+      // La prova: una richiesta piu' recente di quella letta PRIMA del set e' atterrata. Se
+      // TradingView non chiede ne' fa nessun ricalcolo (`senza_richiesta`: input che non tocca il
+      // report) non c'e' prova, e si resta sulle attese di prima con tutte le loro reti.
+      const sincDopo = (deltaReale && reqPrimaDegliInput === null)
+        ? NON_SINCRONIZZABILE
+        : await sincronizza({ richiestaDopo: reqPrimaDegliInput });
+      if (sincDopo.disponibile && sincDopo.deep && sincDopo.ok && sincDopo.attuale === 'senza_richiesta') {
+        report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+      } else if (sincDopo.disponibile && sincDopo.deep) {
         if (!sincDopo.ok) { cron.segna('report'); await fermaReportNonArrivato(run, sincDopo); break; }
         report = { aggiornato: true, click: sincDopo.click, sincronizzato: true };
       } else {

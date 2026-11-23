@@ -133,6 +133,12 @@ export async function applyBacktest(opts, deps = {}) {
     cliccaAggiorna: () => aggiornaReportSeObsoleto({ tentativi: 1, attesaMs: 0 }),
     sleep, now, timeoutMs: Math.max(recalc_timeout_ms, 60000), ...extra,
   });
+  // Il requestId di ADESSO, letto PRIMA di cambiare contesto o input: e' il riferimento che la
+  // richiesta buona deve superare (`richiestaDopo`). null = modello non leggibile: non si sincronizza.
+  const richiestaCorrente = async () => {
+    try { const s = await readDeepState(); return s && s.found === true ? s.requestId : null; } catch { return null; }
+  };
+  const NON_SINCRONIZZABILE = { disponibile: false };
   const reportNonArrivato = (sinc) => (sinc.motivo === 'errore_tradingview'
     ? ['deep_backtest_error', `TradingView ha rifiutato il backtest esteso ("${sinc.errore}"): il report non esiste, quindi le metriche non sono leggibili. Riavvia TradingView e rilancia.`]
     : ['report_not_synced', `il report del backtest esteso non e' arrivato (${sinc.motivo}): le metriche sul pannello sono di una configurazione precedente. Controlla il tester su TradingView e rilancia.`]);
@@ -192,6 +198,7 @@ export async function applyBacktest(opts, deps = {}) {
     return fail('panel_not_open', `${pannello?.error || 'pannello Strategy Tester non pronto'}. Aprilo su TradingView (Strategy Tester, in basso) e rilancia: senza quel pannello il periodo di test non e' impostabile ne' leggibile.`);
   }
 
+  const reqPrimaDelContesto = await richiestaCorrente();
   const contesto = await applicaContestoRun(
     { symbol: bt.symbol, timeframe: bt.timeframe, period_start: bt.period_start, period_end: bt.period_end },
     { getChartState, setSymbol, setTimeframe, setCustomPeriod, readTestPeriod, ensureTesterPanel, sleep },
@@ -206,7 +213,10 @@ export async function applyBacktest(opts, deps = {}) {
   const leggi = (id) => leggiMetricheEffettive(id, { readReportFor, readPanelMetrics, periodoRistretto });
   // Dal 2026-11-23 il rinfresco aspetta che la richiesta partita col cambio di contesto ATTERRI: su
   // quattro anni di M5 impiega 5-7 s, e in quel tempo il pannello mostra il report di prima.
-  const sincPrima = await sincronizza();
+  // La prova e' una richiesta PIU' RECENTE di quella letta prima del cambio, atterrata.
+  const sincPrima = (contesto.contestoCambiato && reqPrimaDelContesto === null)
+    ? NON_SINCRONIZZABILE
+    : await sincronizza({ richiestaDopo: contesto.contestoCambiato ? reqPrimaDelContesto : null });
   if (sincPrima.disponibile && sincPrima.deep) {
     if (!sincPrima.ok) return fail(...reportNonArrivato(sincPrima), appliedSoFar());
   } else if (contesto.contestoCambiato) {
@@ -219,6 +229,7 @@ export async function applyBacktest(opts, deps = {}) {
   const valoriPrima = await readInputValues(entity_id);
   const deltaReale = !Object.entries(piano.resolved).every(([id, v]) => stessoValore(v, valoriPrima[id]));
 
+  const reqPrimaDegliInput = deltaReale ? await richiestaCorrente() : null;
   const setResult = await setInputs({ entity_id, inputs: piano.resolved });
   inputsSet = true;
   if (setResult.missing?.length) {
@@ -242,8 +253,14 @@ export async function applyBacktest(opts, deps = {}) {
   // «Banner sparito» non e' «report attuale»: il banner sparisce al click, e non compare affatto se
   // l'input cambia mentre un'altra richiesta e' in volo (e' il "banner arrivato dopo" del #1009).
   let report;
-  const sincDopo = await sincronizza({ graziaInizialeMs: deltaReale ? 1500 : 0 });
-  if (sincDopo.disponibile && sincDopo.deep) {
+  // `senza_richiesta` (TradingView non chiede ne' fa nessun ricalcolo) non e' una prova: si resta
+  // sulle attese di prima con le loro reti.
+  const sincDopo = (deltaReale && reqPrimaDegliInput === null)
+    ? NON_SINCRONIZZABILE
+    : await sincronizza({ richiestaDopo: reqPrimaDegliInput });
+  if (sincDopo.disponibile && sincDopo.deep && sincDopo.ok && sincDopo.attuale === 'senza_richiesta') {
+    report = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
+  } else if (sincDopo.disponibile && sincDopo.deep) {
     if (!sincDopo.ok) return fail(...reportNonArrivato(sincDopo), appliedSoFar());
     report = { aggiornato: true, click: sincDopo.click, sincronizzato: true };
   } else {
@@ -296,7 +313,10 @@ export async function applyBacktest(opts, deps = {}) {
   if (report.sincronizzato) {
     const sincFine = await sincronizza();
     if (sincFine.disponibile && sincFine.deep && !sincFine.ok) return fail(...reportNonArrivato(sincFine), appliedSoFar());
-    ultimoGiro = { aggiornato: true, click: sincFine.click || 0 };
+    // Se a questo punto il modello non si legge piu', l'ultima occhiata la da' il banner, come prima.
+    ultimoGiro = sincFine.disponibile
+      ? { aggiornato: true, click: sincFine.click || 0 }
+      : await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
   } else {
     ultimoGiro = await attendiReportAggiornato({ timeoutMs: Math.max(recalc_timeout_ms, 30000) });
   }

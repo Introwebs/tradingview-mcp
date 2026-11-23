@@ -461,14 +461,14 @@ test('esteso: cambia periodo e input insieme e legge il report dei PROPRI input,
   assert.equal(out.ok, true, JSON.stringify(out.error));
   assert.equal(out.metrics.total_trades, bt.total_trades);
   assert.equal(out.vs_backtest.total_trades_delta, 0);
-  assert.deepEqual(tv.stato.mostrato, { periodo: P4E, inputs: { in_0: 1, in_40: 10000 } });
+  assert.deepEqual(tv.stato.mostrato, { periodo: P4E, timeframe: '5', inputs: { in_0: 1, in_40: 10000 } });
 });
 
 test('esteso: TradingView rifiuta la richiesta → ok:false con deep_backtest_error, non metriche vecchie', async () => {
   const tv = creaTesterFinto({ periodo: P4E, inputs: { in_0: 2, in_40: 10000 }, durataMs: 3000 });
   const bt = btEsteso(tv, 1);
   const { deps } = depsEsteso(tv, bt);
-  tv.rifiutaLaProssima('not_allowed');
+  tv.rifiuta('not_allowed');
   const out = await applyBacktest({ backtest_id: 263 }, deps);
   assert.equal(out.ok, false);
   assert.equal(out.error.kind, 'deep_backtest_error');
