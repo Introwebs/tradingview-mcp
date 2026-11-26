@@ -41,8 +41,20 @@ import { buildInputsPayload } from './btInputs.js';
 import { resolveCommissionIds, resolveStrategyEntity } from './btCost.js';
 import { toFinalizePayload, fingerprint } from './btMetrics.js';
 import { misuraProva, giornoISO, fpNotoO } from './btProva.js';
+import { risolviMappa, daApplicare } from './btMappa.js';
 
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * La run e' scritta per nome e posizione? Solo se porta una `input_config` non vuota E nessun
+ * `input_set` (assente, `[]` come lo serializza PHP, o `{}`). Un `input_set` pieno vince sempre:
+ * e' il percorso di oggi e resta identico.
+ */
+function haConfigPerNome(run) {
+  if (!Array.isArray(run?.input_config) || run.input_config.length === 0) return false;
+  const set = run.input_set;
+  return set == null || (typeof set === 'object' && Object.keys(set).length === 0);
+}
 
 // Gli aiuti della misura vivono in btProva.js, accanto al nucleo per-prova. Si riesportano da qui
 // perche' btApply.js e i test li importano da questo file.
@@ -206,6 +218,12 @@ export async function grindSession(opts, deps = {}) {
     opzioni: { recalc_timeout_ms, recalc_stable_checks, recalc_step_ms, recalc_start_grace_ms },
     leggiPadre: (id) => api.getBacktest(id),
   };
+  // Una run per nome si traduce sulla mappa viva: {target, delta, ignoti} di btMappa.js. Solo
+  // letture: il grafico si tocca dopo, e solo se nessun nome manca.
+  const risolviPerNome = async (run) => {
+    const { perChiave } = risolviMappa(info, run.input_config);
+    return daApplicare(perChiave, run.input_config, await readInputValues(entity_id));
+  };
   // Fallimenti CONSECUTIVI in finalize: un 422 isolato è un test storto e non deve fermare
   // la matrice, ma se la causa è sistemica (es. initialCapital sempre null perché "Initial
   // Capital" non viene riconosciuto tra gli input) ogni run fallisce allo stesso modo e senza
@@ -294,9 +312,33 @@ export async function grindSession(opts, deps = {}) {
     // non sono mai partite e la sessione risultava chiusa con 10 backtest su 20.
     try {
 
+      // Run scritta PER NOME E POSIZIONE (`input_config`, la run del finalista di una campagna): la
+      // piattaforma non conosce gli id `in_K`, e farli tradurre al modello e' cio' che ha rotto la
+      // sessione 66. Si risolve qui sulla mappa viva, come fa lo strumento di fase (btFase.js), e la
+      // misura riceve il solo delta per id. Tutto il resto — `input_set` per id, anche vuoto, senza
+      // `input_config` — passa com'era: `perNome` resta null e la misura riceve la run stessa.
+      const perNome = haConfigPerNome(run) ? await risolviPerNome(run) : null;
+      if (perNome?.ignoti.length) {
+        // Prima di toccare il grafico: niente contesto, niente input. Come `version_mismatch` delle
+        // varianti di costo (un input della configurazione che la strategia viva non ha), la run si
+        // chiude e il grind si ferma: le altre run della stessa configurazione farebbero lo stesso.
+        const elenco = perNome.ignoti.map((x) => `${x.name} (${x.position})`).join(', ');
+        const msg = `unknown_input: input della configurazione che il grafico non ha: ${elenco}`;
+        await api.markFailed(run.id, msg);
+        failed++;
+        rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: msg.slice(0, 300) });
+        stopped_reason = {
+          kind: 'unknown_input',
+          detail: `la run ${run.id} e' scritta per nome e il grafico non ha questi input: ${elenco}. E' un'altra versione della strategia? Nessun input e' stato toccato.`,
+          unknown_inputs: perNome.ignoti.map((x) => x.name), run_id: run.id, label: run.label ?? null,
+        };
+        await api.progress(command_id, `⛔ run ${run.id}: input che il grafico non ha (${elenco}) — mi fermo`);
+        break ciclo;
+      }
+
       // La misura della prova e' in btProva.js (la condivide lo strumento di fase). Qui restano gli
       // esiti: per ogni uscita gli stessi passi di prima, nello stesso ordine.
-      const prova = await misuraProva(run, amb);
+      const prova = await misuraProva(perNome ? { ...run, input_set: perNome.delta } : run, amb);
       switch (prova.uscita) {
         case 'contesto': {
           const a = prova.problema;
@@ -411,6 +453,18 @@ export async function grindSession(opts, deps = {}) {
           break;
         default:
           throw new Error(`misuraProva: uscita sconosciuta "${prova.uscita}"`);
+      }
+      // Run per nome: la misura ha controllato il delta; qui si controlla la configurazione INTERA
+      // (`target`), come btFase.js. Un valore che non era nel delta perche' gia' giusto puo' essersi
+      // spostato, e allora i numeri non sono di questa configurazione: la run non si registra.
+      if (perNome && !readbackMatches(perNome.target, prova.actual)) {
+        const msg = 'readback_mismatch: i valori riletti non corrispondono alla configurazione della run';
+        await api.markFailed(run.id, msg);
+        failed++;
+        rows.push({ run_id: run.id, label: run.label ?? null, status: 'failed', error: msg });
+        stopped_reason = { kind: 'readback_mismatch', detail: `run ${run.id}: i valori riletti dal grafico non corrispondono alla configurazione scritta per nome`, run_id: run.id, label: run.label ?? null };
+        await api.progress(command_id, `⛔ run ${run.id}: readback_mismatch — mi fermo`);
+        break ciclo;
       }
       const { results, metricheFinali, actual, periodo, periodoFinale, rischio, avviso, costo, verificaCosto } = prova;
 
