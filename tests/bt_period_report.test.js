@@ -8,7 +8,7 @@ const REPORT = {
   found: true, ambiguous: false,
   backtest_from: 1609770600000, // 2021-01-04 14:30 UTC, la prima barra
   backtest_to: 1793653200000, // 2026-11-02
-  total_trades: 438, net_profit: -10219.735000000277,
+  total_trades: 438, net_profit: -10219.735000000277, total_profit: -10219.735000000277,
   sharpe: -0.08610987689412221, sortino: -0.11744264718751704,
 };
 const PANNELLO = { total_trades: 438, net_profit: -10219.74 };
@@ -29,7 +29,34 @@ test('un numero di trade diverso dal pannello: e\' il report di un altro periodo
 });
 
 test('stessi trade ma P&L diverso: si scarta', () => {
-  const r = rischioDalReportDelPeriodo({ ...REPORT, net_profit: -9000 }, { panel: PANNELLO, periodo: PERIODO });
+  const r = rischioDalReportDelPeriodo({ ...REPORT, net_profit: -9000, total_profit: -9000 }, { panel: PANNELLO, periodo: PERIODO });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /P&L/);
+});
+
+test('trade aperto a fine periodo: il pannello mostra il totalProfit, lo Sharpe passa', () => {
+  // Il collaudo della campagna n. 2 (backtest 308, 27/11/2026): netProfit -868,92 (solo trade
+  // chiusi), openPL +1.170,49, totalProfit +301,57 = "P&L totale" del pannello. Confrontare col
+  // netProfit scartava uno Sharpe giusto e il collaudo usciva non conclusivo.
+  const r = rischioDalReportDelPeriodo(
+    { ...REPORT, net_profit: -868.92, total_profit: 301.5700000000002, sharpe: 0.043, sortino: 0.061 },
+    { panel: { total_trades: 438, net_profit: 301.57 }, periodo: PERIODO },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.sharpe, 0.043);
+  assert.equal(r.sortino, 0.061);
+});
+
+test('netProfit uguale al pannello ma totalProfit diverso: si scarta', () => {
+  // Il confronto e' col totalProfit: un netProfit che coincide per caso non basta.
+  const r = rischioDalReportDelPeriodo({ ...REPORT, total_profit: -9000 }, { panel: PANNELLO, periodo: PERIODO });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /P&L/);
+});
+
+test('report senza totalProfit: il P&L non e\' verificabile, si scarta', () => {
+  const { total_profit, ...senza } = REPORT;
+  const r = rischioDalReportDelPeriodo(senza, { panel: PANNELLO, periodo: PERIODO });
   assert.equal(r.ok, false);
   assert.match(r.reason, /P&L/);
 });
@@ -82,6 +109,8 @@ test('readPeriodReport restituisce la proiezione cosi\' come la pagina la calcol
   // marginUsage (~270k caratteri) non deve mai uscire dalla pagina.
   assert.doesNotMatch(codice, /return\s+s\s*;/);
   assert.match(codice, /strategy-report-summary/);
+  // Il pannello mostra il P&L coi trade aperti: la proiezione deve portarlo.
+  assert.match(codice, /total_profit:\s*fin\(a\.totalProfit\)/);
 });
 
 test('readPeriodReport: una evaluate che lancia diventa found:false, mai un\'eccezione', async () => {

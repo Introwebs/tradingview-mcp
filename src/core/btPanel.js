@@ -362,7 +362,9 @@ export async function setPanelMaximized(massimizzato, {
  * Si proietta nella pagina: il report porta `marginUsage` (~270k caratteri), non deve uscire.
  *
  * @returns {Promise<{found: boolean, ambiguous?: boolean, backtest_from?: number, backtest_to?: number,
- *   total_trades?: number, net_profit?: number, sharpe?: number|null, sortino?: number|null, error?: string}>}
+ *   total_trades?: number, net_profit?: number, total_profit?: number, sharpe?: number|null, sortino?: number|null, error?: string}>}
+ *   `net_profit` e' `performance.all.netProfit` (solo trade chiusi); `total_profit` e'
+ *   `performance.all.totalProfit` (trade aperti compresi), il numero che il pannello mostra.
  */
 export async function readPeriodReport({ evaluate = realEvaluate } = {}) {
   try {
@@ -385,14 +387,14 @@ export async function readPeriodReport({ evaluate = realEvaluate } = {}) {
               var a = s.performance.all;
               hits.push({
                 backtest_from: fin(bt.from), backtest_to: fin(bt.to),
-                total_trades: fin(a.totalTrades), net_profit: fin(a.netProfit),
+                total_trades: fin(a.totalTrades), net_profit: fin(a.netProfit), total_profit: fin(a.totalProfit),
                 sharpe: fin(s.performance.sharpeRatio), sortino: fin(s.performance.sortinoRatio),
               });
             }
           }
         }
         if (!hits.length) return { found: false, error: 'nessun report del periodo nello stato React del tester' };
-        var firma = function(x) { return [x.backtest_from, x.backtest_to, x.total_trades, x.net_profit, x.sharpe].join('|'); };
+        var firma = function(x) { return [x.backtest_from, x.backtest_to, x.total_trades, x.net_profit, x.total_profit, x.sharpe].join('|'); };
         var primo = hits[0], ambiguous = false;
         for (var i = 1; i < hits.length; i++) if (firma(hits[i]) !== firma(primo)) ambiguous = true;
         return Object.assign({ found: true, ambiguous: ambiguous }, primo);
@@ -417,7 +419,10 @@ const finito = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : null);
  * Tre controlli, tutti obbligatori — prestare lo Sharpe di un altro periodo e' peggio che non
  * averlo, perche' produce un verdetto di collaudo plausibile e falso:
  *  1. stessi trade del pannello (lo storico intero ne ha di piu': 288 contro 24, misurato);
- *  2. stesso P&L, a meno dell'arrotondamento al centesimo del pannello;
+ *  2. stesso P&L, a meno dell'arrotondamento al centesimo del pannello. Il "P&L totale" del
+ *     pannello e' `totalProfit` (trade aperti compresi), NON `netProfit` (solo chiusi): con un
+ *     trade aperto a fine periodo i due divergono e il confronto col netProfit scartava uno
+ *     Sharpe giusto (collaudo della campagna n. 2, backtest 308, 27/11/2026);
  *  3. date del report dentro il periodo applicato: la prima barra puo' cadere qualche giorno dopo
  *     l'inizio (weekend, festivi), l'ultima qualche giorno prima della fine.
  *
@@ -436,9 +441,9 @@ export function rischioDalReportDelPeriodo(report, { panel = {}, periodo = {} } 
     return { ok: false, reason: `trade diversi dal pannello (report ${report.total_trades}, pannello ${panel.total_trades}): e' il report di un altro periodo` };
   }
   const pnlPanel = finito(panel.net_profit);
-  const pnlReport = finito(report.net_profit);
+  const pnlReport = finito(report.total_profit);
   if (pnlPanel === null || pnlReport === null || Math.abs(pnlPanel - pnlReport) > 0.011) {
-    return { ok: false, reason: `P&L diverso dal pannello (report ${report.net_profit}, pannello ${panel.net_profit})` };
+    return { ok: false, reason: `P&L diverso dal pannello (report ${report.total_profit}, pannello ${panel.net_profit})` };
   }
 
   const da = giornoUTC(periodo.from);

@@ -499,7 +499,7 @@ function runConPeriodoRistretto(reportDelPeriodo) {
 const reportCoerente = (p) => ({
   found: true, ambiguous: false,
   backtest_from: Date.UTC(2023, 10, 6, 14, 30), backtest_to: Date.UTC(2026, 9, 1, 20, 0),
-  total_trades: p.total_trades, net_profit: p.net_profit + 0.004, sharpe: 0.3124, sortino: 0.5511,
+  total_trades: p.total_trades, net_profit: p.net_profit + 0.004, total_profit: p.net_profit + 0.004, sharpe: 0.3124, sortino: 0.5511,
 });
 
 test('periodo ristretto: lo Sharpe del periodo arriva dal report React se coincide col pannello', async () => {
